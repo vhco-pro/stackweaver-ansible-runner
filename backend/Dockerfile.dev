@@ -1,0 +1,75 @@
+FROM golang:1.25.7-alpine AS builder
+
+# Build arguments
+ARG IMAGE_NAME=api
+ARG TARGETARCH
+ARG TARGETOS
+
+WORKDIR /build
+
+# Copy go mod files first
+COPY go.mod go.sum ./
+
+# Copy source code (needed for go mod tidy to analyze imports)
+COPY . .
+
+# Run go mod tidy to ensure all dependencies are in go.sum
+# This will update go.sum with any missing entries
+RUN go mod tidy && go mod download
+
+# Build the application
+# Determine which command to build based on IMAGE_NAME
+RUN if [ "${IMAGE_NAME}" = "orchestrator" ]; then \
+        CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o ${IMAGE_NAME} ./cmd/orchestrator; \
+    elif [ "${IMAGE_NAME}" = "runner" ]; then \
+        CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o ${IMAGE_NAME} ./cmd/runner; \
+    else \
+        CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o ${IMAGE_NAME} ./cmd/api; \
+    fi
+
+# Final stage
+FROM alpine:3.23
+
+# Build arguments (needed for Terraform architecture selection)
+ARG TARGETARCH
+ARG TARGETOS
+
+# Install runtime dependencies (including git for module publishing from Git tags)
+# Install Terraform for runner (only needed for runner, but harmless for other services)
+RUN apk add --no-cache ca-certificates wget git unzip && \
+    ARCH=$(case ${TARGETARCH} in amd64) echo "amd64" ;; arm64) echo "arm64" ;; arm) echo "arm" ;; *) echo "amd64" ;; esac) && \
+    wget -q https://releases.hashicorp.com/terraform/1.13.0/terraform_1.13.0_linux_${ARCH}.zip -O /tmp/terraform.zip && \
+    unzip /tmp/terraform.zip -d /usr/local/bin && \
+    rm /tmp/terraform.zip && \
+    chmod +x /usr/local/bin/terraform && \
+    terraform version
+
+# Create non-root user
+RUN addgroup -g 1001 iac && \
+    adduser -D -u 1001 -G iac iac
+
+# Build arguments (needed in final stage for binary name)
+ARG IMAGE_NAME=api
+
+# Copy binary from builder (always copy to fixed name 'api' for simplicity)
+COPY --from=builder /build/${IMAGE_NAME} /usr/local/bin/api
+COPY --from=builder /build/config /etc/iac/config
+
+# Set proper ownership
+RUN chmod +x /usr/local/bin/api && \
+    chown -R iac:iac /usr/local/bin/api /etc/iac
+
+# Create workspaces directory for runner
+RUN mkdir -p /home/iac/workspaces && \
+    chown -R iac:iac /home/iac/workspaces
+
+# Switch to non-root user
+USER iac
+WORKDIR /home/iac
+
+# Expose port
+EXPOSE 8080
+
+# Run the application (use fixed name for simplicity)
+ENTRYPOINT ["/usr/local/bin/api"]
+
