@@ -1,0 +1,26 @@
+workflow: GitHubFlow/v1
+next-version: 0.0.0
+tag-prefix: ''
+semantic-version-format: Loose
+
+major-version-bump-message: '(BREAKING CHANGE|^.+!:)'
+minor-version-bump-message: '^feat(\([^)]+\))?:\s'
+patch-version-bump-message: '^(fix|enhancement|perf|refactor|revert)(\([^)]+\))?:\s'
+no-bump-message: '^(chore|docs|style|test|ci)(\([^)]+\))?:\s'
+commit-message-incrementing: Enabled
+
+strategies:
+  - Fallback
+  - MergeMessage
+  - TaggedCommit
+  - TrackReleaseBranches
+  - VersionInBranchName
+
+branches:
+  main:
+    regex: ^master$|^main$
+    increment: Patch
+    prevent-increment:
+      of-merged-branch: true
+    is-main-branch: true
+    mode: ContinuousDeployment
