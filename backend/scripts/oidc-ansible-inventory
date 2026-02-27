@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+# Copyright (c) 2025 VH & Co BV. Licensed under the Business Source License 1.1. See LICENSE for details.
+
+"""Ansible inventory wrapper with Azure OIDC workload identity support.
+
+The Azure RM Ansible collection (azure.azcollection) does NOT natively support
+Azure AD Workload Identity Federation / OIDC. Its auth chain only checks for:
+  - client_id + secret + tenant (ClientSecretCredential)
+  - x509 certificate (CertificateCredential)
+  - managed identity (ManagedIdentityCredential)
+  - Azure CLI session (AzureCliCredential)
+
+However, the azure-identity Python SDK (>= 1.14.0) *does* support
+WorkloadIdentityCredential, which reads:
+  - AZURE_CLIENT_ID
+  - AZURE_TENANT_ID
+  - AZURE_FEDERATED_TOKEN_FILE
+
+IMPORTANT: We cannot import `azure_rm_common` before InventoryCLI.run() — doing
+so corrupts Ansible's collection metadata loader, causing "collection metadata
+was not loaded for collection azure.azcollection". Instead, we use a lazy
+__import__ hook that intercepts the import at the moment Ansible naturally loads
+the module, then patches _get_credentials on-the-fly.
+
+Usage:
+    python3 /usr/local/bin/oidc-ansible-inventory -i /path/to/inventory.azure_rm.yml --list
+"""
+
+import builtins
+import os
+import sys
+
+
+def _oidc_env_vars_present():
+    """Check if all required OIDC workload identity env vars are set."""
+    return all(os.environ.get(v) for v in [
+        'AZURE_FEDERATED_TOKEN_FILE',
+        'AZURE_CLIENT_ID',
+        'AZURE_TENANT_ID',
+    ])
+
+
+def _install_import_hook():
+    """Install a lazy __import__ hook that patches AzureRMAuth when it's loaded.
+
+    This avoids importing azure_rm_common before Ansible initializes its
+    collection loader. The hook fires once when Ansible's own code imports
+    the module, patches _get_credentials, and then deactivates itself.
+    """
+    _original_import = builtins.__import__
+    _patched = False
+
+    def _hooked_import(name, *args, **kwargs):
+        nonlocal _patched
+        module = _original_import(name, *args, **kwargs)
+
+        if (name == 'ansible_collections.azure.azcollection.plugins.module_utils.azure_rm_common'
+                and not _patched):
+            _patched = True
+            # Restore original __import__ immediately — one-shot hook
+            builtins.__import__ = _original_import
+
+            try:
+                from azure.identity import WorkloadIdentityCredential
+            except ImportError as e:
+                print(f"Warning: Cannot patch Azure auth (missing azure-identity): {e}",
+                      file=sys.stderr)
+                return module
+
+            _oidc_credential = WorkloadIdentityCredential(
+                client_id=os.environ['AZURE_CLIENT_ID'],
+                tenant_id=os.environ['AZURE_TENANT_ID'],
+                token_file_path=os.environ['AZURE_FEDERATED_TOKEN_FILE'],
+            )
+
+            _original_get_credentials = module.AzureRMAuth._get_credentials
+
+            def _patched_get_credentials(self, auth_source=None, **params):
+                """Use WorkloadIdentityCredential when OIDC env vars are present."""
+                if _oidc_env_vars_present():
+                    subscription_id = os.environ.get(
+                        'AZURE_SUBSCRIPTION_ID',
+                        params.get('subscription_id'),
+                    )
+                    return {
+                        'credentials': _oidc_credential,
+                        'subscription_id': subscription_id,
+                    }
+                return _original_get_credentials(self, auth_source=auth_source, **params)
+
+            module.AzureRMAuth._get_credentials = _patched_get_credentials
+            print("OIDC workload identity auth patched for Azure RM collection",
+                  file=sys.stderr)
+
+        return module
+
+    builtins.__import__ = _hooked_import
+
+
+if __name__ == '__main__':
+    # Install the lazy import hook if OIDC env vars are present
+    if _oidc_env_vars_present():
+        _install_import_hook()
+
+    # Run ansible-inventory in-process (the hook fires when the azure_rm
+    # inventory plugin naturally imports azure_rm_common during parse)
+    from ansible.cli.inventory import InventoryCLI
+    cli = InventoryCLI(['ansible-inventory'] + sys.argv[1:])
+    sys.exit(cli.run())
