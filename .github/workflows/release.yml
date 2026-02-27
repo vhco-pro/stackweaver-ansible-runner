@@ -23,7 +23,7 @@ jobs:
         with:
           version: ${{ github.ref_name }}
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: vhco-pro
           password: ${{ secrets.GITHUB_TOKEN }}
           project: stackweaver-ansible-runner
           platforms: linux/amd64,linux/arm64
