@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Build and push
-        uses: michielvha/docker-release-action@v1
+        uses: michielvha/docker-release-action@main
         with:
           version: ${{ github.ref_name }}
           registry: ghcr.io
