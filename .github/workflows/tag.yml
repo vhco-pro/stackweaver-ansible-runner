@@ -1,0 +1,30 @@
+# Copyright (c) 2025 VH & Co BV. Licensed under the Apache License 2.0. See LICENSE for details.
+
+name: GitVersion Tag
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.gitignore'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Tag with GitVersion
+        uses: michielvha/gitversion-tag-action@main
+        with:
+          configFilePath: 'gitversion.yml'

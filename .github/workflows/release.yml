@@ -1,0 +1,30 @@
+# Copyright (c) 2025 VH & Co BV. Licensed under the Apache License 2.0. See LICENSE for details.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Build and push
+        uses: michielvha/docker-release-action@v1
+        with:
+          version: ${{ github.ref_name }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          project: stackweaver-ansible-runner
+          platforms: linux/amd64,linux/arm64
+          context: .
