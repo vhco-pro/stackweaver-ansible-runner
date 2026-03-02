@@ -2,6 +2,7 @@
 
 The self-hosted Ansible runner for the [Stackweaver](https://github.com/vhco-pro/stackweaver) DevOps platform.
 
+> [!IMPORTANT]
 > **This repository is auto-synced from the Stackweaver monorepo. Do not make changes here directly.**
 
 ## Overview
@@ -15,6 +16,10 @@ docker pull ghcr.io/vhco-pro/stackweaver-ansible-runner:latest
 ```
 
 See the [Stackweaver documentation](https://github.com/vhco-pro/stackweaver) for deployment and configuration instructions.
+
+## Customize
+
+Fork and adjust the dockerfile to create your own version of the runner image with any dependency you might require.
 
 ## License
 
