@@ -164,6 +164,32 @@ func (h *VCSAppInstallationHandlerV2) InitiateInstallation(c *gin.Context) {
 	})
 }
 
+// GitHubSetupCallback is the GitHub App "Setup URL" endpoint.
+// GitHub redirects here after a user installs or updates the GitHub App
+// (including permission upgrades). This handler proxies the redirect to
+// the correct frontend URL, which varies between Docker Compose (localhost:5173)
+// and Kubernetes (the public ingress domain).
+//
+// Set STACKWEAVER_APP_URL to your public frontend origin (e.g. https://app.example.com).
+// Defaults to http://localhost:5173 for Docker Compose.
+//
+// GitHub App Setup URL should be: <your-api-url>/api/v2/vcs-connections/github/setup
+// GET /api/v2/vcs-connections/github/setup
+func (h *VCSAppInstallationHandlerV2) GitHubSetupCallback(c *gin.Context) {
+	appURL := os.Getenv("STACKWEAVER_APP_URL")
+	if appURL == "" {
+		appURL = "http://localhost:5173"
+	}
+
+	// Forward all query params GitHub sends (installation_id, setup_action, state, etc.)
+	target := appURL + "/vcs/github/installed"
+	if q := c.Request.URL.RawQuery; q != "" {
+		target = target + "?" + q
+	}
+
+	c.Redirect(http.StatusFound, target)
+}
+
 // InitiateAzureDevOpsInstallation initiates the Azure DevOps OAuth2 installation flow
 // Returns the authorization URL for the frontend to redirect to
 // GET /api/v2/organizations/:name/vcs-connections/azure-devops/install
