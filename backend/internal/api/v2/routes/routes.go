@@ -831,9 +831,6 @@ func SetupV2Routes(
 				ansibleQueueForWebhook,
 			)
 			vcsWebhook.POST("/webhook", appHandler.HandleInstallationWebhook)
-			// GitHub App Setup URL relay — redirects GitHub's post-install callback to the
-			// correct frontend URL. Set STACKWEAVER_APP_URL to the public frontend origin.
-			vcsWebhook.GET("/setup", appHandler.GitHubSetupCallback)
 		}
 
 		// Also update the installation initiation handler
