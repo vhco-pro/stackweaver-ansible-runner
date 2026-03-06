@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/go-jose/go-jose/v4"
@@ -20,9 +21,10 @@ import (
 
 // remoteKeySet implements oidc.KeySet for remote JWKS
 type remoteKeySet struct {
-	httpClient *http.Client
-	jwksURL    string
-	keys       []jose.JSONWebKey
+	httpClient   *http.Client
+	jwksURL      string
+	hostOverride string // Host header override for in-cluster requests to Zitadel
+	keys         []jose.JSONWebKey
 }
 
 func (r *remoteKeySet) VerifySignature(ctx context.Context, jws *jose.JSONWebSignature) ([]byte, error) {
@@ -60,6 +62,13 @@ func (r *remoteKeySet) fetchKeys(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", r.jwksURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// When fetching JWKS via an internal K8s service address, Zitadel uses the
+	// Host header to identify the instance. Override it with the external issuer
+	// hostname so Zitadel can route to the correct tenant.
+	if r.hostOverride != "" {
+		req.Host = r.hostOverride
 	}
 
 	resp, err := r.httpClient.Do(req) //nolint:gosec // G704: URL is the operator-configured Zitadel JWKS endpoint, not user-controlled
@@ -108,16 +117,24 @@ func NewZitadelVerifier(issuer, clientID, clientSecret, internalAddr string) (*Z
 	// Create HTTP client
 	httpClient := oauth2.NewClient(context.Background(), nil)
 
-	// Use internal address for JWKS if provided, otherwise fall back to issuer
+	// Use internal address for JWKS if provided, otherwise fall back to issuer.
+	// When using an internal address (e.g. K8s service name), we must also send
+	// the external issuer hostname as the Host header so Zitadel can identify
+	// the correct instance (Zitadel routes tenants by the Host header).
 	jwksURL := issuer + "/oauth/v2/keys"
+	var hostOverride string
 	if internalAddr != "" {
 		jwksURL = "http://" + internalAddr + "/oauth/v2/keys"
+		if u, err := url.Parse(issuer); err == nil {
+			hostOverride = u.Host
+		}
 	}
 
 	// Create remote key set that implements oidc.KeySet
 	keySet := &remoteKeySet{
-		httpClient: httpClient,
-		jwksURL:    jwksURL,
+		httpClient:   httpClient,
+		jwksURL:      jwksURL,
+		hostOverride: hostOverride,
 	}
 
 	return &ZitadelVerifier{

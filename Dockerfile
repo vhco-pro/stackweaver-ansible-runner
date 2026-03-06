@@ -1,6 +1,7 @@
 # Ansible Runner Dockerfile
 # This builds the Ansible runner that executes Ansible playbooks
-# Build context must be the repository root (context: .)
+# NOTE: This Dockerfile must be built with context set to the backend directory
+# Example: docker build -f runner-images/ansible/Dockerfile -t ansible-runner backend/
 
 # Build stage
 FROM golang:1.25.7-alpine AS builder
@@ -11,11 +12,11 @@ WORKDIR /app
 RUN apk add --no-cache git
 
 # Copy go modules first for caching
-COPY backend/go.mod backend/go.sum ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy source code
-COPY backend/ .
+COPY . .
 
 # Build the ansible-runner binary
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner

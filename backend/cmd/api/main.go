@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -55,19 +56,26 @@ func main() {
 	logger.Init(logLevel)
 
 	// Load configuration
+	// When CONFIG_PATH is explicitly set, the file must exist (misconfiguration is fatal).
+	// When CONFIG_PATH is unset, the default path is tried; if missing the binary
+	// continues with defaults + env-var overrides (enables file-free Kubernetes deploys).
 	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
+	explicitPath := configPath != ""
+	if !explicitPath {
 		configPath = "config/config.yaml"
 	}
 
+	config := defaultConfig()
 	configData, err := os.ReadFile(configPath) //nolint:gosec // configPath is from environment variable, validated
-	if err != nil {
+	switch {
+	case err == nil:
+		if err := yaml.Unmarshal(configData, &config); err != nil {
+			logger.Fatalf("Failed to parse config: %v", err)
+		}
+	case errors.Is(err, os.ErrNotExist) && !explicitPath:
+		logger.Info("No config file found, using environment variables only")
+	default:
 		logger.Fatalf("Failed to read config file: %v", err)
-	}
-
-	var config Config
-	if err := yaml.Unmarshal(configData, &config); err != nil {
-		logger.Fatalf("Failed to parse config: %v", err)
 	}
 
 	// Apply environment variable overrides (allows Kubernetes deployments to
@@ -455,6 +463,23 @@ func main() {
 	logger.Info("Server exited")
 }
 
+// defaultConfig returns a Config with sensible defaults matching the values
+// in config/config.yaml. This ensures the binary works without a config file
+// when all required values are supplied via environment variables.
+func defaultConfig() Config {
+	var cfg Config
+	cfg.Server.Host = "0.0.0.0"
+	cfg.Server.Port = 8022
+	cfg.Server.ReadTimeout = 30 * time.Second
+	cfg.Server.WriteTimeout = 30 * time.Second
+	cfg.Database.Port = 5432
+	cfg.Database.SSLMode = "disable"
+	cfg.Database.MaxOpenConns = 25
+	cfg.Database.MaxIdleConns = 5
+	cfg.Database.ConnMaxLifetime = 5 * time.Minute
+	return cfg
+}
+
 // applyEnvOverrides overrides config.yaml values with environment variables when set.
 // This allows Kubernetes pods to inject configuration via env vars without modifying config.yaml.
 func applyEnvOverrides(config *Config) {
@@ -465,6 +490,16 @@ func applyEnvOverrides(config *Config) {
 	if v := os.Getenv("SERVER_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			config.Server.Port = p
+		}
+	}
+	if v := os.Getenv("SERVER_READ_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			config.Server.ReadTimeout = d
+		}
+	}
+	if v := os.Getenv("SERVER_WRITE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			config.Server.WriteTimeout = d
 		}
 	}
 
@@ -488,6 +523,21 @@ func applyEnvOverrides(config *Config) {
 	}
 	if v := os.Getenv("DATABASE_SSLMODE"); v != "" {
 		config.Database.SSLMode = v
+	}
+	if v := os.Getenv("DATABASE_MAX_OPEN_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			config.Database.MaxOpenConns = n
+		}
+	}
+	if v := os.Getenv("DATABASE_MAX_IDLE_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			config.Database.MaxIdleConns = n
+		}
+	}
+	if v := os.Getenv("DATABASE_CONN_MAX_LIFETIME"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			config.Database.ConnMaxLifetime = d
+		}
 	}
 
 	// Zitadel (also overridden later in main via os.Getenv, kept here for completeness)
