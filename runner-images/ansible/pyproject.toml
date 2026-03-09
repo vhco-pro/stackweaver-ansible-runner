@@ -1,0 +1,51 @@
+[project]
+name = "stackweaver-ansible-runner"
+version = "0.1.0"
+requires-python = ">=3.12"
+description = "Python dependencies for the Stackweaver Ansible runner image"
+
+dependencies = [
+    "ansible>=11.0,<14",
+    "ansible-lint>=25.0",
+    "jmespath>=1.0",
+    "netaddr>=1.0",
+]
+
+[dependency-groups]
+aws = [
+    "boto3>=1.35",
+    "botocore>=1.35",
+]
+
+azure = [
+    "azure-identity>=1.19",
+    "azure-mgmt-resource>=25.0",
+    "azure-mgmt-compute>=37.0",
+    "azure-mgmt-network>=30.0",
+    "azure-mgmt-subscription>=3.0",
+    "azure-cli-core>=2.84",
+]
+
+gcp = [
+    "google-auth>=2.30",
+]
+
+vmware = [
+    "pyvmomi>=9.0",
+]
+
+# Convenience group: install everything (default for official image)
+all = [
+    { include-group = "aws" },
+    { include-group = "azure" },
+    { include-group = "gcp" },
+    { include-group = "vmware" },
+]
+
+[tool.uv]
+# Lock only for the platforms targeted by the Docker image
+environments = [
+    "sys_platform == 'linux' and python_version >= '3.12'",
+]
+# azure-cli-core >= 2.69 requires msal pre-release; allow it when necessary
+prerelease = "allow"
