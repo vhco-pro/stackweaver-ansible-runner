@@ -4,6 +4,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -150,7 +151,7 @@ func TestListModules(t *testing.T) {
 	router.GET("/v1/modules/:namespace", handler.ListModules)
 
 	// Make request
-	req := httptest.NewRequest("GET", fmt.Sprintf("/v1/modules/%s", org.Name), nil)
+	req := httptest.NewRequestWithContext(context.Background(), "GET", fmt.Sprintf("/v1/modules/%s", org.Name), nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -232,7 +233,7 @@ func TestGetModuleVersions(t *testing.T) {
 	router.GET("/v1/modules/:namespace/:name/:provider/versions", handler.GetModuleVersions)
 
 	// Make request
-	req := httptest.NewRequest("GET", fmt.Sprintf("/v1/modules/%s/%s/%s/versions", org.Name, module.Name, module.Provider), nil)
+	req := httptest.NewRequestWithContext(context.Background(), "GET", fmt.Sprintf("/v1/modules/%s/%s/%s/versions", org.Name, module.Name, module.Provider), nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -340,7 +341,7 @@ func TestPublishModuleVersion(t *testing.T) {
 	}
 
 	// Make request
-	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v2/organizations/%s/registry/modules/%s/%s/versions", org.Name, module.Name, module.Provider), body)
+	req := httptest.NewRequestWithContext(context.Background(), "POST", fmt.Sprintf("/api/v2/organizations/%s/registry/modules/%s/%s/versions", org.Name, module.Name, module.Provider), body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)

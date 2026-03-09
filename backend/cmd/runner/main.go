@@ -62,7 +62,7 @@ type Job struct {
 // If cancelled, it cancels the context which will kill the terraform process
 // Returns the cancellable context and a cancel function
 func createCancellableContext(ctx context.Context, runRepo *repository.RunRepository, runID string) (context.Context, context.CancelFunc) {
-	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelCtx, cancel := context.WithCancel(ctx) //nolint:gosec // G118: cancel is returned to caller who is responsible for calling it
 
 	go func() {
 		ticker := time.NewTicker(2 * time.Second) // Check every 2 seconds
@@ -1237,7 +1237,7 @@ func extractTarGz(data []byte, destDir string) error {
 				return fmt.Errorf("failed to create directory: %w", err)
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil {
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o750); err != nil { //nolint:gosec // G703: targetPath is validated against workspace directory before extraction
 				return fmt.Errorf("failed to create parent directory: %w", err)
 			}
 			// Security: Validate file mode to prevent integer overflow
@@ -1351,7 +1351,7 @@ func replaceRemoteBackendWithLocal(workspaceDir string) error {
 
 		// If replacement occurred, write the file back
 		if newContent != contentStr {
-			if err := os.WriteFile(filePath, []byte(newContent), 0o600); err != nil {
+			if err := os.WriteFile(filePath, []byte(newContent), 0o600); err != nil { //nolint:gosec // G703: filePath is from workspace directory, validated before use
 				return fmt.Errorf("failed to write %s: %w", filename, err)
 			}
 			logger.Infof("Replaced remote backend with local backend in %s", filename)

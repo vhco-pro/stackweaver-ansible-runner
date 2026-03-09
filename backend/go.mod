@@ -1,6 +1,6 @@
 module github.com/iac-platform/backend
 
-go 1.25.7
+go 1.25.8
 
 require (
 	github.com/gin-gonic/gin v1.11.0
