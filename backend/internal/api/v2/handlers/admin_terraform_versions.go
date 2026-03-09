@@ -111,9 +111,32 @@ func (h *AdminTerraformVersionsHandler) List(c *gin.Context) {
 		totalPages++
 	}
 
+	// Compute live workspace usage counts for the fetched page.
+	type usageRow struct {
+		TerraformVersion string
+		Count            int
+	}
+	versionStrings := make([]string, 0, len(versions))
+	for _, v := range versions {
+		versionStrings = append(versionStrings, v.Version)
+	}
+	usageCounts := make(map[string]int)
+	if len(versionStrings) > 0 {
+		var rows []usageRow
+		h.db.Model(&models.Workspace{}).
+			Select("terraform_version, COUNT(*) AS count").
+			Where("terraform_version IN ?", versionStrings).
+			Group("terraform_version").
+			Scan(&rows)
+		for _, r := range rows {
+			usageCounts[r.TerraformVersion] = r.Count
+		}
+	}
+
 	// Format as JSON:API
 	data := make([]gin.H, 0, len(versions))
 	for _, v := range versions {
+		v.Usage = usageCounts[v.Version]
 		data = append(data, formatTerraformVersion(&v))
 	}
 
