@@ -63,7 +63,7 @@ func (r *ModuleRepository) List(organizationID *uuid.UUID, provider string, veri
 		return nil, 0, err
 	}
 
-	err := query.Preload("Organization").Preload("Versions").
+	err := query.Preload("Organization").Preload("Versions").Preload("VCSConnection").
 		Order("created_at DESC").
 		Limit(limit).Offset(offset).
 		Find(&modules).Error
