@@ -314,19 +314,24 @@ func (h *RegistryPublishingHandler) ListModules(c *gin.Context) {
 			downloads = versions[0].Downloads
 		}
 
+		listAttrs := gin.H{
+			"name":              m.Name,
+			"provider":          m.Provider,
+			"description":       m.Description,
+			"vcs_repository":    m.VCSRepository,
+			"auto_publish_tags": m.AutoPublishTags,
+			"latest_version":    latestVersion,
+			"published_at":      publishedAt.Format("2006-01-02T15:04:05Z"),
+			"downloads":         downloads,
+		}
+		if m.VCSConnection != nil {
+			listAttrs["vcs_provider"] = string(m.VCSConnection.Provider)
+			listAttrs["vcs_account_name"] = m.VCSConnection.AccountName
+		}
 		data[i] = gin.H{
-			"id":   m.ID.String(),
-			"type": "registry-modules",
-			"attributes": gin.H{
-				"name":              m.Name,
-				"provider":          m.Provider,
-				"description":       m.Description,
-				"vcs_repository":    m.VCSRepository,
-				"auto_publish_tags": m.AutoPublishTags,
-				"latest_version":    latestVersion,
-				"published_at":      publishedAt.Format("2006-01-02T15:04:05Z"),
-				"downloads":         downloads,
-			},
+			"id":         m.ID.String(),
+			"type":       "registry-modules",
+			"attributes": listAttrs,
 		}
 	}
 
@@ -355,17 +360,23 @@ func (h *RegistryPublishingHandler) GetModule(c *gin.Context) {
 		return
 	}
 
+	attrs := gin.H{
+		"name":              module.Name,
+		"provider":          module.Provider,
+		"description":       module.Description,
+		"vcs_repository":    module.VCSRepository,
+		"auto_publish_tags": module.AutoPublishTags,
+	}
+	if module.VCSConnection != nil {
+		attrs["vcs_provider"] = string(module.VCSConnection.Provider)
+		attrs["vcs_account_name"] = module.VCSConnection.AccountName
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
-			"id":   module.ID.String(),
-			"type": "registry-modules",
-			"attributes": gin.H{
-				"name":              module.Name,
-				"provider":          module.Provider,
-				"description":       module.Description,
-				"vcs_repository":    module.VCSRepository,
-				"auto_publish_tags": module.AutoPublishTags,
-			},
+			"id":         module.ID.String(),
+			"type":       "registry-modules",
+			"attributes": attrs,
 		},
 	})
 }
