@@ -797,7 +797,7 @@ func replaceRemoteBackendForAgent(dir string) {
 		modified = removeHCLBlock(modified, `backend "remote" {`)
 
 		if modified != contentStr {
-			_ = os.WriteFile(filePath, []byte(modified), 0o600)
+			_ = os.WriteFile(filePath, []byte(modified), 0o600) //nolint:gosec // G703: filePath is constructed from trusted directory listing via os.ReadDir
 			logger.Infof("Replaced remote backend in %s", entry.Name())
 		}
 	}
