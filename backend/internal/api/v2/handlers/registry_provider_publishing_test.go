@@ -4,6 +4,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -241,7 +242,7 @@ func TestCreateProvider(t *testing.T) {
 	bodyBytes, _ := json.Marshal(reqBody) //nolint:errchkjson // test helper, error handling not critical
 
 	// Make request
-	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v2/organizations/%s/registry/providers", org.Name), bytes.NewReader(bodyBytes))
+	req := httptest.NewRequestWithContext(context.Background(), "POST", fmt.Sprintf("/api/v2/organizations/%s/registry/providers", org.Name), bytes.NewReader(bodyBytes))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -373,7 +374,7 @@ func TestPublishProviderPlatform(t *testing.T) {
 	}
 
 	// Make request
-	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v2/organizations/%s/registry/providers/%s/versions/1.0.0/platforms", org.Name, provider.Name), body)
+	req := httptest.NewRequestWithContext(context.Background(), "POST", fmt.Sprintf("/api/v2/organizations/%s/registry/providers/%s/versions/1.0.0/platforms", org.Name, provider.Name), body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -527,7 +528,7 @@ func TestPublishProviderPlatformWithGPG(t *testing.T) {
 	}
 
 	// Make request
-	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v2/organizations/%s/registry/providers/%s/versions/1.0.0/platforms", org.Name, provider.Name), body)
+	req := httptest.NewRequestWithContext(context.Background(), "POST", fmt.Sprintf("/api/v2/organizations/%s/registry/providers/%s/versions/1.0.0/platforms", org.Name, provider.Name), body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
