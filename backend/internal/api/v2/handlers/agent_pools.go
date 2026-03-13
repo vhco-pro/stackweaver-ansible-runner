@@ -439,7 +439,7 @@ func (h *AgentPoolHandlerV2) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// ListAgents returns agents (runners) in a pool. TFE-compatible; runners not implemented yet, returns empty list.
+// ListAgents returns agents (runners) in a pool. TFE-compatible agent shape.
 // GET /api/v2/agent-pools/:id/agents
 func (h *AgentPoolHandlerV2) ListAgents(c *gin.Context) {
 	idStr := c.Param("id")
@@ -462,10 +462,30 @@ func (h *AgentPoolHandlerV2) ListAgents(c *gin.Context) {
 		return
 	}
 
-	// Runners not implemented yet; return empty list (TFE Agent shape: id, name, ip-address, status, last-ping-at)
+	runners, err := h.runnerRepo.ListByAgentPool(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"errors": []gin.H{{"status": "500", "title": "Internal Server Error", "detail": "Failed to list agents"}}})
+		return
+	}
+
+	// Format as TFE Agent shape: id, name, ip-address, status, last-ping-at
+	data := make([]gin.H, 0, len(runners))
+	for _, r := range runners {
+		agent := gin.H{
+			"id":   r.ID.String(),
+			"type": "agents",
+			"attributes": gin.H{
+				"name":         r.Name,
+				"ip-address":   r.IPAddress,
+				"status":       string(r.Status),
+				"last-ping-at": r.LastHeartbeatAt,
+			},
+		}
+		data = append(data, agent)
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"data": []gin.H{},
-		"meta": gin.H{"pagination": gin.H{"current-page": 1, "page-size": 20, "total-count": 0}},
+		"data": data,
+		"meta": gin.H{"pagination": gin.H{"current-page": 1, "page-size": 20, "total-count": len(data)}},
 	})
 }
 

@@ -31,6 +31,7 @@ type WorkspaceHandlerV2 struct {
 	orgRepo           *repository.OrganizationRepository
 	vcsConnectionRepo *repository.VCSConnectionRepository
 	teamRepo          *repository.TeamRepository
+	poolRepo          *repository.AgentPoolRepository
 	authService       *auth.Service
 	activityService   *activity.Service
 	rbacService       *rbac.Service
@@ -44,6 +45,7 @@ func NewWorkspaceHandlerV2(
 	orgRepo *repository.OrganizationRepository,
 	vcsConnectionRepo *repository.VCSConnectionRepository,
 	teamRepo *repository.TeamRepository,
+	poolRepo *repository.AgentPoolRepository,
 	authService *auth.Service,
 	activityService *activity.Service,
 	rbacService *rbac.Service,
@@ -56,12 +58,53 @@ func NewWorkspaceHandlerV2(
 		orgRepo:           orgRepo,
 		vcsConnectionRepo: vcsConnectionRepo,
 		teamRepo:          teamRepo,
+		poolRepo:          poolRepo,
 		authService:       authService,
 		activityService:   activityService,
 		rbacService:       rbacService,
 		vcsRegistry:       vcsRegistry,
 		db:                db,
 	}
+}
+
+// validatePoolAccess checks whether a workspace is allowed to use the given agent pool
+// based on the pool's scoping rules (organization_scoped, allowed workspaces/projects, excluded workspaces).
+func (h *WorkspaceHandlerV2) validatePoolAccess(poolID uuid.UUID, workspaceID string, projectID *uuid.UUID) (bool, string) {
+	pool, err := h.poolRepo.GetByID(poolID, true)
+	if err != nil {
+		return false, "Agent pool not found"
+	}
+	return CheckPoolAccess(pool, workspaceID, projectID)
+}
+
+// CheckPoolAccess evaluates pool scoping rules against a workspace.
+// Org-scoped pools allow all workspaces except those in ExcludedWorkspaces.
+// Non-org-scoped pools require the workspace to be in AllowedWorkspaces or its project in AllowedProjects.
+func CheckPoolAccess(pool *models.AgentPool, workspaceID string, projectID *uuid.UUID) (bool, string) {
+	if pool.OrganizationScoped {
+		// Org-scoped: allowed unless explicitly excluded
+		for _, ws := range pool.ExcludedWorkspaces {
+			if ws.ID == workspaceID {
+				return false, "Workspace is excluded from this agent pool"
+			}
+		}
+		return true, ""
+	}
+
+	// Not org-scoped: must be in allowed workspaces or allowed projects
+	for _, ws := range pool.AllowedWorkspaces {
+		if ws.ID == workspaceID {
+			return true, ""
+		}
+	}
+	if projectID != nil {
+		for _, p := range pool.AllowedProjects {
+			if p.ID == *projectID {
+				return true, ""
+			}
+		}
+	}
+	return false, "Workspace is not allowed to use this agent pool"
 }
 
 // maybeRegisterADOWebhook fires a background goroutine to register per-repository Service Hook
@@ -1080,6 +1123,10 @@ func (h *WorkspaceHandlerV2) Create(c *gin.Context) {
 	if executionMode == "agent" && attrs.AgentPoolID != nil && *attrs.AgentPoolID != "" {
 		poolID, err := uuid.Parse(*attrs.AgentPoolID)
 		if err == nil {
+			if allowed, reason := h.validatePoolAccess(poolID, workspace.ID, &workspace.ProjectID); !allowed {
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"errors": []gin.H{{"status": "422", "title": "Invalid Agent Pool", "detail": reason}}})
+				return
+			}
 			workspace.AgentPoolID = &poolID
 		}
 	}
@@ -1435,6 +1482,10 @@ func (h *WorkspaceHandlerV2) Update(c *gin.Context) {
 		} else {
 			poolID, err := uuid.Parse(*attrs.AgentPoolID)
 			if err == nil {
+				if allowed, reason := h.validatePoolAccess(poolID, workspace.ID, &workspace.ProjectID); !allowed {
+					c.JSON(http.StatusUnprocessableEntity, gin.H{"errors": []gin.H{{"status": "422", "title": "Invalid Agent Pool", "detail": reason}}})
+					return
+				}
 				if workspace.AgentPoolID == nil || *workspace.AgentPoolID != poolID {
 					changes["agent_pool_id"] = poolID.String()
 				}
@@ -2285,6 +2336,10 @@ func (h *WorkspaceHandlerV2) UpdateByID(c *gin.Context) {
 		} else {
 			poolID, parseErr := uuid.Parse(*attrs.AgentPoolID)
 			if parseErr == nil {
+				if allowed, reason := h.validatePoolAccess(poolID, workspace.ID, &workspace.ProjectID); !allowed {
+					c.JSON(http.StatusUnprocessableEntity, gin.H{"errors": []gin.H{{"status": "422", "title": "Invalid Agent Pool", "detail": reason}}})
+					return
+				}
 				workspace.AgentPoolID = &poolID
 			}
 		}
