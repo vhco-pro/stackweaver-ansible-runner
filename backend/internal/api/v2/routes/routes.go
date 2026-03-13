@@ -88,7 +88,8 @@ func SetupV2Routes(
 	teamHandler := handlers.NewTeamHandlerV2(teamRepo, orgRepo, authService, rbacService)
 	teamWorkspaceAccessHandler := handlers.NewTeamWorkspaceAccessHandlerV2(teamRepo, workspaceRepo, projectRepo, orgRepo, authService, rbacService)
 	teamProjectAccessHandler := handlers.NewTeamProjectAccessHandlerV2(teamRepo, projectRepo, orgRepo, authService, rbacService)
-	workspaceHandler := terraformHandlers.NewWorkspaceHandlerV2(workspaceRepo, projectRepo, orgRepo, vcsConnectionRepo, teamRepo, authService, activityService, rbacService, vcsRegistry, db)
+	agentPoolRepo := repository.NewAgentPoolRepository(db)
+	workspaceHandler := terraformHandlers.NewWorkspaceHandlerV2(workspaceRepo, projectRepo, orgRepo, vcsConnectionRepo, teamRepo, agentPoolRepo, authService, activityService, rbacService, vcsRegistry, db)
 
 	// User repository for organization memberships
 	userRepo := repository.NewUserRepository(db)
@@ -175,9 +176,8 @@ func SetupV2Routes(
 
 	// Agent Pools (TFE-compatible)
 	// Reference: go-tfe/agent_pool.go, terraform-provider-tfe agent_pool resources
-	poolRepo := repository.NewAgentPoolRepository(db)
 	runnerRepo := repository.NewRunnerRepository(db)
-	agentPoolHandler := handlers.NewAgentPoolHandlerV2(poolRepo, runnerRepo, orgRepo, authService, rbacService)
+	agentPoolHandler := handlers.NewAgentPoolHandlerV2(agentPoolRepo, runnerRepo, orgRepo, authService, rbacService)
 	orgAgentPools := v2.Group("/organizations/:name/agent-pools")
 	{
 		orgAgentPools.GET("", agentPoolHandler.List)
@@ -226,7 +226,7 @@ func SetupV2Routes(
 	// Runners (Self-Hosted Runners Management)
 	// Reference: SELF_HOSTED_RUNNERS_DESIGN.md
 	runnerJobExecRepo := repository.NewRunnerJobExecutionRepository(db)
-	runnerHandler := handlers.NewRunnerHandlerV2(runnerRepo, runnerJobExecRepo, poolRepo, orgRepo, rbacService)
+	runnerHandler := handlers.NewRunnerHandlerV2(runnerRepo, runnerJobExecRepo, agentPoolRepo, orgRepo, rbacService)
 
 	// Runners by organization (management API)
 	orgRunners := v2.Group("/organizations/:name/runners")
@@ -1183,7 +1183,7 @@ func SetupV2Routes(
 	runnerInventoryService := ansible.NewInventoryService(ansibleInventoryRepo, orgRepo)
 
 	runnerAgentHandler := handlers.NewRunnerAgentHandlerWithRepos(
-		runnerRepo, runnerJobExecRepo, poolRepo, nil,
+		runnerRepo, runnerJobExecRepo, agentPoolRepo, nil,
 		ansibleJobRepo, ansiblePlaybookRepo, ansibleInventoryRepo,
 		ansibleCredentialRepo, ansibleConfigRepo, runnerInventoryService, vcsRegistry, runnerCryptoSvc,
 		variableService, configStorageClient, db,
