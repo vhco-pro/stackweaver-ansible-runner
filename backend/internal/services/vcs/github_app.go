@@ -400,7 +400,7 @@ func (s *GitHubAppService) ListYamlFiles(ctx context.Context, installationID, ow
 					// Recursively search subdirectories
 					if err := listYamlFilesRecursive(file.GetPath()); err != nil {
 						// Log error but continue searching other directories
-						fmt.Printf("Warning: failed to list files in directory %s: %v\n", file.GetPath(), err)
+						logger.Warnf("vcs: failed to list files in directory %s: %v", file.GetPath(), err)
 					}
 				}
 			}
@@ -473,7 +473,7 @@ func (s *GitHubAppService) ListInventoryFiles(ctx context.Context, installationI
 					// Recursively search subdirectories
 					if err := listInventoryFilesRecursive(file.GetPath()); err != nil {
 						// Log error but continue searching other directories
-						fmt.Printf("Warning: failed to list files in directory %s: %v\n", file.GetPath(), err)
+						logger.Warnf("vcs: failed to list files in directory %s: %v", file.GetPath(), err)
 					}
 				}
 			}
