@@ -193,9 +193,9 @@ func (s *Service) AuthenticateMiddleware() gin.HandlerFunc {
 
 		// Extract token from Authorization header (standard TFE authentication)
 		authHeader := c.GetHeader("Authorization")
-		fmt.Printf("[AUTH DEBUG] Authorization header present: %v\n", authHeader != "")
+		logger.Debugf("auth: authorization header present: %v", authHeader != "")
 		if authHeader == "" {
-			fmt.Printf("[AUTH DEBUG] Missing authorization header for path: %s\n", c.Request.URL.Path)
+			logger.Debugf("auth: missing authorization header for path: %s", c.Request.URL.Path)
 			c.JSON(401, gin.H{
 				"errors": []gin.H{
 					{
@@ -232,17 +232,17 @@ func (s *Service) AuthenticateMiddleware() gin.HandlerFunc {
 		if len(tokenString) > 10 {
 			tokenPreview = tokenString[:10]
 		}
-		fmt.Printf("[AUTH DEBUG] Received token (first 10 chars): %s...\n", tokenPreview)
-		fmt.Printf("[AUTH DEBUG] Request path: %s\n", c.Request.URL.Path)
-		fmt.Printf("[AUTH DEBUG] Request method: %s\n", c.Request.Method)
+		logger.Debugf("auth: received token (first 10 chars): %s...", tokenPreview)
+		logger.Debugf("auth: request path: %s", c.Request.URL.Path)
+		logger.Debugf("auth: request method: %s", c.Request.Method)
 
 		// Try API key or TFE token first (if it starts with "tfe-")
 		if strings.HasPrefix(tokenString, "tfe-") {
-			fmt.Printf("[AUTH DEBUG] Token starts with 'tfe-', attempting TFE token lookup\n")
+			logger.Debug("auth: token starts with 'tfe-', attempting TFE token lookup")
 			// First try TFE token (legacy)
 			tfeToken, err := s.tfeTokenRepo.GetByToken(tokenString)
 			if err == nil {
-				fmt.Printf("[AUTH DEBUG] TFE token lookup successful, user_id: %s\n", tfeToken.UserID)
+				logger.Debugf("auth: TFE token lookup successful, user_id: %s", tfeToken.UserID)
 				// Update last used timestamp
 				_ = s.tfeTokenRepo.UpdateLastUsed(tfeToken.ID)
 
@@ -284,10 +284,10 @@ func (s *Service) AuthenticateMiddleware() gin.HandlerFunc {
 			}
 			// If both fail, continue to JWT verification
 			if err != nil {
-				fmt.Printf("[AUTH DEBUG] TFE token lookup failed: %v\n", err)
+				logger.Debugf("auth: TFE token lookup failed: %v", err)
 			}
 		} else {
-			fmt.Printf("[AUTH DEBUG] Token does not start with 'tfe-', attempting JWT verification\n")
+			logger.Debug("auth: token does not start with 'tfe-', attempting JWT verification")
 		}
 
 		// Try JWT token (Zitadel)
@@ -309,7 +309,7 @@ func (s *Service) AuthenticateMiddleware() gin.HandlerFunc {
 		claims, claimsMap, err := s.verifier.VerifyToken(c.Request.Context(), tokenString)
 		if err != nil {
 			// Log the actual error for debugging (but don't expose it to client for security)
-			fmt.Printf("Token verification failed: %v\n", err)
+			logger.Warnf("auth: token verification failed: %v", err)
 			c.JSON(401, gin.H{
 				"errors": []gin.H{
 					{

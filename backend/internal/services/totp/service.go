@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 
 	"github.com/zitadel/zitadel-go/v3/pkg/client"
 	userV2 "github.com/zitadel/zitadel-go/v3/pkg/client/zitadel/user/v2"
@@ -24,8 +25,18 @@ type Service struct {
 func NewService(zitadelIssuer, zitadelInternalAddr, loginServicePAT string) (*Service, error) {
 	ctx := context.Background()
 
-	// Use localhost as domain to match ExternalDomain
-	zitadelInstance := zitadelpkg.New("localhost", zitadelpkg.WithInsecure("8080"))
+	// Derive domain from issuer URL so the gRPC :authority header matches Zitadel's ExternalDomain.
+	// In Docker Compose (localhost) the port is 8080; in Kubernetes the ExternalPort is 443.
+	// The custom dialer below handles actual TCP routing to zitadelInternalAddr regardless.
+	zitadelDomain := "localhost"
+	zitadelPort := "8080"
+	if issuerURL, parseErr := url.Parse(zitadelIssuer); parseErr == nil && issuerURL.Hostname() != "" {
+		zitadelDomain = issuerURL.Hostname()
+		if zitadelDomain != "localhost" {
+			zitadelPort = "443"
+		}
+	}
+	zitadelInstance := zitadelpkg.New(zitadelDomain, zitadelpkg.WithInsecure(zitadelPort))
 
 	if zitadelInternalAddr == "" {
 		zitadelInternalAddr = "internal-zitadel:8080"

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/iac-platform/backend/internal/plugins"
+	"github.com/michielvha/logger"
 )
 
 type Plugin struct {
@@ -31,7 +31,7 @@ type Plugin struct {
 // Version must not be empty -- it should be resolved from workspace or org before calling this.
 func NewPlugin(terraformVersion string) *Plugin {
 	if terraformVersion == "" {
-		log.Printf("WARNING: NewPlugin called with empty terraform version -- runs will fail")
+		logger.Warn("terraform: NewPlugin called with empty terraform version -- runs will fail")
 	}
 	p := &Plugin{
 		terraformVersion: terraformVersion,
@@ -46,14 +46,14 @@ func (p *Plugin) resolveBinary() string {
 	// Check for versioned binary: /usr/local/bin/terraform-X.Y.Z
 	versioned := "/usr/local/bin/terraform-" + p.terraformVersion
 	if _, err := os.Stat(versioned); err == nil {
-		log.Printf("Using terraform %s from %s", p.terraformVersion, versioned)
+		logger.Infof("terraform: using terraform %s from %s", p.terraformVersion, versioned)
 		return versioned
 	}
 
 	// Not installed locally - download it
 	downloaded, err := downloadTerraform(p.terraformVersion)
 	if err != nil {
-		log.Printf("FATAL: failed to get terraform %s: %v", p.terraformVersion, err)
+		logger.Errorf("terraform: failed to get terraform %s: %v", p.terraformVersion, err)
 		// Return the versioned path anyway - commands will fail with a clear
 		// "binary not found" error rather than silently using a wrong version
 		return versioned
@@ -69,7 +69,7 @@ func downloadTerraform(version string) (string, error) {
 	url := fmt.Sprintf("https://releases.hashicorp.com/terraform/%s/terraform_%s_%s_%s.zip", version, version, osName, arch)
 	destBin := "/usr/local/bin/terraform-" + version
 
-	log.Printf("Downloading Terraform %s from %s", version, url)
+	logger.Infof("terraform: downloading terraform %s from %s", version, url)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil) //nolint:gosec // intentional: downloading terraform binary
 	if err != nil {
@@ -132,7 +132,7 @@ func downloadTerraform(version string) (string, error) {
 		return "", fmt.Errorf("chmod: %w", err)
 	}
 
-	log.Printf("Installed Terraform %s at %s", version, destBin)
+	logger.Infof("terraform: installed terraform %s at %s", version, destBin)
 	return destBin, nil
 }
 
@@ -359,7 +359,7 @@ func (p *Plugin) planWithStreaming(ctx context.Context, cmd *exec.Cmd, hasRemote
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			// Log scanner error but don't fail the command
+			logger.Warnf("terraform: scanner error reading stdout: %v", err)
 			_, _ = fmt.Fprintf(&outputBuffer, "Warning: Scanner error reading stdout: %v\n", err)
 		}
 	}()
@@ -381,7 +381,7 @@ func (p *Plugin) planWithStreaming(ctx context.Context, cmd *exec.Cmd, hasRemote
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			// Log scanner error but don't fail the command
+			logger.Warnf("terraform: scanner error reading stderr: %v", err)
 			_, _ = fmt.Fprintf(&outputBuffer, "Warning: Scanner error reading stderr: %v\n", err)
 		}
 	}()
@@ -656,7 +656,7 @@ func (p *Plugin) applyWithStreaming(ctx context.Context, cmd *exec.Cmd, options 
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			// Log scanner error but don't fail the command
+			logger.Warnf("terraform: scanner error reading stdout: %v", err)
 			_, _ = fmt.Fprintf(&outputBuffer, "Warning: Scanner error reading stdout: %v\n", err)
 		}
 	}()
@@ -678,7 +678,7 @@ func (p *Plugin) applyWithStreaming(ctx context.Context, cmd *exec.Cmd, options 
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			// Log scanner error but don't fail the command
+			logger.Warnf("terraform: scanner error reading stderr: %v", err)
 			_, _ = fmt.Fprintf(&outputBuffer, "Warning: Scanner error reading stderr: %v\n", err)
 		}
 	}()
