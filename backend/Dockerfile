@@ -10,8 +10,8 @@ ARG TARGETOS
 # Copy the ARG value to an ENV variable that will persist at runtime
 ENV IMAGE_NAME=${IMAGE_NAME}
 
-# Install runtime dependencies
-RUN apk add --no-cache git ca-certificates wget
+# Install runtime dependencies (upgrade first to pull security patches)
+RUN apk upgrade --no-cache && apk add --no-cache git ca-certificates wget
 
 # Create a non-root user with UID 1001 to match GitHub Actions runner
 RUN addgroup -g 1001 ${IMAGE_NAME} && \
