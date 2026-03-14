@@ -27,8 +27,8 @@ RUN uv sync --frozen --group all --no-dev --no-install-project
 # ── Runtime stage ────────────────────────────────────────────────────
 FROM python:3.14-slim
 
-# System packages required by Ansible modules / connections
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# System packages required by Ansible modules / connections (upgrade first to pull security patches)
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
         openssh-client git sshpass ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
