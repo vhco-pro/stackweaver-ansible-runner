@@ -10,7 +10,6 @@ on:
 permissions:
   contents: read
   packages: write
-  security-events: write
 
 jobs:
   release:
@@ -32,7 +31,6 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/vhco-pro/stackweaver-ansible-runner:buildcache
           cache-to: type=registry,ref=ghcr.io/vhco-pro/stackweaver-ansible-runner:buildcache,mode=max
           trivy-exit-code: '1'
-          trivy-format: sarif
 
   # bump-helm:
   #   needs: release
