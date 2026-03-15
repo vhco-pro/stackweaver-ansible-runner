@@ -106,6 +106,8 @@ type ZitadelVerifier struct {
 	clientSecret string
 	httpClient   *http.Client
 	keySet       oidc.KeySet
+	internalAddr string // K8s-internal service address (e.g. "zitadel:8080"), bypasses TLS
+	hostOverride string // External issuer hostname sent as Host header for tenant routing
 }
 
 // NewZitadelVerifier creates a new Zitadel JWT verifier using the OIDC library.
@@ -143,6 +145,8 @@ func NewZitadelVerifier(issuer, clientID, clientSecret, internalAddr string) (*Z
 		clientSecret: clientSecret,
 		httpClient:   httpClient,
 		keySet:       keySet,
+		internalAddr: internalAddr,
+		hostOverride: hostOverride,
 	}, nil
 }
 
@@ -208,8 +212,11 @@ type UserInfo struct {
 
 // ExtractUserInfo extracts user information from token claims
 // Uses the raw claims map to extract custom Zitadel fields (email, name, etc.)
-// If email is missing from claims, calls UserInfo endpoint (standard OIDC fallback)
-func ExtractUserInfo(ctx context.Context, claims *oidc.AccessTokenClaims, claimsMap map[string]interface{}, issuer, tokenString string, httpClient *http.Client) *UserInfo {
+// If email is missing from claims, calls UserInfo endpoint (standard OIDC fallback).
+// internalAddr and hostOverride are optional: when set, the UserInfo call is routed
+// through the internal K8s service address (plain HTTP) instead of the external issuer
+// URL, avoiding TLS certificate trust issues with corporate/private CAs.
+func ExtractUserInfo(ctx context.Context, claims *oidc.AccessTokenClaims, claimsMap map[string]interface{}, issuer, tokenString string, httpClient *http.Client, internalAddr, hostOverride string) *UserInfo {
 	info := &UserInfo{
 		Subject: claims.Subject,
 		ID:      claims.Subject,
@@ -229,7 +236,7 @@ func ExtractUserInfo(ctx context.Context, claims *oidc.AccessTokenClaims, claims
 	// If email is missing, call UserInfo endpoint (standard OIDC practice)
 	var userInfoData map[string]interface{}
 	if !emailFound && issuer != "" && tokenString != "" && httpClient != nil {
-		userInfoData = fetchUserInfoFromEndpoint(ctx, issuer, tokenString, httpClient)
+		userInfoData = fetchUserInfoFromEndpoint(ctx, issuer, tokenString, httpClient, internalAddr, hostOverride)
 		if userInfoData != nil {
 			// Try email field
 			if email, ok := userInfoData["email"].(string); ok && email != "" {
@@ -321,16 +328,31 @@ func getClaimKeys(m map[string]interface{}) []string {
 	return keys
 }
 
-// fetchUserInfoFromEndpoint calls the OIDC UserInfo endpoint
-// Returns the parsed JSON response or nil on error
-func fetchUserInfoFromEndpoint(ctx context.Context, issuer, tokenString string, httpClient *http.Client) map[string]interface{} {
+// fetchUserInfoFromEndpoint calls the OIDC UserInfo endpoint.
+// When internalAddr is set (K8s deployments), the request is routed through the
+// internal service address over plain HTTP, with the external issuer hostname sent
+// as the Host header for Zitadel tenant routing.  This mirrors the JWKS fetch
+// pattern and avoids TLS certificate trust issues with corporate/private CAs.
+// Returns the parsed JSON response or nil on error.
+func fetchUserInfoFromEndpoint(ctx context.Context, issuer, tokenString string, httpClient *http.Client, internalAddr, hostOverride string) map[string]interface{} {
 	// Zitadel UserInfo endpoint: /oidc/v1/userinfo (from defaults.yaml)
-	userInfoURL := issuer + "/oidc/v1/userinfo"
+	var userInfoURL string
+	if internalAddr != "" {
+		userInfoURL = "http://" + internalAddr + "/oidc/v1/userinfo"
+	} else {
+		userInfoURL = issuer + "/oidc/v1/userinfo"
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", userInfoURL, nil)
 	if err != nil {
 		logger.Warnf("Failed to create UserInfo request: %v", err)
 		return nil
+	}
+
+	// When using an internal address, set the Host header so Zitadel can identify
+	// the correct instance (Zitadel routes tenants by the Host header).
+	if hostOverride != "" {
+		req.Host = hostOverride
 	}
 
 	// Set Authorization header with Bearer token (OIDC standard)
