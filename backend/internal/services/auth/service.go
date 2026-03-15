@@ -136,7 +136,7 @@ func (s *Service) GetUserFromToken(tokenString string) (*models.User, error) {
 
 	// Extract user info from claims (using raw claims map for custom Zitadel fields)
 	// If email is missing, fallback to UserInfo endpoint (standard OIDC)
-	userInfo := ExtractUserInfo(ctx, claims, claimsMap, s.issuer, tokenString, s.verifier.httpClient)
+	userInfo := ExtractUserInfo(ctx, claims, claimsMap, s.issuer, tokenString, s.verifier.httpClient, s.verifier.internalAddr, s.verifier.hostOverride)
 
 	// Get or create user in database by Zitadel subject
 	user, err := s.userRepo.GetOrCreateByZitadelSubject(
@@ -325,7 +325,7 @@ func (s *Service) AuthenticateMiddleware() gin.HandlerFunc {
 
 		// Extract user info from claims (using raw claims map for custom Zitadel fields)
 		// If email is missing, fallback to UserInfo endpoint (standard OIDC)
-		userInfo := ExtractUserInfo(c.Request.Context(), claims, claimsMap, s.issuer, tokenString, s.verifier.httpClient)
+		userInfo := ExtractUserInfo(c.Request.Context(), claims, claimsMap, s.issuer, tokenString, s.verifier.httpClient, s.verifier.internalAddr, s.verifier.hostOverride)
 
 		logger.Infof("Auth: Subject=%s Email=%s Groups=%v", userInfo.Subject, userInfo.Email, userInfo.Groups)
 
