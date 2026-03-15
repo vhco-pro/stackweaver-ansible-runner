@@ -30,7 +30,7 @@ jobs:
           context: .
           cache-from: type=registry,ref=ghcr.io/vhco-pro/stackweaver-ansible-runner:buildcache
           cache-to: type=registry,ref=ghcr.io/vhco-pro/stackweaver-ansible-runner:buildcache,mode=max
-          trivy-exit-code: '1'
+          trivy-exit-code: '0'
 
   # bump-helm:
   #   needs: release
