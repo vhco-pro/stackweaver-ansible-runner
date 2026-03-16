@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -97,18 +98,32 @@ func loadPrivateKeyFromFile(path string) (*rsa.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read private key file: %w", err)
 	}
-	return loadPrivateKeyFromString(string(data))
+
+	key, parseErr := loadPrivateKeyFromString(string(data))
+	if parseErr != nil {
+		lineCount := strings.Count(string(data), "\n")
+		return nil, fmt.Errorf("%w (hint: file=%s size=%d lines=%d)", parseErr, path, len(data), lineCount)
+	}
+	return key, nil
 }
 
 // loadPrivateKeyFromString loads a private key from a PEM string
 func loadPrivateKeyFromString(keyData string) (*rsa.PrivateKey, error) {
-	// Remove any whitespace and newlines that might be in environment variable
 	keyData = strings.TrimSpace(keyData)
 	keyData = strings.ReplaceAll(keyData, "\\n", "\n")
 
 	block, _ := pem.Decode([]byte(keyData))
 	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM block")
+		// PEM decode failed — attempt normalization for keys where newlines
+		// were replaced by spaces (common with secret managers like 1Password,
+		// HashiCorp Vault, or ExternalSecrets operator)
+		normalized := normalizePEM(keyData)
+		if normalized != "" {
+			block, _ = pem.Decode([]byte(normalized))
+		}
+		if block == nil {
+			return nil, fmt.Errorf("failed to decode PEM block")
+		}
 	}
 
 	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
@@ -126,4 +141,37 @@ func loadPrivateKeyFromString(keyData string) (*rsa.PrivateKey, error) {
 	}
 
 	return privateKey, nil
+}
+
+// pemHeaderRe matches PEM BEGIN/END markers to extract the type label and body.
+var pemHeaderRe = regexp.MustCompile(`(?s)-----BEGIN ([A-Z0-9 ]+)-----(.+?)-----END ([A-Z0-9 ]+)-----`)
+
+// normalizePEM reconstructs a properly formatted PEM block from input where
+// newlines have been replaced by spaces (e.g. secret managers, 1Password).
+func normalizePEM(data string) string {
+	m := pemHeaderRe.FindStringSubmatch(data)
+	if m == nil {
+		return ""
+	}
+
+	pemType := m[1]
+	body := m[2]
+
+	// Strip all whitespace from the base64 body
+	body = strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(body)
+	if body == "" {
+		return ""
+	}
+
+	// Re-wrap at 64 characters per line (standard PEM line length)
+	var lines []string
+	for len(body) > 64 {
+		lines = append(lines, body[:64])
+		body = body[64:]
+	}
+	if len(body) > 0 {
+		lines = append(lines, body)
+	}
+
+	return fmt.Sprintf("-----BEGIN %s-----\n%s\n-----END %s-----\n", pemType, strings.Join(lines, "\n"), pemType)
 }

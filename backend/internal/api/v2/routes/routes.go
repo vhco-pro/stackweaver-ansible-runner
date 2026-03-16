@@ -832,8 +832,12 @@ func SetupV2Routes(
 			)
 			vcsWebhook.POST("/webhook", appHandler.HandleInstallationWebhook)
 		}
+	}
 
-		// Also update the installation initiation handler
+	// VCS install routes (authenticated) — registered unconditionally so the handler
+	// can return an actionable error when GitHub App is not configured, instead of a bare 404.
+	// The Azure DevOps install route must also not depend on GitHub App status.
+	{
 		orgVCSConnections := v2.Group("/organizations/:name/vcs-connections")
 		{
 			// Initialize storage for VCS connection handlers
