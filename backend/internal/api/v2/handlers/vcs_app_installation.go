@@ -135,8 +135,8 @@ func (h *VCSAppInstallationHandlerV2) InitiateInstallation(c *gin.Context) {
 			"errors": []gin.H{
 				{
 					"status": "500",
-					"title":  "Configuration Error",
-					"detail": "GitHub App is not configured. Please set GITHUB_APP_ID, GITHUB_APP_NAME, and GITHUB_APP_PRIVATE_KEY environment variables.",
+					"title":  "GitHub App Not Configured",
+					"detail": "The GitHub App integration is not available. Check the API pod logs for initialization errors (search for 'GitHub App Manager'). Common causes: missing GITHUB_APP_ID/GITHUB_APP_NAME env vars, or the PEM private key lost its newlines during secret provisioning.",
 				},
 			},
 		})
