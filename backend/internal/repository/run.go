@@ -48,6 +48,32 @@ func (r *RunRepository) ListByWorkspace(workspaceID string, limit, offset int) (
 	return runs, total, err
 }
 
+// GetLatestByWorkspaceIDs returns the most recent run for each of the given workspace IDs
+// in a single query. The returned map is keyed by workspace ID.
+func (r *RunRepository) GetLatestByWorkspaceIDs(workspaceIDs []string) (map[string]*models.Run, error) {
+	if len(workspaceIDs) == 0 {
+		return map[string]*models.Run{}, nil
+	}
+
+	// Use DISTINCT ON (PostgreSQL) to get the latest run per workspace in one query
+	var runs []models.Run
+	err := r.db.Raw(`
+		SELECT DISTINCT ON (workspace_id) *
+		FROM runs
+		WHERE workspace_id IN ?
+		ORDER BY workspace_id, created_at DESC
+	`, workspaceIDs).Scan(&runs).Error
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]*models.Run, len(runs))
+	for i := range runs {
+		result[runs[i].WorkspaceID] = &runs[i]
+	}
+	return result, nil
+}
+
 func (r *RunRepository) Update(run *models.Run) error {
 	return r.db.Save(run).Error
 }

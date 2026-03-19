@@ -32,6 +32,7 @@ type WorkspaceHandlerV2 struct {
 	vcsConnectionRepo *repository.VCSConnectionRepository
 	teamRepo          *repository.TeamRepository
 	poolRepo          *repository.AgentPoolRepository
+	runRepo           *repository.RunRepository
 	authService       *auth.Service
 	activityService   *activity.Service
 	rbacService       *rbac.Service
@@ -46,6 +47,7 @@ func NewWorkspaceHandlerV2(
 	vcsConnectionRepo *repository.VCSConnectionRepository,
 	teamRepo *repository.TeamRepository,
 	poolRepo *repository.AgentPoolRepository,
+	runRepo *repository.RunRepository,
 	authService *auth.Service,
 	activityService *activity.Service,
 	rbacService *rbac.Service,
@@ -59,6 +61,7 @@ func NewWorkspaceHandlerV2(
 		vcsConnectionRepo: vcsConnectionRepo,
 		teamRepo:          teamRepo,
 		poolRepo:          poolRepo,
+		runRepo:           runRepo,
 		authService:       authService,
 		activityService:   activityService,
 		rbacService:       rbacService,
@@ -365,33 +368,42 @@ func (h *WorkspaceHandlerV2) ListByOrganization(c *gin.Context) {
 		}
 	}
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		workspacesData := make([]gin.H, len(workspaces))
-		for i := range workspaces {
-			workspacesData[i] = formatWorkspaceSimple(&workspaces[i])
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"data": workspacesData,
-			"meta": gin.H{
-				"pagination": gin.H{
-					"page":     pageNumber,
-					"per_page": pageSize,
-					"total":    total,
-				},
-			},
-		})
-		return
-	}
-
-	// Default: Format workspaces in TFE-compatible JSON:API format
+	// Format workspaces in TFE-compatible JSON:API format
 	workspacesData := make([]gin.H, len(workspaces))
+
+	// Fetch latest run per workspace in a single batch query (avoids N+1)
+	workspaceIDs := make([]string, len(workspaces))
 	for i := range workspaces {
-		workspacesData[i] = formatWorkspaceResponse(&workspaces[i], h.vcsConnectionRepo)
+		workspaceIDs[i] = workspaces[i].ID
+	}
+	latestRuns, err := h.runRepo.GetLatestByWorkspaceIDs(workspaceIDs)
+	if err != nil {
+		// Non-fatal: log and continue without run data
+		logger.Warnf("Failed to batch-fetch latest runs for workspace list: %v", err)
+		latestRuns = map[string]*models.Run{}
 	}
 
-	// TFE-compatible response format
-	c.JSON(http.StatusOK, gin.H{
+	var included []gin.H
+	for i := range workspaces {
+		wsData := formatWorkspaceResponse(&workspaces[i], h.vcsConnectionRepo)
+
+		// Add current-run relationship if a run exists
+		if run, ok := latestRuns[workspaces[i].ID]; ok {
+			rels := wsData["relationships"].(gin.H)
+			rels["current-run"] = gin.H{
+				"data": gin.H{
+					"id":   run.ID,
+					"type": "runs",
+				},
+			}
+			included = append(included, formatRunForInclusion(run))
+		}
+
+		workspacesData[i] = wsData
+	}
+
+	// TFE-compatible response format with sideloaded run data
+	response := gin.H{
 		"data": workspacesData,
 		"meta": gin.H{
 			"pagination": gin.H{
@@ -400,7 +412,11 @@ func (h *WorkspaceHandlerV2) ListByOrganization(c *gin.Context) {
 				"total":    total,
 			},
 		},
-	})
+	}
+	if len(included) > 0 {
+		response["included"] = included
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // formatWorkspaceResponse formats a workspace model into TFE-compatible JSON:API format
@@ -569,6 +585,21 @@ func formatWorkspaceResponse(workspace *models.Workspace, vcsConnRepo ...*reposi
 	}
 	attributes["setting-overwrites"] = settingOverwrites
 
+	// StackWeaver extensions — extra attributes the frontend needs that aren't in the TFE API.
+	// TFE clients will ignore unknown attributes.
+	if workspace.VCSConnectionID != nil {
+		attributes["vcs-connection-id"] = workspace.VCSConnectionID.String()
+		if workspace.VCSConnection != nil {
+			attributes["vcs-account-name"] = workspace.VCSConnection.AccountName
+		}
+	}
+	if workspace.AgentPoolID != nil && workspace.AgentPool.Name != "" {
+		attributes["agent-pool-name"] = workspace.AgentPool.Name
+	}
+	if workspace.LockedAt != nil {
+		attributes["locked-at"] = workspace.LockedAt.Format("2006-01-02T15:04:05Z")
+	}
+
 	// Build relationships
 	relationships := gin.H{}
 
@@ -630,81 +661,45 @@ func formatWorkspaceResponse(workspace *models.Workspace, vcsConnRepo ...*reposi
 	}
 }
 
-// formatWorkspaceSimple formats a workspace in simple format for frontend compatibility
-func formatWorkspaceSimple(workspace *models.Workspace) gin.H {
-	// Default branch to "main" when empty
-	vcsBranch := workspace.VCSBranch
-	if vcsBranch == "" && workspace.VCSRepository != "" {
-		vcsBranch = "main"
+// formatRunForInclusion formats a run as a lightweight JSON:API resource for sideloading
+// in the workspace list response. Includes only the attributes the frontend needs for
+// workspace cards: status, operation, plan-only, has-changes, timestamps.
+func formatRunForInclusion(run *models.Run) gin.H {
+	planOnly := run.Operation == models.RunOperationPlanOnly
+
+	attributes := gin.H{
+		"status":      string(run.Status),
+		"operation":   string(run.Operation),
+		"is-destroy":  run.Operation == models.RunOperationDestroy,
+		"plan-only":   planOnly,
+		"created-at":  run.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		"updated-at":  run.UpdatedAt.Format("2006-01-02T15:04:05Z"),
+		"has-changes": hasChanges(run),
+		"permissions": gin.H{
+			"can-apply": !planOnly && run.Status == models.RunStatusPlanned,
+		},
+	}
+	if run.CompletedAt != nil {
+		attributes["completed-at"] = run.CompletedAt.Format("2006-01-02T15:04:05Z")
 	}
 
-	// Derive VCS provider: prefer VCSConnection.Provider (source of truth), fall back to deprecated workspace field
-	vcsProvider := workspace.VCSProvider
-	if vcsProvider == "" && workspace.VCSConnection != nil {
-		vcsProvider = string(workspace.VCSConnection.Provider)
+	return gin.H{
+		"id":         run.ID,
+		"type":       "runs",
+		"attributes": attributes,
+		"relationships": gin.H{
+			"workspace": gin.H{
+				"data": gin.H{
+					"id":   run.WorkspaceID,
+					"type": "workspaces",
+				},
+			},
+		},
 	}
-
-	result := gin.H{
-		"id":                            workspace.ID,
-		"project_id":                    workspace.ProjectID.String(),
-		"name":                          workspace.Name,
-		"description":                   workspace.Description,
-		"vcs_connection_id":             nil, // Will be set below if workspace has VCS connection
-		"vcs_provider":                  vcsProvider,
-		"vcs_repository":                workspace.VCSRepository,
-		"vcs_branch":                    vcsBranch,
-		"terraform_version":             workspace.TerraformVersion,
-		"working_directory":             workspace.WorkingDirectory,
-		"auto_queue_runs":               workspace.AutoQueueRuns,
-		"auto_apply":                    workspace.AutoApply,
-		"auto_apply_run_trigger":        workspace.AutoApplyRunTrigger,
-		"allow_destroy_plan":            workspace.AllowDestroyPlan,
-		"queue_all_runs":                workspace.QueueAllRuns,
-		"speculative_enabled":           workspace.SpeculativeEnabled,
-		"file_triggers_enabled":         workspace.FileTriggersEnabled,
-		"global_remote_state":           workspace.GlobalRemoteState,
-		"structured_run_output_enabled": workspace.StructuredRunOutputEnabled,
-		"assessments_enabled":           workspace.AssessmentsEnabled,
-		"execution_mode":                workspace.ExecutionMode,
-		"agent_pool_id":                 nil, // Will be set below if workspace has agent pool
-		"force_delete":                  workspace.ForceDelete,
-		"locked":                        workspace.Locked,
-		"locked_reason":                 workspace.LockedReason,
-		"run_timeout":                   workspace.RunTimeout,
-		"created_at":                    workspace.CreatedAt.Format("2006-01-02T15:04:05Z"),
-		"updated_at":                    workspace.UpdatedAt.Format("2006-01-02T15:04:05Z"),
-	}
-
-	// Include VCS connection ID and account name if workspace has one configured
-	if workspace.VCSConnectionID != nil {
-		result["vcs_connection_id"] = workspace.VCSConnectionID.String()
-		if workspace.VCSConnection != nil {
-			result["vcs_account_name"] = workspace.VCSConnection.AccountName
-		}
-	}
-
-	// Include agent pool ID and name if workspace has one configured
-	if workspace.AgentPoolID != nil {
-		result["agent_pool_id"] = workspace.AgentPoolID.String()
-		if workspace.AgentPool.Name != "" {
-			result["agent_pool_name"] = workspace.AgentPool.Name
-		}
-	}
-
-	// Include locked_by and locked_at if workspace is locked
-	if workspace.LockedBy != nil {
-		result["locked_by"] = workspace.LockedBy.String()
-	}
-	if workspace.LockedAt != nil {
-		result["locked_at"] = workspace.LockedAt.Format("2006-01-02T15:04:05Z")
-	}
-
-	return result
 }
 
 // GetByOrganizationAndName gets a workspace by organization name and workspace name (TFE-compatible)
 // GET /api/v2/organizations/:name/workspaces/:name
-// Supports ?format=simple for frontend compatibility
 func (h *WorkspaceHandlerV2) GetByOrganizationAndName(c *gin.Context) {
 	orgName := c.Param("name")
 	workspaceName := c.Param("workspace_name")
@@ -723,15 +718,6 @@ func (h *WorkspaceHandlerV2) GetByOrganizationAndName(c *gin.Context) {
 		return
 	}
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusOK, gin.H{
-			"data": formatWorkspaceSimple(workspace),
-		})
-		return
-	}
-
-	// Default: TFE-compatible JSON:API format
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatWorkspaceResponse(workspace, h.vcsConnectionRepo),
 	})
@@ -1171,15 +1157,6 @@ func (h *WorkspaceHandlerV2) Create(c *gin.Context) {
 		_ = h.activityService.LogCreate(c.Request.Context(), "workspace", createdWorkspace.ID, createdWorkspace.Name, activityCtx)
 	}
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusCreated, gin.H{
-			"data": formatWorkspaceSimple(createdWorkspace),
-		})
-		return
-	}
-
-	// Default: Format in TFE-compatible JSON:API format
 	c.JSON(http.StatusCreated, gin.H{
 		"data": formatWorkspaceResponse(createdWorkspace, h.vcsConnectionRepo),
 	})
@@ -1635,15 +1612,6 @@ func (h *WorkspaceHandlerV2) Update(c *gin.Context) {
 		_ = h.activityService.LogUpdate(c.Request.Context(), "workspace", workspace.ID, workspace.Name, changes, activityCtx)
 	}
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusOK, gin.H{
-			"data": formatWorkspaceSimple(workspace),
-		})
-		return
-	}
-
-	// Default: Format in TFE-compatible JSON:API format
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatWorkspaceResponse(workspace, h.vcsConnectionRepo),
 	})
@@ -1982,14 +1950,6 @@ func (h *WorkspaceHandlerV2) Lock(c *gin.Context) {
 	// Reload to get updated workspace
 	workspace, _ = h.workspaceRepo.GetByID(workspaceID)
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusOK, gin.H{
-			"data": formatWorkspaceSimple(workspace),
-		})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatWorkspaceResponse(workspace, h.vcsConnectionRepo),
 	})
@@ -2121,14 +2081,6 @@ func (h *WorkspaceHandlerV2) Unlock(c *gin.Context) {
 	// Reload to get updated workspace
 	workspace, _ = h.workspaceRepo.GetByID(workspaceID)
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusOK, gin.H{
-			"data": formatWorkspaceSimple(workspace),
-		})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatWorkspaceResponse(workspace, h.vcsConnectionRepo),
 	})
@@ -2200,14 +2152,6 @@ func (h *WorkspaceHandlerV2) ForceUnlock(c *gin.Context) {
 	// Reload to get updated workspace
 	workspace, _ = h.workspaceRepo.GetByID(workspaceID)
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusOK, gin.H{
-			"data": formatWorkspaceSimple(workspace),
-		})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatWorkspaceResponse(workspace, h.vcsConnectionRepo),
 	})
@@ -2244,15 +2188,6 @@ func (h *WorkspaceHandlerV2) GetByID(c *gin.Context) {
 		return
 	}
 
-	// Check if frontend wants simple format
-	if c.Query("format") == "simple" {
-		c.JSON(http.StatusOK, gin.H{
-			"data": formatWorkspaceSimple(workspace),
-		})
-		return
-	}
-
-	// Default: Format in TFE-compatible JSON:API format
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatWorkspaceResponse(workspace, h.vcsConnectionRepo),
 	})
