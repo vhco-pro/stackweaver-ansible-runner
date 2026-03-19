@@ -89,7 +89,7 @@ func SetupV2Routes(
 	teamWorkspaceAccessHandler := handlers.NewTeamWorkspaceAccessHandlerV2(teamRepo, workspaceRepo, projectRepo, orgRepo, authService, rbacService)
 	teamProjectAccessHandler := handlers.NewTeamProjectAccessHandlerV2(teamRepo, projectRepo, orgRepo, authService, rbacService)
 	agentPoolRepo := repository.NewAgentPoolRepository(db)
-	workspaceHandler := terraformHandlers.NewWorkspaceHandlerV2(workspaceRepo, projectRepo, orgRepo, vcsConnectionRepo, teamRepo, agentPoolRepo, authService, activityService, rbacService, vcsRegistry, db)
+	workspaceHandler := terraformHandlers.NewWorkspaceHandlerV2(workspaceRepo, projectRepo, orgRepo, vcsConnectionRepo, teamRepo, agentPoolRepo, runRepo, authService, activityService, rbacService, vcsRegistry, db)
 
 	// User repository for organization memberships
 	userRepo := repository.NewUserRepository(db)
