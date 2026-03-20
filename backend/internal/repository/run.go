@@ -40,6 +40,7 @@ func (r *RunRepository) ListByWorkspace(workspaceID string, limit, offset int) (
 	}
 
 	err := r.db.Where("workspace_id = ?", workspaceID).
+		Omit("PlanOutput").
 		Preload("AgentPool").Preload("Runner").
 		Order("created_at DESC").
 		Limit(limit).
@@ -80,7 +81,7 @@ func (r *RunRepository) Update(run *models.Run) error {
 
 func (r *RunRepository) ListByStatus(status models.RunStatus, limit int) ([]models.Run, error) {
 	var runs []models.Run
-	err := r.db.Where("status = ?", status).Limit(limit).Find(&runs).Error
+	err := r.db.Where("status = ?", status).Omit("PlanOutput").Limit(limit).Find(&runs).Error
 	return runs, err
 }
 
@@ -100,6 +101,7 @@ func (r *RunRepository) ListByOrganization(organizationID uuid.UUID, limit, offs
 	}
 
 	err := query.
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Preload("Workspace.Project").
 		Preload("AgentPool").
@@ -125,6 +127,7 @@ func (r *RunRepository) ListQueued(organizationID uuid.UUID, limit int) ([]model
 		Joins("JOIN projects ON workspaces.project_id = projects.id").
 		Where("projects.organization_id = ?", organizationID).
 		Where("runs.status IN ?", []models.RunStatus{models.RunStatusPending, models.RunStatusRunning}).
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Preload("Workspace.Project").
 		Order("runs.created_at ASC").
@@ -149,6 +152,7 @@ func (r *RunRepository) FindStuckRuns(maxAge time.Duration) ([]models.Run, error
 		Where("runs.status = ?", models.RunStatusRunning).
 		Where("runs.started_at IS NOT NULL").
 		Where("runs.started_at < NOW() - INTERVAL '1 second' * COALESCE(NULLIF(workspaces.run_timeout, 0), 3600)").
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Find(&runs).Error
 	if err != nil {
@@ -161,6 +165,7 @@ func (r *RunRepository) FindStuckRuns(maxAge time.Duration) ([]models.Run, error
 	err = r.db.Model(&models.Run{}).
 		Where("status = ?", models.RunStatusPending).
 		Where("created_at < ?", now.Add(-maxAge)).
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Find(&pendingRuns).Error
 	if err != nil {
@@ -204,6 +209,7 @@ func (r *RunRepository) ListByWorkspaceAndOperationAndConfigVersion(
 	}
 
 	err := query.
+		Omit("PlanOutput").
 		Order("created_at DESC").
 		Limit(limit).
 		Find(&runs).Error
@@ -222,6 +228,7 @@ func (r *RunRepository) ListByUser(userID uuid.UUID, limit, offset int) ([]model
 	}
 
 	err := query.
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Preload("Workspace.Project").
 		Order("created_at DESC").
@@ -248,6 +255,7 @@ func (r *RunRepository) ListByOrganizationAndUser(organizationID, userID uuid.UU
 	}
 
 	err := query.
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Preload("Workspace.Project").
 		Order("runs.created_at DESC").
@@ -276,6 +284,7 @@ func (r *RunRepository) ListPRRunsForStatusChecks(limit int) ([]models.Run, erro
 			models.RunStatusFailed,
 			models.RunStatusCancelled,
 		}).
+		Omit("PlanOutput").
 		Preload("Workspace").
 		Preload("Workspace.Project").
 		Preload("Workspace.Project.Organization").
