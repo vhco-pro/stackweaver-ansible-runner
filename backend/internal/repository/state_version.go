@@ -57,6 +57,7 @@ func (r *StateVersionRepository) ListByWorkspace(workspaceID string, limit, offs
 	}
 
 	err := r.db.Where("workspace_id = ?", workspaceID).
+		Omit("StateData").
 		Order("version DESC").
 		Limit(limit).
 		Offset(offset).

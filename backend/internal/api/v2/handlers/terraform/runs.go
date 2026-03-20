@@ -1205,6 +1205,7 @@ func (h *RunHandlerV2) GetApply(c *gin.Context) {
 	}
 
 	// Apply ID = Run ID (same pattern as Plan ID = Run ID)
+	// Need PlanOutput for extracting planned resources for log parsing
 	run, err := h.runRepo.GetByID(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
