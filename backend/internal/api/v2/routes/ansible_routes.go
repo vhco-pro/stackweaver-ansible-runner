@@ -13,6 +13,7 @@ import (
 	"github.com/iac-platform/backend/internal/services/ansible"
 	"github.com/iac-platform/backend/internal/services/auth"
 	"github.com/iac-platform/backend/internal/services/oidc"
+	"github.com/iac-platform/backend/internal/services/rbac"
 	"github.com/iac-platform/backend/internal/services/variable"
 	vcs "github.com/iac-platform/backend/internal/services/vcs"
 	"github.com/iac-platform/backend/pkg/crypto"
@@ -27,9 +28,10 @@ func SetupAnsibleWorkflowRoutes(
 	orgRepo *repository.OrganizationRepository,
 	projectRepo *repository.ProjectRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 ) {
 	// Initialize Workflow Handler
-	workflowHandler := ansibleHandlers.NewWorkflowHandler(workflowRepo, orgRepo, projectRepo, authService)
+	workflowHandler := ansibleHandlers.NewWorkflowHandler(workflowRepo, orgRepo, projectRepo, authService, rbacService)
 
 	// ==========================================
 	// Ansible Workflow Template Routes
@@ -86,6 +88,7 @@ func SetupAnsibleRoutes(
 	projectRepo *repository.ProjectRepository,
 	orgRepo *repository.OrganizationRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 	redisQueue queue.Queue,
 	encryptionKey []byte,
 	vcsRegistry *vcs.ProviderRegistry,
@@ -153,16 +156,16 @@ func SetupAnsibleRoutes(
 	variableSetHandlerForAnsible := handlers.NewVariableSetHandlerV2(variableSetRepoForAnsible, variableSetVariableRepoForAnsible, orgRepo, projectRepo, nil, templateRepo, authService)
 
 	// Initialize Ansible Handlers
-	inventoryHandler := ansibleHandlers.NewInventoryHandler(inventoryService, inventoryRepo, orgRepo, projectRepo, authService, redisQueue, vcsRegistry, vcsConnectionRepo)
+	inventoryHandler := ansibleHandlers.NewInventoryHandler(inventoryService, inventoryRepo, orgRepo, projectRepo, authService, rbacService, redisQueue, vcsRegistry, vcsConnectionRepo)
 	hostHandler := ansibleHandlers.NewHostHandler(inventoryService, inventoryRepo, authService)
 	groupHandler := ansibleHandlers.NewGroupHandler(inventoryService, inventoryRepo, authService)
-	credentialHandler := ansibleHandlers.NewCredentialHandler(credentialService, orgRepo, projectRepo, authService)
-	playbookHandler := ansibleHandlers.NewPlaybookHandler(playbookRepo, templateRepo, jobRepo, scheduleRepo, projectRepo, orgRepo, authService, redisQueue, vcsRegistry, vcsConnectionRepo)
-	jobHandler := ansibleHandlers.NewJobHandler(jobService, projectRepo, orgRepo, authService)
+	credentialHandler := ansibleHandlers.NewCredentialHandler(credentialService, orgRepo, projectRepo, authService, rbacService)
+	playbookHandler := ansibleHandlers.NewPlaybookHandler(playbookRepo, templateRepo, jobRepo, scheduleRepo, projectRepo, orgRepo, authService, rbacService, redisQueue, vcsRegistry, vcsConnectionRepo)
+	jobHandler := ansibleHandlers.NewJobHandler(jobService, projectRepo, orgRepo, templateRepo, authService, rbacService)
 
 	// Initialize new handlers
 	inventorySourceHandler := ansibleHandlers.NewInventorySourceHandler(inventorySourceService, redisQueue)
-	scheduleHandler := ansibleHandlers.NewScheduleHandler(schedulerService, orgRepo)
+	scheduleHandler := ansibleHandlers.NewScheduleHandler(schedulerService, orgRepo, authService, rbacService)
 	collectionsHandler := ansibleHandlers.NewCollectionsHandler()
 
 	// Initialize job template variable handler

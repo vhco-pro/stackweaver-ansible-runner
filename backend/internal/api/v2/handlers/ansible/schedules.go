@@ -13,19 +13,25 @@ import (
 	"github.com/iac-platform/backend/internal/models"
 	"github.com/iac-platform/backend/internal/repository"
 	"github.com/iac-platform/backend/internal/services/ansible"
+	"github.com/iac-platform/backend/internal/services/auth"
+	"github.com/iac-platform/backend/internal/services/rbac"
 )
 
 // ScheduleHandler handles schedule API requests
 type ScheduleHandler struct {
 	schedulerService *ansible.SchedulerService
 	orgRepo          *repository.OrganizationRepository
+	authService      *auth.Service
+	rbacService      *rbac.Service
 }
 
 // NewScheduleHandler creates a new schedule handler
-func NewScheduleHandler(schedulerService *ansible.SchedulerService, orgRepo *repository.OrganizationRepository) *ScheduleHandler {
+func NewScheduleHandler(schedulerService *ansible.SchedulerService, orgRepo *repository.OrganizationRepository, authService *auth.Service, rbacService *rbac.Service) *ScheduleHandler {
 	return &ScheduleHandler{
 		schedulerService: schedulerService,
 		orgRepo:          orgRepo,
+		authService:      authService,
+		rbacService:      rbacService,
 	}
 }
 
@@ -93,6 +99,34 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 		return
 	}
 	orgID := org.ID
+
+	// RBAC: check org-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create schedules in this organization"},
+			},
+		})
+		return
+	}
 
 	// Parse target IDs based on type
 	var jobTemplateID, inventorySourceID, playbookID *uuid.UUID
@@ -314,6 +348,34 @@ func (h *ScheduleHandler) Get(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check org-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, schedule.OrganizationID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this schedule"},
+			},
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, schedule)
 }
 
@@ -337,6 +399,34 @@ func (h *ScheduleHandler) List(c *gin.Context) {
 	orgID, err := uuid.Parse(orgIDStr.(string))
 	if err != nil {
 		response.BadRequest(c, "Invalid organization ID")
+		return
+	}
+
+	// RBAC: check org-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list schedules in this organization"},
+			},
+		})
 		return
 	}
 
@@ -371,6 +461,39 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// RBAC: fetch schedule and check org-level write permission
+	existingSchedule, err := h.schedulerService.GetSchedule(id)
+	if err != nil {
+		response.NotFound(c, "Schedule not found")
+		return
+	}
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, existingSchedule.OrganizationID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to update this schedule"},
+			},
+		})
+		return
+	}
+
 	var req UpdateScheduleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
@@ -402,6 +525,39 @@ func (h *ScheduleHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	// RBAC: fetch schedule and check org-level write permission
+	schedule, err := h.schedulerService.GetSchedule(id)
+	if err != nil {
+		response.NotFound(c, "Schedule not found")
+		return
+	}
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, schedule.OrganizationID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to delete this schedule"},
+			},
+		})
+		return
+	}
+
 	if err := h.schedulerService.DeleteSchedule(id); err != nil {
 		response.InternalError(c, err.Error())
 		return
@@ -426,6 +582,39 @@ func (h *ScheduleHandler) Enable(c *gin.Context) {
 		return
 	}
 
+	// RBAC: fetch schedule and check org-level write permission
+	schedule, err := h.schedulerService.GetSchedule(id)
+	if err != nil {
+		response.NotFound(c, "Schedule not found")
+		return
+	}
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, schedule.OrganizationID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to enable this schedule"},
+			},
+		})
+		return
+	}
+
 	if err := h.schedulerService.EnableSchedule(id); err != nil {
 		response.InternalError(c, err.Error())
 		return
@@ -447,6 +636,39 @@ func (h *ScheduleHandler) Disable(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid schedule ID")
+		return
+	}
+
+	// RBAC: fetch schedule and check org-level write permission
+	schedule, err := h.schedulerService.GetSchedule(id)
+	if err != nil {
+		response.NotFound(c, "Schedule not found")
+		return
+	}
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, schedule.OrganizationID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to disable this schedule"},
+			},
+		})
 		return
 	}
 
@@ -545,6 +767,34 @@ func (h *ScheduleHandler) ListByOrganization(c *gin.Context) {
 	}
 	orgID := org.ID
 
+	// RBAC: check org-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list schedules in this organization"},
+			},
+		})
+		return
+	}
+
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
 
@@ -570,6 +820,39 @@ func (h *ScheduleHandler) RunNow(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("schedule_id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid schedule ID")
+		return
+	}
+
+	// RBAC: fetch schedule and check org-level write permission
+	schedule, err := h.schedulerService.GetSchedule(id)
+	if err != nil {
+		response.NotFound(c, "Schedule not found")
+		return
+	}
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, schedule.OrganizationID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to run this schedule"},
+			},
+		})
 		return
 	}
 

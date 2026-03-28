@@ -31,6 +31,25 @@ type TeamOrganizationAccess struct {
 	ManageOrganizationAccess bool `gorm:"default:false" json:"manage_organization_access"`
 	AccessSecretTeams        bool `gorm:"default:false" json:"access_secret_teams"`
 	ManageAgentPools         bool `gorm:"default:false" json:"manage_agent_pools"`
+	ManageAnsible            bool `gorm:"default:false" json:"manage_ansible"`
+	ReadAnsible              bool `gorm:"default:false" json:"read_ansible"`
+
+	// Fine-grained Ansible permissions (per-resource-type)
+	// When ManageAnsible is true, all manage+read sub-permissions are implied.
+	// When ReadAnsible is true, all read sub-permissions are implied.
+	// These fields allow restricting a team to specific Ansible resource types.
+	ManageAnsiblePlaybooks    bool `gorm:"default:false" json:"manage_ansible_playbooks"`
+	ReadAnsiblePlaybooks      bool `gorm:"default:false" json:"read_ansible_playbooks"`
+	ManageAnsibleInventories  bool `gorm:"default:false" json:"manage_ansible_inventories"`
+	ReadAnsibleInventories    bool `gorm:"default:false" json:"read_ansible_inventories"`
+	ManageAnsibleCredentials  bool `gorm:"default:false" json:"manage_ansible_credentials"`
+	ReadAnsibleCredentials    bool `gorm:"default:false" json:"read_ansible_credentials"`
+	ManageAnsibleJobTemplates bool `gorm:"default:false" json:"manage_ansible_job_templates"`
+	ReadAnsibleJobTemplates   bool `gorm:"default:false" json:"read_ansible_job_templates"`
+	ManageAnsibleJobs         bool `gorm:"default:false" json:"manage_ansible_jobs"`
+	ReadAnsibleJobs           bool `gorm:"default:false" json:"read_ansible_jobs"`
+	ManageAnsibleSchedules    bool `gorm:"default:false" json:"manage_ansible_schedules"`
+	ReadAnsibleSchedules      bool `gorm:"default:false" json:"read_ansible_schedules"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

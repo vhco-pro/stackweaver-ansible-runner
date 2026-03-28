@@ -158,6 +158,9 @@ func SetupV2Routes(
 		teamsById.DELETE("/:id/relationships/organization-memberships", teamMemberHandler.RemoveOrganizationMemberships)
 	}
 
+	// Effective permissions (returns union of all team permissions for the authenticated user)
+	v2.GET("/organizations/:name/effective-permissions", orgHandler.GetEffectivePermissions)
+
 	// Projects (nested under organizations)
 	projects := v2.Group("/organizations/:name/projects")
 	{
@@ -1152,6 +1155,7 @@ func SetupV2Routes(
 		projectRepo,
 		orgRepo,
 		authService,
+		rbacService,
 		ansibleRedisQueue,
 		encryptionKeyBytes,
 		vcsRegistry,
@@ -1166,6 +1170,7 @@ func SetupV2Routes(
 		orgRepo,
 		projectRepo,
 		authService,
+		rbacService,
 	)
 
 	// ==========================================

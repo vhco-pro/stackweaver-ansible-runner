@@ -13,6 +13,7 @@ import (
 	"github.com/iac-platform/backend/internal/repository"
 	"github.com/iac-platform/backend/internal/services/ansible"
 	"github.com/iac-platform/backend/internal/services/auth"
+	"github.com/iac-platform/backend/internal/services/rbac"
 )
 
 // CredentialHandler handles Ansible credential API endpoints
@@ -21,6 +22,7 @@ type CredentialHandler struct {
 	orgRepo           *repository.OrganizationRepository
 	projectRepo       *repository.ProjectRepository
 	authService       *auth.Service
+	rbacService       *rbac.Service
 }
 
 // NewCredentialHandler creates a new credential handler
@@ -29,12 +31,14 @@ func NewCredentialHandler(
 	orgRepo *repository.OrganizationRepository,
 	projectRepo *repository.ProjectRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 ) *CredentialHandler {
 	return &CredentialHandler{
 		credentialService: credentialService,
 		orgRepo:           orgRepo,
 		projectRepo:       projectRepo,
 		authService:       authService,
+		rbacService:       rbacService,
 	}
 }
 
@@ -110,11 +114,39 @@ type UpdateCredentialRequest struct {
 func (h *CredentialHandler) List(c *gin.Context) {
 	orgName := c.Param("name")
 
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
 	org, err := h.orgRepo.GetByName(orgName)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list credentials in this organization"},
 			},
 		})
 		return
@@ -167,11 +199,39 @@ func (h *CredentialHandler) List(c *gin.Context) {
 func (h *CredentialHandler) Create(c *gin.Context) {
 	orgName := c.Param("name")
 
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
 	org, err := h.orgRepo.GetByName(orgName)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create credentials in this organization"},
 			},
 		})
 		return
@@ -301,11 +361,52 @@ func (h *CredentialHandler) Get(c *gin.Context) {
 		return
 	}
 
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
 	credential, err := h.credentialService.GetCredential(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Credential not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: if credential is project-scoped, check project-level permission; otherwise check org-level
+	var hasPermission bool
+	if credential.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleCredential,
+			credential.ID.String(),
+			rbac.PermissionAnsibleCredentialRead,
+			credential.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, credential.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this credential"},
 			},
 		})
 		return
@@ -330,6 +431,58 @@ func (h *CredentialHandler) Update(c *gin.Context) {
 		return
 	}
 
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	// Fetch existing credential for RBAC check and project validation
+	existingCredential, err := h.credentialService.GetCredential(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Credential not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: if credential is project-scoped, check project-level permission; otherwise check org-level
+	var hasPermission bool
+	if existingCredential.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleCredential,
+			existingCredential.ID.String(),
+			rbac.PermissionAnsibleCredentialWrite,
+			existingCredential.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, existingCredential.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to update this credential"},
+			},
+		})
+		return
+	}
+
 	var req UpdateCredentialRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -348,16 +501,6 @@ func (h *CredentialHandler) Update(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"errors": []gin.H{
 					{"status": "400", "title": "Bad Request", "detail": "Invalid project ID"},
-				},
-			})
-			return
-		}
-		// Get existing credential to verify organization
-		existingCredential, err := h.credentialService.GetCredential(id)
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{
-				"errors": []gin.H{
-					{"status": "404", "title": "Not Found", "detail": "Credential not found"},
 				},
 			})
 			return
@@ -419,6 +562,58 @@ func (h *CredentialHandler) Delete(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid credential ID"},
+			},
+		})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	// Fetch credential for RBAC check
+	credential, err := h.credentialService.GetCredential(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Credential not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: if credential is project-scoped, check project-level permission; otherwise check org-level
+	var hasPermission bool
+	if credential.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleCredential,
+			credential.ID.String(),
+			rbac.PermissionAnsibleCredentialWrite,
+			credential.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, credential.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to delete this credential"},
 			},
 		})
 		return

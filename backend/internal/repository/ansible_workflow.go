@@ -142,6 +142,16 @@ func (r *AnsibleWorkflowRepository) ListNodesByWorkflow(workflowID uuid.UUID) ([
 // Edge operations
 // ============================================================================
 
+// GetEdgeByID retrieves a workflow edge by ID
+func (r *AnsibleWorkflowRepository) GetEdgeByID(id uuid.UUID) (*models.AnsibleWorkflowEdge, error) {
+	var edge models.AnsibleWorkflowEdge
+	err := r.db.First(&edge, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &edge, nil
+}
+
 // CreateEdge creates a new workflow edge
 func (r *AnsibleWorkflowRepository) CreateEdge(edge *models.AnsibleWorkflowEdge) error {
 	return r.db.Create(edge).Error
