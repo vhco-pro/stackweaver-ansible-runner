@@ -26,6 +26,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Create .netrc for private Go modules
+        run: |
+          printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.RELEASE_TOKEN }}\n" > .netrc
+
       - name: Build and push by digest
         uses: michielvha/docker-release-action@v2
         with:
@@ -37,6 +41,7 @@ jobs:
           project: stackweaver-ansible-runner
           platforms: ${{ matrix.platform }}
           context: .
+          secret-files: netrc=.netrc
 
   merge:
     needs: build
