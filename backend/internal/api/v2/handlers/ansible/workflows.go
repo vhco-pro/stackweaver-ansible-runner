@@ -11,6 +11,7 @@ import (
 	"github.com/iac-platform/backend/internal/models"
 	"github.com/iac-platform/backend/internal/repository"
 	"github.com/iac-platform/backend/internal/services/auth"
+	"github.com/iac-platform/backend/internal/services/rbac"
 	"gorm.io/datatypes"
 )
 
@@ -20,6 +21,7 @@ type WorkflowHandler struct {
 	orgRepo      *repository.OrganizationRepository
 	projectRepo  *repository.ProjectRepository
 	authService  *auth.Service
+	rbacService  *rbac.Service
 }
 
 // NewWorkflowHandler creates a new WorkflowHandler
@@ -28,12 +30,14 @@ func NewWorkflowHandler(
 	orgRepo *repository.OrganizationRepository,
 	projectRepo *repository.ProjectRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 ) *WorkflowHandler {
 	return &WorkflowHandler{
 		workflowRepo: workflowRepo,
 		orgRepo:      orgRepo,
 		projectRepo:  projectRepo,
 		authService:  authService,
+		rbacService:  rbacService,
 	}
 }
 
@@ -142,6 +146,34 @@ func (h *WorkflowHandler) List(c *gin.Context) {
 		return
 	}
 
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list workflows in this organization"},
+			},
+		})
+		return
+	}
+
 	limit, _ := strconv.Atoi(c.DefaultQuery("page[size]", "20"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("page[number]", "0"))
 	if offset > 0 {
@@ -172,6 +204,34 @@ func (h *WorkflowHandler) Create(c *gin.Context) {
 	org, err := h.orgRepo.GetByName(orgName)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Organization not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create workflows in this organization"},
+			},
+		})
 		return
 	}
 
@@ -207,10 +267,7 @@ func (h *WorkflowHandler) Create(c *gin.Context) {
 		workflow.InventoryID = &inventoryID
 	}
 
-	// Get user ID
-	if user, err := h.authService.GetUserFromContext(c); err == nil {
-		workflow.CreatedBy = &user.ID
-	}
+	workflow.CreatedBy = &user.ID
 
 	if err := h.workflowRepo.Create(workflow); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"errors": []gin.H{{"detail": "Failed to create workflow"}}})
@@ -233,6 +290,41 @@ func (h *WorkflowHandler) Get(c *gin.Context) {
 	workflow, edges, err := h.workflowRepo.GetByIDWithEdges(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateRead,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this workflow"},
+			},
+		})
 		return
 	}
 
@@ -267,6 +359,41 @@ func (h *WorkflowHandler) Update(c *gin.Context) {
 	workflow, err := h.workflowRepo.GetByID(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to update this workflow"},
+			},
+		})
 		return
 	}
 
@@ -307,6 +434,47 @@ func (h *WorkflowHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	workflow, err := h.workflowRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to delete this workflow"},
+			},
+		})
+		return
+	}
+
 	if err := h.workflowRepo.Delete(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"errors": []gin.H{{"detail": "Failed to delete workflow"}}})
 		return
@@ -326,6 +494,47 @@ func (h *WorkflowHandler) CreateNode(c *gin.Context) {
 	workflowID, err := uuid.Parse(workflowIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"errors": []gin.H{{"detail": "Invalid workflow ID"}}})
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(workflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to modify this workflow"},
+			},
+		})
 		return
 	}
 
@@ -387,6 +596,47 @@ func (h *WorkflowHandler) ListNodes(c *gin.Context) {
 		return
 	}
 
+	workflow, err := h.workflowRepo.GetByID(workflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateRead,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this workflow"},
+			},
+		})
+		return
+	}
+
 	nodes, err := h.workflowRepo.ListNodesByWorkflow(workflowID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"errors": []gin.H{{"detail": "Failed to list nodes"}}})
@@ -414,6 +664,47 @@ func (h *WorkflowHandler) UpdateNode(c *gin.Context) {
 	node, err := h.workflowRepo.GetNodeByID(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Node not found"}}})
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(node.WorkflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to modify this workflow"},
+			},
+		})
 		return
 	}
 
@@ -453,6 +744,53 @@ func (h *WorkflowHandler) DeleteNode(c *gin.Context) {
 		return
 	}
 
+	node, err := h.workflowRepo.GetNodeByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Node not found"}}})
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(node.WorkflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to modify this workflow"},
+			},
+		})
+		return
+	}
+
 	if err := h.workflowRepo.DeleteNode(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"errors": []gin.H{{"detail": "Failed to delete node"}}})
 		return
@@ -472,6 +810,47 @@ func (h *WorkflowHandler) CreateEdge(c *gin.Context) {
 	workflowID, err := uuid.Parse(workflowIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"errors": []gin.H{{"detail": "Invalid workflow ID"}}})
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(workflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to modify this workflow"},
+			},
+		})
 		return
 	}
 
@@ -509,6 +888,47 @@ func (h *WorkflowHandler) ListEdges(c *gin.Context) {
 		return
 	}
 
+	workflow, err := h.workflowRepo.GetByID(workflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateRead,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this workflow"},
+			},
+		})
+		return
+	}
+
 	edges, err := h.workflowRepo.ListEdgesByWorkflow(workflowID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"errors": []gin.H{{"detail": "Failed to list edges"}}})
@@ -530,6 +950,53 @@ func (h *WorkflowHandler) DeleteEdge(c *gin.Context) {
 	id, err := uuid.Parse(idStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"errors": []gin.H{{"detail": "Invalid edge ID"}}})
+		return
+	}
+
+	edge, err := h.workflowRepo.GetEdgeByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Edge not found"}}})
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(edge.WorkflowID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"detail": "Workflow not found"}}})
+		return
+	}
+
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		workflow.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&workflow.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to modify this workflow"},
+			},
+		})
 		return
 	}
 

@@ -935,3 +935,41 @@ func (h *OrganizationHandlerV2) createDefaultTeams(orgID uuid.UUID) error {
 
 	return nil
 }
+
+// GetEffectivePermissions returns the authenticated user's effective permissions for an organization.
+// This is the union of all permissions from all teams the user is a member of.
+// Used by the frontend to conditionally show/hide UI elements based on permissions.
+func (h *OrganizationHandlerV2) GetEffectivePermissions(c *gin.Context) {
+	orgName := c.Param("name")
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"errors": []gin.H{{"status": "401", "title": "Unauthorized"}}})
+		return
+	}
+
+	org, err := h.orgRepo.GetByName(orgName)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"errors": []gin.H{{"status": "404", "title": "Organization not found"}}})
+		return
+	}
+
+	perms, err := h.rbacService.GetEffectivePermissions(c.Request.Context(), userID.(uuid.UUID), org.ID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"errors": []gin.H{{"status": "403", "title": "Access denied"}}})
+		return
+	}
+
+	// Convert Permission keys to strings for JSON
+	result := make(map[string]bool)
+	for perm, granted := range perms {
+		result[string(perm)] = granted
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": gin.H{
+			"type":       "effective-permissions",
+			"id":         org.ID.String(),
+			"attributes": result,
+		},
+	})
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/iac-platform/backend/internal/queue"
 	"github.com/iac-platform/backend/internal/repository"
 	"github.com/iac-platform/backend/internal/services/auth"
+	"github.com/iac-platform/backend/internal/services/rbac"
 	vcs "github.com/iac-platform/backend/internal/services/vcs"
 	"github.com/michielvha/logger"
 )
@@ -34,6 +35,7 @@ type PlaybookHandler struct {
 	projectRepo       *repository.ProjectRepository
 	orgRepo           *repository.OrganizationRepository
 	authService       *auth.Service
+	rbacService       *rbac.Service
 	queue             queue.Queue
 	vcsRegistry       *vcs.ProviderRegistry
 	vcsConnectionRepo *repository.VCSConnectionRepository
@@ -48,6 +50,7 @@ func NewPlaybookHandler(
 	projectRepo *repository.ProjectRepository,
 	orgRepo *repository.OrganizationRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 	redisQueue queue.Queue,
 	vcsRegistry *vcs.ProviderRegistry,
 	vcsConnectionRepo *repository.VCSConnectionRepository,
@@ -60,6 +63,7 @@ func NewPlaybookHandler(
 		projectRepo:       projectRepo,
 		orgRepo:           orgRepo,
 		authService:       authService,
+		rbacService:       rbacService,
 		queue:             redisQueue,
 		vcsRegistry:       vcsRegistry,
 		vcsConnectionRepo: vcsConnectionRepo,
@@ -256,6 +260,41 @@ func (h *PlaybookHandler) ListPlaybooks(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check project-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsiblePlaybook,
+		"",
+		rbac.PermissionAnsiblePlaybookRead,
+		&projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list playbooks in this project"},
+			},
+		})
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page[number]", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("page[size]", "20"))
 	if perPage > 100 {
@@ -295,6 +334,34 @@ func (h *PlaybookHandler) ListPlaybooksByOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check org-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list playbooks in this organization"},
 			},
 		})
 		return
@@ -354,6 +421,41 @@ func (h *PlaybookHandler) GetPlaybook(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check resource-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsiblePlaybook,
+		playbook.ID.String(),
+		rbac.PermissionAnsiblePlaybookRead,
+		&playbook.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this playbook"},
+			},
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatPlaybookResponse(playbook),
 	})
@@ -368,6 +470,41 @@ func (h *PlaybookHandler) CreatePlaybook(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid project ID"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check project-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsiblePlaybook,
+		"",
+		rbac.PermissionAnsiblePlaybookWrite,
+		&projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create playbooks in this project"},
 			},
 		})
 		return
@@ -439,6 +576,34 @@ func (h *PlaybookHandler) CreatePlaybookByOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check org-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create playbooks in this organization"},
 			},
 		})
 		return
@@ -582,6 +747,41 @@ func (h *PlaybookHandler) UpdatePlaybook(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsiblePlaybook,
+		playbook.ID.String(),
+		rbac.PermissionAnsiblePlaybookWrite,
+		&playbook.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to update this playbook"},
+			},
+		})
+		return
+	}
+
 	var req UpdatePlaybookRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -653,6 +853,52 @@ func (h *PlaybookHandler) DeletePlaybook(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid playbook ID"},
+			},
+		})
+		return
+	}
+
+	// Fetch playbook to get ProjectID for RBAC check
+	playbook, err := h.playbookRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Playbook not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsiblePlaybook,
+		playbook.ID.String(),
+		rbac.PermissionAnsiblePlaybookWrite,
+		&playbook.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to delete this playbook"},
 			},
 		})
 		return
@@ -742,6 +988,41 @@ func (h *PlaybookHandler) SyncPlaybook(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsiblePlaybook,
+		playbook.ID.String(),
+		rbac.PermissionAnsiblePlaybookWrite,
+		&playbook.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to sync this playbook"},
+			},
+		})
+		return
+	}
+
 	// Check if playbook has VCS configuration
 	if playbook.VCSConnectionID == nil || playbook.VCSRepository == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -805,6 +1086,41 @@ func (h *PlaybookHandler) ListTemplates(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check project-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		"",
+		rbac.PermissionAnsibleJobTemplateRead,
+		&projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list job templates in this project"},
+			},
+		})
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page[number]", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("page[size]", "20"))
 	if perPage > 100 {
@@ -844,6 +1160,34 @@ func (h *PlaybookHandler) ListTemplatesByOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check org-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list job templates in this organization"},
 			},
 		})
 		return
@@ -903,6 +1247,41 @@ func (h *PlaybookHandler) GetTemplate(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check resource-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		template.ID.String(),
+		rbac.PermissionAnsibleJobTemplateRead,
+		&template.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to view this job template"},
+			},
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatJobTemplateResponse(template),
 	})
@@ -917,6 +1296,41 @@ func (h *PlaybookHandler) CreateTemplate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid project ID"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check project-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		"",
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create job templates in this project"},
 			},
 		})
 		return
@@ -1031,6 +1445,34 @@ func (h *PlaybookHandler) CreateTemplateByOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check org-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create job templates in this organization"},
 			},
 		})
 		return
@@ -1197,6 +1639,41 @@ func (h *PlaybookHandler) UpdateTemplate(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		template.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&template.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to update this job template"},
+			},
+		})
+		return
+	}
+
 	var req UpdateJobTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -1353,6 +1830,52 @@ func (h *PlaybookHandler) DeleteTemplate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid job template ID"},
+			},
+		})
+		return
+	}
+
+	// Fetch template to get ProjectID for RBAC check
+	template, err := h.templateRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Job template not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJobTemplate,
+		template.ID.String(),
+		rbac.PermissionAnsibleJobTemplateWrite,
+		&template.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to delete this job template"},
 			},
 		})
 		return

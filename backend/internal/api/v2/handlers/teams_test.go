@@ -170,6 +170,68 @@ func TestUpdateOrganizationAccessFromRequest_MutualExclusivity(t *testing.T) {
 			},
 			description: "Multiple mutually exclusive groups should update correctly in one request",
 		},
+		// Ansible permissions: manage-ansible and read-ansible are mutually exclusive
+		{
+			name: "Setting manage-ansible clears read-ansible",
+			initialAccess: &models.TeamOrganizationAccess{
+				TeamID:      uuid.New(),
+				ReadAnsible: true,
+			},
+			requestAccess: map[string]interface{}{
+				"manage-ansible": true,
+			},
+			expectedAccess: &models.TeamOrganizationAccess{
+				ManageAnsible: true,
+				ReadAnsible:   false,
+			},
+			description: "When setting manage-ansible to true, read-ansible should be cleared",
+		},
+		{
+			name: "Setting read-ansible clears manage-ansible",
+			initialAccess: &models.TeamOrganizationAccess{
+				TeamID:        uuid.New(),
+				ManageAnsible: true,
+			},
+			requestAccess: map[string]interface{}{
+				"read-ansible": true,
+			},
+			expectedAccess: &models.TeamOrganizationAccess{
+				ManageAnsible: false,
+				ReadAnsible:   true,
+			},
+			description: "When setting read-ansible to true, manage-ansible should be cleared",
+		},
+		{
+			name: "Setting manage-ansible to false does not affect read-ansible",
+			initialAccess: &models.TeamOrganizationAccess{
+				TeamID:        uuid.New(),
+				ManageAnsible: true,
+				ReadAnsible:   false,
+			},
+			requestAccess: map[string]interface{}{
+				"manage-ansible": false,
+			},
+			expectedAccess: &models.TeamOrganizationAccess{
+				ManageAnsible: false,
+				ReadAnsible:   false,
+			},
+			description: "When setting manage-ansible to false, read-ansible should remain unchanged",
+		},
+		{
+			name: "Ansible permissions are independent from workspace permissions",
+			initialAccess: &models.TeamOrganizationAccess{
+				TeamID:           uuid.New(),
+				ManageWorkspaces: true,
+			},
+			requestAccess: map[string]interface{}{
+				"manage-ansible": true,
+			},
+			expectedAccess: &models.TeamOrganizationAccess{
+				ManageWorkspaces: true, // Should remain unchanged
+				ManageAnsible:    true,
+			},
+			description: "Setting manage-ansible should not affect workspace permissions",
+		},
 	}
 
 	for _, tt := range tests {
@@ -192,6 +254,8 @@ func TestUpdateOrganizationAccessFromRequest_MutualExclusivity(t *testing.T) {
 				ManageMembership:         tt.initialAccess.ManageMembership,
 				ManageTeams:              tt.initialAccess.ManageTeams,
 				ManageOrganizationAccess: tt.initialAccess.ManageOrganizationAccess,
+				ManageAnsible:            tt.initialAccess.ManageAnsible,
+				ReadAnsible:              tt.initialAccess.ReadAnsible,
 			}
 
 			// Apply the update
@@ -218,6 +282,15 @@ func TestUpdateOrganizationAccessFromRequest_MutualExclusivity(t *testing.T) {
 			}
 			if orgAccess.ManageMembership != tt.expectedAccess.ManageMembership {
 				t.Errorf("%s: ManageMembership: expected %v, got %v", tt.description, tt.expectedAccess.ManageMembership, orgAccess.ManageMembership)
+			}
+			if orgAccess.ManageAnsible != tt.expectedAccess.ManageAnsible {
+				t.Errorf("%s: ManageAnsible: expected %v, got %v", tt.description, tt.expectedAccess.ManageAnsible, orgAccess.ManageAnsible)
+			}
+			if orgAccess.ReadAnsible != tt.expectedAccess.ReadAnsible {
+				t.Errorf("%s: ReadAnsible: expected %v, got %v", tt.description, tt.expectedAccess.ReadAnsible, orgAccess.ReadAnsible)
+			}
+			if orgAccess.ManageWorkspaces != tt.expectedAccess.ManageWorkspaces {
+				t.Errorf("%s: ManageWorkspaces: expected %v, got %v", tt.description, tt.expectedAccess.ManageWorkspaces, orgAccess.ManageWorkspaces)
 			}
 		})
 	}

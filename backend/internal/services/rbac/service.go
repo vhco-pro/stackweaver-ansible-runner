@@ -70,6 +70,8 @@ const (
 	PermissionOrgManageRunTasks           Permission = "org:manage-run-tasks"           // Manage run tasks
 	PermissionOrgAccessSecretTeams        Permission = "org:access-secret-teams"        //nolint:gosec // false positive: string constant, not actual credential
 	PermissionOrgManageAgentPools         Permission = "org:manage-agent-pools"         // Manage agent pools
+	PermissionOrgManageAnsible            Permission = "org:manage-ansible"             // Manage all Ansible resources (playbooks, inventories, credentials, job templates, jobs, schedules)
+	PermissionOrgReadAnsible              Permission = "org:read-ansible"               // Read all Ansible resources
 
 	// Project permissions
 	PermissionProjectRead  Permission = "project:read"
@@ -377,6 +379,91 @@ func (s *Service) getPermissionsFromOrganizationAccess(orgAccess *models.TeamOrg
 	if orgAccess.ManageAgentPools {
 		perms[PermissionOrgManageAgentPools] = true
 	}
+	if orgAccess.ManageAnsible {
+		// Parent toggle: ManageAnsible grants ALL Ansible resource permissions
+		perms[PermissionOrgManageAnsible] = true
+		perms[PermissionOrgReadAnsible] = true
+		perms[PermissionAnsiblePlaybookRead] = true
+		perms[PermissionAnsiblePlaybookWrite] = true
+		perms[PermissionAnsibleInventoryRead] = true
+		perms[PermissionAnsibleInventoryWrite] = true
+		perms[PermissionAnsibleCredentialRead] = true
+		perms[PermissionAnsibleCredentialWrite] = true
+		perms[PermissionAnsibleJobTemplateRead] = true
+		perms[PermissionAnsibleJobTemplateWrite] = true
+		perms[PermissionAnsibleJobRead] = true
+		perms[PermissionAnsibleJobExecute] = true
+		perms[PermissionAnsibleScheduleRead] = true
+		perms[PermissionAnsibleScheduleWrite] = true
+	}
+	if orgAccess.ReadAnsible {
+		// Parent toggle: ReadAnsible grants ALL Ansible read permissions
+		perms[PermissionOrgReadAnsible] = true
+		perms[PermissionAnsiblePlaybookRead] = true
+		perms[PermissionAnsibleInventoryRead] = true
+		perms[PermissionAnsibleCredentialRead] = true
+		perms[PermissionAnsibleJobTemplateRead] = true
+		perms[PermissionAnsibleJobRead] = true
+		perms[PermissionAnsibleScheduleRead] = true
+	}
+
+	// Fine-grained per-resource Ansible permissions
+	// These are independent of the parent toggles above — a team can have
+	// ManageAnsible=false but ManageAnsiblePlaybooks=true to only manage playbooks.
+	if orgAccess.ManageAnsiblePlaybooks {
+		perms[PermissionAnsiblePlaybookRead] = true
+		perms[PermissionAnsiblePlaybookWrite] = true
+		perms[PermissionOrgReadAnsible] = true // implied: can list org-scoped playbooks
+	}
+	if orgAccess.ReadAnsiblePlaybooks {
+		perms[PermissionAnsiblePlaybookRead] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ManageAnsibleInventories {
+		perms[PermissionAnsibleInventoryRead] = true
+		perms[PermissionAnsibleInventoryWrite] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ReadAnsibleInventories {
+		perms[PermissionAnsibleInventoryRead] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ManageAnsibleCredentials {
+		perms[PermissionAnsibleCredentialRead] = true
+		perms[PermissionAnsibleCredentialWrite] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ReadAnsibleCredentials {
+		perms[PermissionAnsibleCredentialRead] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ManageAnsibleJobTemplates {
+		perms[PermissionAnsibleJobTemplateRead] = true
+		perms[PermissionAnsibleJobTemplateWrite] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ReadAnsibleJobTemplates {
+		perms[PermissionAnsibleJobTemplateRead] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ManageAnsibleJobs {
+		perms[PermissionAnsibleJobRead] = true
+		perms[PermissionAnsibleJobExecute] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ReadAnsibleJobs {
+		perms[PermissionAnsibleJobRead] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ManageAnsibleSchedules {
+		perms[PermissionAnsibleScheduleRead] = true
+		perms[PermissionAnsibleScheduleWrite] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
+	if orgAccess.ReadAnsibleSchedules {
+		perms[PermissionAnsibleScheduleRead] = true
+		perms[PermissionOrgReadAnsible] = true
+	}
 
 	return perms
 }
@@ -402,6 +489,19 @@ func (s *Service) getPermissionsFromProjectAccess(projectAccess *models.TeamProj
 			perms[PermissionSentinelMocks] = true
 			perms[PermissionWorkspaceLocking] = true
 			perms[PermissionRunTasks] = true
+			// Ansible permissions: admin gets full access to all Ansible resources in the project
+			perms[PermissionAnsiblePlaybookRead] = true
+			perms[PermissionAnsiblePlaybookWrite] = true
+			perms[PermissionAnsibleInventoryRead] = true
+			perms[PermissionAnsibleInventoryWrite] = true
+			perms[PermissionAnsibleCredentialRead] = true
+			perms[PermissionAnsibleCredentialWrite] = true
+			perms[PermissionAnsibleJobTemplateRead] = true
+			perms[PermissionAnsibleJobTemplateWrite] = true
+			perms[PermissionAnsibleJobRead] = true
+			perms[PermissionAnsibleJobExecute] = true
+			perms[PermissionAnsibleScheduleRead] = true
+			perms[PermissionAnsibleScheduleWrite] = true
 		case "maintain", "write":
 			// Write has write permissions
 			perms[PermissionProjectRead] = true
@@ -415,6 +515,19 @@ func (s *Service) getPermissionsFromProjectAccess(projectAccess *models.TeamProj
 			perms[PermissionRuns] = true
 			perms[PermissionWorkspaceLocking] = true
 			perms[PermissionRunTasks] = true
+			// Ansible permissions: write/maintain gets full access to Ansible resources in the project
+			perms[PermissionAnsiblePlaybookRead] = true
+			perms[PermissionAnsiblePlaybookWrite] = true
+			perms[PermissionAnsibleInventoryRead] = true
+			perms[PermissionAnsibleInventoryWrite] = true
+			perms[PermissionAnsibleCredentialRead] = true
+			perms[PermissionAnsibleCredentialWrite] = true
+			perms[PermissionAnsibleJobTemplateRead] = true
+			perms[PermissionAnsibleJobTemplateWrite] = true
+			perms[PermissionAnsibleJobRead] = true
+			perms[PermissionAnsibleJobExecute] = true
+			perms[PermissionAnsibleScheduleRead] = true
+			perms[PermissionAnsibleScheduleWrite] = true
 		case "read":
 			// Read has read-only permissions (PermissionRuns NOT included - that's for creating/planning)
 			perms[PermissionProjectRead] = true
@@ -423,6 +536,13 @@ func (s *Service) getPermissionsFromProjectAccess(projectAccess *models.TeamProj
 			perms[PermissionStateVersions] = true // Granular permission (level checked separately)
 			perms[PermissionVariables] = true     // Granular permission (level checked separately)
 			perms[PermissionSentinelMocks] = true
+			// Ansible permissions: read gets read-only access to Ansible resources in the project
+			perms[PermissionAnsiblePlaybookRead] = true
+			perms[PermissionAnsibleInventoryRead] = true
+			perms[PermissionAnsibleCredentialRead] = true
+			perms[PermissionAnsibleJobTemplateRead] = true
+			perms[PermissionAnsibleJobRead] = true
+			perms[PermissionAnsibleScheduleRead] = true
 		}
 	}
 
@@ -1089,7 +1209,94 @@ func (s *Service) CheckOrgManageAgentPools(ctx context.Context, userID, organiza
 	return s.checkOrgPermission(ctx, userID, organizationID, PermissionOrgManageAgentPools)
 }
 
+// CheckOrgManageAnsible checks if user can manage all Ansible resources (create/update/delete)
+func (s *Service) CheckOrgManageAnsible(ctx context.Context, userID, organizationID uuid.UUID) (bool, error) {
+	return s.checkOrgPermission(ctx, userID, organizationID, PermissionOrgManageAnsible)
+}
+
+// CheckOrgReadAnsible checks if user can read Ansible resources
+func (s *Service) CheckOrgReadAnsible(ctx context.Context, userID, organizationID uuid.UUID) (bool, error) {
+	return s.checkOrgPermission(ctx, userID, organizationID, PermissionOrgReadAnsible)
+}
+
 // checkOrgPermission is a helper to check organization-level permissions from team memberships
+// GetEffectivePermissions returns all effective permissions for a user in an organization.
+// This is the union of all permissions from all teams the user is a member of.
+// Used by the /effective-permissions endpoint for frontend permission enforcement.
+func (s *Service) GetEffectivePermissions(ctx context.Context, userID, organizationID uuid.UUID) (map[Permission]bool, error) {
+	inOrg, err := s.orgRepo.UserInOrg(userID, organizationID)
+	if err != nil || !inOrg {
+		return nil, fmt.Errorf("user not in organization")
+	}
+
+	if s.teamRepo == nil {
+		return nil, fmt.Errorf("team repository not available")
+	}
+
+	teams, err := s.teamRepo.GetTeamsByUserID(userID, organizationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Owners get all permissions
+	for _, team := range teams {
+		if team.Name == "owners" {
+			return map[Permission]bool{
+				PermissionOrgManageAnsible:            true,
+				PermissionOrgReadAnsible:              true,
+				PermissionOrgManageProjects:           true,
+				PermissionOrgReadProjects:             true,
+				PermissionOrgManageWorkspaces:         true,
+				PermissionOrgReadWorkspaces:           true,
+				PermissionOrgManageTeams:              true,
+				PermissionOrgManageMembership:         true,
+				PermissionOrgManageVCSSettings:        true,
+				PermissionOrgManageProviders:          true,
+				PermissionOrgManageModules:            true,
+				PermissionOrgManagePolicies:           true,
+				PermissionOrgManagePolicyOverrides:    true,
+				PermissionOrgManageRunTasks:           true,
+				PermissionOrgManageAgentPools:         true,
+				PermissionOrgAccessSecretTeams:        true,
+				PermissionOrgManageOrganizationAccess: true,
+				PermissionAnsiblePlaybookRead:         true,
+				PermissionAnsiblePlaybookWrite:        true,
+				PermissionAnsibleInventoryRead:        true,
+				PermissionAnsibleInventoryWrite:       true,
+				PermissionAnsibleCredentialRead:       true,
+				PermissionAnsibleCredentialWrite:      true,
+				PermissionAnsibleJobTemplateRead:      true,
+				PermissionAnsibleJobTemplateWrite:     true,
+				PermissionAnsibleJobRead:              true,
+				PermissionAnsibleJobExecute:           true,
+				PermissionAnsibleScheduleRead:         true,
+				PermissionAnsibleScheduleWrite:        true,
+			}, nil
+		}
+	}
+
+	allPermissions := make(map[Permission]bool)
+	for _, team := range teams {
+		var orgAccess *models.TeamOrganizationAccess
+		if team.OrganizationAccess != nil {
+			orgAccess = team.OrganizationAccess
+		} else {
+			orgAccess, err = s.teamRepo.GetOrganizationAccess(team.ID)
+			if err != nil {
+				continue
+			}
+		}
+		if orgAccess != nil {
+			teamPerms := s.getPermissionsFromOrganizationAccess(orgAccess)
+			for perm := range teamPerms {
+				allPermissions[perm] = true
+			}
+		}
+	}
+
+	return allPermissions, nil
+}
+
 func (s *Service) checkOrgPermission(ctx context.Context, userID, organizationID uuid.UUID, permission Permission) (bool, error) {
 	// Tenant isolation: user must have at least one team in the org (team-based access)
 	inOrg, err := s.orgRepo.UserInOrg(userID, organizationID)

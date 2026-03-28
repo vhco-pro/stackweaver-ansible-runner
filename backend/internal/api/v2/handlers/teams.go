@@ -99,6 +99,121 @@ func (h *TeamHandlerV2) updateOrganizationAccessFromRequest(orgAccess *models.Te
 		orgAccess.ManageAgentPools = v
 	}
 
+	// Ansible permissions: manage-ansible and read-ansible are mutually exclusive parent toggles
+	if v, ok := reqAccess["manage-ansible"].(bool); ok {
+		orgAccess.ManageAnsible = v
+		if v {
+			orgAccess.ReadAnsible = false
+			// Parent toggle sets all sub-permissions
+			orgAccess.ManageAnsiblePlaybooks = true
+			orgAccess.ReadAnsiblePlaybooks = true
+			orgAccess.ManageAnsibleInventories = true
+			orgAccess.ReadAnsibleInventories = true
+			orgAccess.ManageAnsibleCredentials = true
+			orgAccess.ReadAnsibleCredentials = true
+			orgAccess.ManageAnsibleJobTemplates = true
+			orgAccess.ReadAnsibleJobTemplates = true
+			orgAccess.ManageAnsibleJobs = true
+			orgAccess.ReadAnsibleJobs = true
+			orgAccess.ManageAnsibleSchedules = true
+			orgAccess.ReadAnsibleSchedules = true
+		}
+	}
+	if v, ok := reqAccess["read-ansible"].(bool); ok {
+		orgAccess.ReadAnsible = v
+		if v {
+			orgAccess.ManageAnsible = false
+			// Parent toggle sets all read sub-permissions, clears manage
+			orgAccess.ManageAnsiblePlaybooks = false
+			orgAccess.ReadAnsiblePlaybooks = true
+			orgAccess.ManageAnsibleInventories = false
+			orgAccess.ReadAnsibleInventories = true
+			orgAccess.ManageAnsibleCredentials = false
+			orgAccess.ReadAnsibleCredentials = true
+			orgAccess.ManageAnsibleJobTemplates = false
+			orgAccess.ReadAnsibleJobTemplates = true
+			orgAccess.ManageAnsibleJobs = false
+			orgAccess.ReadAnsibleJobs = true
+			orgAccess.ManageAnsibleSchedules = false
+			orgAccess.ReadAnsibleSchedules = true
+		}
+	}
+
+	// Fine-grained per-resource Ansible permissions
+	// Each manage/read pair is mutually exclusive per resource type
+	if v, ok := reqAccess["manage-ansible-playbooks"].(bool); ok {
+		orgAccess.ManageAnsiblePlaybooks = v
+		if v {
+			orgAccess.ReadAnsiblePlaybooks = false
+		}
+	}
+	if v, ok := reqAccess["read-ansible-playbooks"].(bool); ok {
+		orgAccess.ReadAnsiblePlaybooks = v
+		if v {
+			orgAccess.ManageAnsiblePlaybooks = false
+		}
+	}
+	if v, ok := reqAccess["manage-ansible-inventories"].(bool); ok {
+		orgAccess.ManageAnsibleInventories = v
+		if v {
+			orgAccess.ReadAnsibleInventories = false
+		}
+	}
+	if v, ok := reqAccess["read-ansible-inventories"].(bool); ok {
+		orgAccess.ReadAnsibleInventories = v
+		if v {
+			orgAccess.ManageAnsibleInventories = false
+		}
+	}
+	if v, ok := reqAccess["manage-ansible-credentials"].(bool); ok {
+		orgAccess.ManageAnsibleCredentials = v
+		if v {
+			orgAccess.ReadAnsibleCredentials = false
+		}
+	}
+	if v, ok := reqAccess["read-ansible-credentials"].(bool); ok {
+		orgAccess.ReadAnsibleCredentials = v
+		if v {
+			orgAccess.ManageAnsibleCredentials = false
+		}
+	}
+	if v, ok := reqAccess["manage-ansible-job-templates"].(bool); ok {
+		orgAccess.ManageAnsibleJobTemplates = v
+		if v {
+			orgAccess.ReadAnsibleJobTemplates = false
+		}
+	}
+	if v, ok := reqAccess["read-ansible-job-templates"].(bool); ok {
+		orgAccess.ReadAnsibleJobTemplates = v
+		if v {
+			orgAccess.ManageAnsibleJobTemplates = false
+		}
+	}
+	if v, ok := reqAccess["manage-ansible-jobs"].(bool); ok {
+		orgAccess.ManageAnsibleJobs = v
+		if v {
+			orgAccess.ReadAnsibleJobs = false
+		}
+	}
+	if v, ok := reqAccess["read-ansible-jobs"].(bool); ok {
+		orgAccess.ReadAnsibleJobs = v
+		if v {
+			orgAccess.ManageAnsibleJobs = false
+		}
+	}
+	if v, ok := reqAccess["manage-ansible-schedules"].(bool); ok {
+		orgAccess.ManageAnsibleSchedules = v
+		if v {
+			orgAccess.ReadAnsibleSchedules = false
+		}
+	}
+	if v, ok := reqAccess["read-ansible-schedules"].(bool); ok {
+		orgAccess.ReadAnsibleSchedules = v
+		if v {
+			orgAccess.ManageAnsibleSchedules = false
+		}
+	}
+
 	// Project permissions: manage-projects and read-projects are mutually exclusive
 	if v, ok := reqAccess["manage-projects"].(bool); ok {
 		orgAccess.ManageProjects = v
@@ -167,40 +282,68 @@ func formatTeamResponse(team *models.Team, orgName string, userID ...uuid.UUID) 
 
 	// Format organization access (always include, even if nil)
 	orgAccess := gin.H{
-		"manage-policies":            false,
-		"manage-policy-overrides":    false,
-		"manage-workspaces":          false,
-		"manage-vcs-settings":        false,
-		"manage-providers":           false,
-		"manage-modules":             false,
-		"manage-run-tasks":           false,
-		"manage-projects":            false,
-		"read-workspaces":            false,
-		"read-projects":              false,
-		"manage-membership":          false,
-		"manage-teams":               false,
-		"manage-organization-access": false,
-		"access-secret-teams":        false,
-		"manage-agent-pools":         false,
+		"manage-policies":              false,
+		"manage-policy-overrides":      false,
+		"manage-workspaces":            false,
+		"manage-vcs-settings":          false,
+		"manage-providers":             false,
+		"manage-modules":               false,
+		"manage-run-tasks":             false,
+		"manage-projects":              false,
+		"read-workspaces":              false,
+		"read-projects":                false,
+		"manage-membership":            false,
+		"manage-teams":                 false,
+		"manage-organization-access":   false,
+		"access-secret-teams":          false,
+		"manage-agent-pools":           false,
+		"manage-ansible":               false,
+		"read-ansible":                 false,
+		"manage-ansible-playbooks":     false,
+		"read-ansible-playbooks":       false,
+		"manage-ansible-inventories":   false,
+		"read-ansible-inventories":     false,
+		"manage-ansible-credentials":   false,
+		"read-ansible-credentials":     false,
+		"manage-ansible-job-templates": false,
+		"read-ansible-job-templates":   false,
+		"manage-ansible-jobs":          false,
+		"read-ansible-jobs":            false,
+		"manage-ansible-schedules":     false,
+		"read-ansible-schedules":       false,
 	}
 
 	if team.OrganizationAccess != nil {
 		orgAccess = gin.H{
-			"manage-policies":            team.OrganizationAccess.ManagePolicies,
-			"manage-policy-overrides":    team.OrganizationAccess.ManagePolicyOverrides,
-			"manage-workspaces":          team.OrganizationAccess.ManageWorkspaces,
-			"manage-vcs-settings":        team.OrganizationAccess.ManageVCSSettings,
-			"manage-providers":           team.OrganizationAccess.ManageProviders,
-			"manage-modules":             team.OrganizationAccess.ManageModules,
-			"manage-run-tasks":           team.OrganizationAccess.ManageRunTasks,
-			"manage-projects":            team.OrganizationAccess.ManageProjects,
-			"read-workspaces":            team.OrganizationAccess.ReadWorkspaces,
-			"read-projects":              team.OrganizationAccess.ReadProjects,
-			"manage-membership":          team.OrganizationAccess.ManageMembership,
-			"manage-teams":               team.OrganizationAccess.ManageTeams,
-			"manage-organization-access": team.OrganizationAccess.ManageOrganizationAccess,
-			"access-secret-teams":        team.OrganizationAccess.AccessSecretTeams,
-			"manage-agent-pools":         team.OrganizationAccess.ManageAgentPools,
+			"manage-policies":              team.OrganizationAccess.ManagePolicies,
+			"manage-policy-overrides":      team.OrganizationAccess.ManagePolicyOverrides,
+			"manage-workspaces":            team.OrganizationAccess.ManageWorkspaces,
+			"manage-vcs-settings":          team.OrganizationAccess.ManageVCSSettings,
+			"manage-providers":             team.OrganizationAccess.ManageProviders,
+			"manage-modules":               team.OrganizationAccess.ManageModules,
+			"manage-run-tasks":             team.OrganizationAccess.ManageRunTasks,
+			"manage-projects":              team.OrganizationAccess.ManageProjects,
+			"read-workspaces":              team.OrganizationAccess.ReadWorkspaces,
+			"read-projects":                team.OrganizationAccess.ReadProjects,
+			"manage-membership":            team.OrganizationAccess.ManageMembership,
+			"manage-teams":                 team.OrganizationAccess.ManageTeams,
+			"manage-organization-access":   team.OrganizationAccess.ManageOrganizationAccess,
+			"access-secret-teams":          team.OrganizationAccess.AccessSecretTeams,
+			"manage-agent-pools":           team.OrganizationAccess.ManageAgentPools,
+			"manage-ansible":               team.OrganizationAccess.ManageAnsible,
+			"read-ansible":                 team.OrganizationAccess.ReadAnsible,
+			"manage-ansible-playbooks":     team.OrganizationAccess.ManageAnsiblePlaybooks,
+			"read-ansible-playbooks":       team.OrganizationAccess.ReadAnsiblePlaybooks,
+			"manage-ansible-inventories":   team.OrganizationAccess.ManageAnsibleInventories,
+			"read-ansible-inventories":     team.OrganizationAccess.ReadAnsibleInventories,
+			"manage-ansible-credentials":   team.OrganizationAccess.ManageAnsibleCredentials,
+			"read-ansible-credentials":     team.OrganizationAccess.ReadAnsibleCredentials,
+			"manage-ansible-job-templates": team.OrganizationAccess.ManageAnsibleJobTemplates,
+			"read-ansible-job-templates":   team.OrganizationAccess.ReadAnsibleJobTemplates,
+			"manage-ansible-jobs":          team.OrganizationAccess.ManageAnsibleJobs,
+			"read-ansible-jobs":            team.OrganizationAccess.ReadAnsibleJobs,
+			"manage-ansible-schedules":     team.OrganizationAccess.ManageAnsibleSchedules,
+			"read-ansible-schedules":       team.OrganizationAccess.ReadAnsibleSchedules,
 		}
 	}
 

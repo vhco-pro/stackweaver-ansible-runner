@@ -17,6 +17,7 @@ import (
 	"github.com/iac-platform/backend/internal/repository"
 	"github.com/iac-platform/backend/internal/services/ansible"
 	"github.com/iac-platform/backend/internal/services/auth"
+	"github.com/iac-platform/backend/internal/services/rbac"
 	vcs "github.com/iac-platform/backend/internal/services/vcs"
 	"github.com/michielvha/logger"
 )
@@ -33,6 +34,7 @@ type InventoryHandler struct {
 	orgRepo           *repository.OrganizationRepository
 	projectRepo       *repository.ProjectRepository
 	authService       *auth.Service
+	rbacService       *rbac.Service
 	queue             queue.Queue
 	vcsRegistry       *vcs.ProviderRegistry
 	vcsConnectionRepo *repository.VCSConnectionRepository
@@ -45,6 +47,7 @@ func NewInventoryHandler(
 	orgRepo *repository.OrganizationRepository,
 	projectRepo *repository.ProjectRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 	redisQueue queue.Queue,
 	vcsRegistry *vcs.ProviderRegistry,
 	vcsConnectionRepo *repository.VCSConnectionRepository,
@@ -55,6 +58,7 @@ func NewInventoryHandler(
 		orgRepo:           orgRepo,
 		projectRepo:       projectRepo,
 		authService:       authService,
+		rbacService:       rbacService,
 		queue:             redisQueue,
 		vcsRegistry:       vcsRegistry,
 		vcsConnectionRepo: vcsConnectionRepo,
@@ -166,6 +170,34 @@ func (h *InventoryHandler) List(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check org-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to list inventories in this organization"},
+			},
+		})
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page[number]", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("page[size]", "20"))
 	if perPage > 100 {
@@ -225,6 +257,34 @@ func (h *InventoryHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check org-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to create inventories in this organization"},
 			},
 		})
 		return
@@ -377,6 +437,46 @@ func (h *InventoryHandler) Get(c *gin.Context) {
 		return
 	}
 
+	// RBAC: check resource-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	var hasPermission bool
+	if inventory.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleInventory,
+			inventory.ID.String(),
+			rbac.PermissionAnsibleInventoryRead,
+			inventory.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, inventory.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to access this inventory"},
+			},
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data": formatInventoryResponse(inventory),
 	})
@@ -391,6 +491,55 @@ func (h *InventoryHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid inventory ID"},
+			},
+		})
+		return
+	}
+
+	// RBAC: fetch inventory and check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	rbacInventory, err := h.inventoryRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Inventory not found"},
+			},
+		})
+		return
+	}
+	var hasPermission bool
+	if rbacInventory.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleInventory,
+			rbacInventory.ID.String(),
+			rbac.PermissionAnsibleInventoryWrite,
+			rbacInventory.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, rbacInventory.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to update this inventory"},
 			},
 		})
 		return
@@ -499,6 +648,55 @@ func (h *InventoryHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	// RBAC: fetch inventory and check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	inventoryForRBAC, err := h.inventoryRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Inventory not found"},
+			},
+		})
+		return
+	}
+	var hasPermission bool
+	if inventoryForRBAC.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleInventory,
+			inventoryForRBAC.ID.String(),
+			rbac.PermissionAnsibleInventoryWrite,
+			inventoryForRBAC.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, inventoryForRBAC.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to delete this inventory"},
+			},
+		})
+		return
+	}
+
 	if err := h.inventoryService.DeleteInventory(id); err != nil {
 		// Check if it's a dependency error (contains "cannot delete" or "referenced")
 		errStr := err.Error()
@@ -546,6 +744,55 @@ func (h *InventoryHandler) GetInventoryINI(c *gin.Context) {
 		return
 	}
 
+	// RBAC: fetch inventory and check resource-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	inventory, err := h.inventoryRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Inventory not found"},
+			},
+		})
+		return
+	}
+	var hasPermission bool
+	if inventory.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleInventory,
+			inventory.ID.String(),
+			rbac.PermissionAnsibleInventoryRead,
+			inventory.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, inventory.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to access this inventory"},
+			},
+		})
+		return
+	}
+
 	content, err := h.inventoryService.GenerateInventoryINI(id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -569,6 +816,55 @@ func (h *InventoryHandler) GetInventoryJSON(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid inventory ID"},
+			},
+		})
+		return
+	}
+
+	// RBAC: fetch inventory and check resource-level read permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	inventory, err := h.inventoryRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Inventory not found"},
+			},
+		})
+		return
+	}
+	var hasPermission bool
+	if inventory.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleInventory,
+			inventory.ID.String(),
+			rbac.PermissionAnsibleInventoryRead,
+			inventory.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, inventory.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to access this inventory"},
 			},
 		})
 		return
@@ -607,6 +903,46 @@ func (h *InventoryHandler) SyncInventory(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Inventory not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC: check resource-level write permission
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+	var hasPermission bool
+	if inventory.ProjectID != nil {
+		hasPermission, err = h.rbacService.CheckAnsibleResourcePermission(
+			c.Request.Context(),
+			user.ID,
+			rbac.ResourceTypeAnsibleInventory,
+			inventory.ID.String(),
+			rbac.PermissionAnsibleInventoryWrite,
+			inventory.ProjectID,
+		)
+	} else {
+		hasPermission, err = h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, inventory.OrganizationID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You do not have permission to sync this inventory"},
 			},
 		})
 		return

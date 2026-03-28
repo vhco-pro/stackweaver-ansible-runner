@@ -13,14 +13,17 @@ import (
 	"github.com/iac-platform/backend/internal/repository"
 	"github.com/iac-platform/backend/internal/services/ansible"
 	"github.com/iac-platform/backend/internal/services/auth"
+	"github.com/iac-platform/backend/internal/services/rbac"
 )
 
 // JobHandler handles Ansible job API endpoints
 type JobHandler struct {
-	jobService  *ansible.JobService
-	projectRepo *repository.ProjectRepository
-	orgRepo     *repository.OrganizationRepository
-	authService *auth.Service
+	jobService   *ansible.JobService
+	projectRepo  *repository.ProjectRepository
+	orgRepo      *repository.OrganizationRepository
+	templateRepo *repository.AnsibleJobTemplateRepository
+	authService  *auth.Service
+	rbacService  *rbac.Service
 }
 
 // NewJobHandler creates a new job handler
@@ -28,13 +31,17 @@ func NewJobHandler(
 	jobService *ansible.JobService,
 	projectRepo *repository.ProjectRepository,
 	orgRepo *repository.OrganizationRepository,
+	templateRepo *repository.AnsibleJobTemplateRepository,
 	authService *auth.Service,
+	rbacService *rbac.Service,
 ) *JobHandler {
 	return &JobHandler{
-		jobService:  jobService,
-		projectRepo: projectRepo,
-		orgRepo:     orgRepo,
-		authService: authService,
+		jobService:   jobService,
+		projectRepo:  projectRepo,
+		orgRepo:      orgRepo,
+		templateRepo: templateRepo,
+		authService:  authService,
+		rbacService:  rbacService,
 	}
 }
 
@@ -108,6 +115,42 @@ func (h *JobHandler) ListByProject(c *gin.Context) {
 		return
 	}
 
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		"",
+		rbac.PermissionAnsibleJobRead,
+		&projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to list jobs in this project"},
+			},
+		})
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page[number]", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("page[size]", "20"))
 	if perPage > 100 {
@@ -153,6 +196,35 @@ func (h *JobHandler) ListByOrganization(c *gin.Context) {
 		return
 	}
 
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to list jobs in this organization"},
+			},
+		})
+		return
+	}
+
 	page, _ := strconv.Atoi(c.DefaultQuery("page[number]", "1"))
 	perPage, _ := strconv.Atoi(c.DefaultQuery("page[size]", "20"))
 	if perPage > 100 {
@@ -193,6 +265,35 @@ func (h *JobHandler) GetQueue(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgReadAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to view the job queue for this organization"},
 			},
 		})
 		return
@@ -290,11 +391,43 @@ func (h *JobHandler) Launch(c *gin.Context) {
 		jobType = models.AnsibleJobTypeSyntax
 	}
 
-	// Get user ID
-	var createdBy *uuid.UUID
-	if user, err := h.authService.GetUserFromContext(c); err == nil {
-		createdBy = &user.ID
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
 	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		"",
+		rbac.PermissionAnsibleJobExecute,
+		&projectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to launch jobs in this project"},
+			},
+		})
+		return
+	}
+
+	createdBy := &user.ID
 
 	input := ansible.LaunchJobInput{
 		ProjectID:      projectID,
@@ -339,6 +472,35 @@ func (h *JobHandler) LaunchByOrganization(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Organization not found"},
+			},
+		})
+		return
+	}
+
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckOrgManageAnsible(c.Request.Context(), user.ID, org.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to launch jobs in this organization"},
 			},
 		})
 		return
@@ -439,11 +601,7 @@ func (h *JobHandler) LaunchByOrganization(c *gin.Context) {
 		jobType = models.AnsibleJobTypeSyntax
 	}
 
-	// Get user ID
-	var createdBy *uuid.UUID
-	if user, err := h.authService.GetUserFromContext(c); err == nil {
-		createdBy = &user.ID
-	}
+	createdBy := &user.ID
 
 	input := ansible.LaunchJobInput{
 		ProjectID:      projectID,
@@ -493,11 +651,47 @@ func (h *JobHandler) Get(c *gin.Context) {
 		return
 	}
 
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
 	job, err := h.jobService.GetJob(id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"errors": []gin.H{
 				{"status": "404", "title": "Not Found", "detail": "Job not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		job.ID.String(),
+		rbac.PermissionAnsibleJobRead,
+		&job.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to view this job"},
 			},
 		})
 		return
@@ -517,6 +711,52 @@ func (h *JobHandler) Cancel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid job ID"},
+			},
+		})
+		return
+	}
+
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	existingJob, err := h.jobService.GetJob(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Job not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		existingJob.ID.String(),
+		rbac.PermissionAnsibleJobExecute,
+		&existingJob.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to cancel this job"},
 			},
 		})
 		return
@@ -551,11 +791,53 @@ func (h *JobHandler) Relaunch(c *gin.Context) {
 		return
 	}
 
-	// Get user ID
-	var createdBy *uuid.UUID
-	if user, err := h.authService.GetUserFromContext(c); err == nil {
-		createdBy = &user.ID
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
 	}
+
+	existingJob, err := h.jobService.GetJob(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Job not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		existingJob.ID.String(),
+		rbac.PermissionAnsibleJobExecute,
+		&existingJob.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to relaunch this job"},
+			},
+		})
+		return
+	}
+
+	createdBy := &user.ID
 
 	job, err := h.jobService.RelaunchJob(context.Background(), id, createdBy)
 	if err != nil {
@@ -586,6 +868,52 @@ func (h *JobHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	existingJob, err := h.jobService.GetJob(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Job not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		existingJob.ID.String(),
+		rbac.PermissionAnsibleJobExecute,
+		&existingJob.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to delete this job"},
+			},
+		})
+		return
+	}
+
 	err = h.jobService.DeleteJob(id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -608,6 +936,52 @@ func (h *JobHandler) GetEvents(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"errors": []gin.H{
 				{"status": "400", "title": "Bad Request", "detail": "Invalid job ID"},
+			},
+		})
+		return
+	}
+
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	job, err := h.jobService.GetJob(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Job not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		job.ID.String(),
+		rbac.PermissionAnsibleJobRead,
+		&job.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to view events for this job"},
 			},
 		})
 		return
@@ -657,6 +1031,52 @@ func (h *JobHandler) GetOutput(c *gin.Context) {
 		return
 	}
 
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	job, err := h.jobService.GetJob(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Job not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		job.ID.String(),
+		rbac.PermissionAnsibleJobRead,
+		&job.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to view output for this job"},
+			},
+		})
+		return
+	}
+
 	output, err := h.jobService.GetJobOutput(id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -686,17 +1106,59 @@ func (h *JobHandler) LaunchFromTemplate(c *gin.Context) {
 		return
 	}
 
+	// RBAC check
+	user, err := h.authService.GetUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"errors": []gin.H{
+				{"status": "401", "title": "Unauthorized", "detail": "Authentication required"},
+			},
+		})
+		return
+	}
+
+	template, err := h.templateRepo.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"errors": []gin.H{
+				{"status": "404", "title": "Not Found", "detail": "Template not found"},
+			},
+		})
+		return
+	}
+
+	hasPermission, err := h.rbacService.CheckAnsibleResourcePermission(
+		c.Request.Context(),
+		user.ID,
+		rbac.ResourceTypeAnsibleJob,
+		"",
+		rbac.PermissionAnsibleJobExecute,
+		&template.ProjectID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"errors": []gin.H{
+				{"status": "500", "title": "Internal Server Error", "detail": "Failed to check permissions"},
+			},
+		})
+		return
+	}
+	if !hasPermission {
+		c.JSON(http.StatusForbidden, gin.H{
+			"errors": []gin.H{
+				{"status": "403", "title": "Forbidden", "detail": "You don't have permission to launch jobs from this template"},
+			},
+		})
+		return
+	}
+
 	var req LaunchFromTemplateRequest
 	// Optional body for extra vars
 	// If JSON binding fails, continue with empty request (backward compatibility)
 	// The request body is optional for this endpoint
 	_ = c.ShouldBindJSON(&req)
 
-	// Get user ID
-	var createdBy *uuid.UUID
-	if user, err := h.authService.GetUserFromContext(c); err == nil {
-		createdBy = &user.ID
-	}
+	createdBy := &user.ID
 
 	job, err := h.jobService.LaunchFromTemplate(context.Background(), id, req.Data.Attributes.ExtraVars, createdBy)
 	if err != nil {
