@@ -12,25 +12,53 @@ permissions:
   packages: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Build and push
-        uses: michielvha/docker-release-action@main
+      - name: Build and push by digest
+        uses: michielvha/docker-release-action@v2
         with:
+          matrix-mode: build
           version: ${{ github.ref_name }}
           registry: ghcr.io
           username: vhco-pro
           password: ${{ secrets.GITHUB_TOKEN }}
           project: stackweaver-ansible-runner
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           context: .
-          cache-from: type=registry,ref=ghcr.io/vhco-pro/stackweaver-ansible-runner:buildcache
-          cache-to: type=registry,ref=ghcr.io/vhco-pro/stackweaver-ansible-runner:buildcache,mode=max
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create multi-arch manifest
+        uses: michielvha/docker-release-action@v2
+        with:
+          matrix-mode: merge
+          version: ${{ github.ref_name }}
+          registry: ghcr.io
+          username: vhco-pro
+          password: ${{ secrets.GITHUB_TOKEN }}
+          project: stackweaver-ansible-runner
           trivy-exit-code: '0'
+
+  changelog:
+    needs: merge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
 
       - name: Changelog & GitHub Release
         uses: michielvha/changelog-release-action@main
