@@ -17,7 +17,7 @@ COPY backend/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner
 
 # ── Python deps stage: install via uv into a venv ───────────────────
-FROM python:3.14-slim AS python-deps
+FROM python:3.14-slim@sha256:fb83750094b46fd6b8adaa80f66e2302ecbe45d513f6cece637a841e1025b4ca AS python-deps
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
 
@@ -26,12 +26,14 @@ COPY runner-images/ansible/pyproject.toml runner-images/ansible/uv.lock ./
 RUN uv sync --frozen --group all --no-dev --no-install-project
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM python:3.14-slim
+FROM python:3.14-slim@sha256:fb83750094b46fd6b8adaa80f66e2302ecbe45d513f6cece637a841e1025b4ca
 
 # System packages required by Ansible modules / connections (upgrade first to pull security patches)
+# Remove pip/ensurepip from stdlib — uv handles package management, pip is a vulnerability surface
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
         openssh-client git sshpass ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /usr/local/lib/python3.14/ensurepip /usr/local/lib/python3.14/site-packages/pip*
 
 # Copy the pre-built venv from the python-deps stage
 COPY --from=python-deps /opt/ansible-deps/.venv /opt/ansible-deps/.venv
