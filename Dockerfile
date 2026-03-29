@@ -5,12 +5,13 @@
 
 # ── Build stage: compile the Go binary ──────────────────────────────
 FROM golang:1.26-alpine AS builder
+ENV GOPRIVATE=github.com/michielvha/stackweaver
 
 WORKDIR /app
 RUN apk add --no-cache git
 
 COPY backend/go.mod backend/go.sum ./
-RUN go mod download
+RUN --mount=type=secret,id=netrc,target=/root/.netrc go mod download
 
 COPY backend/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner
