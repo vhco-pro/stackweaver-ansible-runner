@@ -23,16 +23,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/iac-platform/backend/internal/models"
-	"github.com/iac-platform/backend/internal/queue"
-	"github.com/iac-platform/backend/internal/repository"
-	"github.com/iac-platform/backend/internal/services/ansible"
-	"github.com/iac-platform/backend/internal/services/oidc"
-	"github.com/iac-platform/backend/internal/services/vcs"
-	"github.com/iac-platform/backend/internal/storage"
-	vcsGitHub "github.com/iac-platform/backend/internal/vcs/github"
-	"github.com/iac-platform/backend/pkg/crypto"
 	"github.com/michielvha/logger"
+	"github.com/michielvha/stackweaver/core/crypto"
+	"github.com/michielvha/stackweaver/core/models"
+	"github.com/michielvha/stackweaver/core/queue"
+	"github.com/michielvha/stackweaver/core/repository"
+	"github.com/michielvha/stackweaver/core/services/ansible"
+	"github.com/michielvha/stackweaver/core/services/oidc"
+	"github.com/michielvha/stackweaver/core/services/vcs"
+	"github.com/michielvha/stackweaver/core/storage"
+	vcsGitHub "github.com/michielvha/stackweaver/core/vcs/github"
 )
 
 // AnsibleJobMessage represents the message received from the job queue
