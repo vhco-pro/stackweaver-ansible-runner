@@ -28,7 +28,7 @@ jobs:
 
       - name: Create .netrc for private Go modules
         run: |
-          printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.RELEASE_TOKEN }}\n" > .netrc
+          printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.MONOREPO_READ_TOKEN }}\n" > .netrc
 
       - name: Build and push by digest
         uses: michielvha/docker-release-action@v2
