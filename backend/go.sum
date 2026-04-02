@@ -124,8 +124,8 @@ github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/michielvha/logger v0.0.1 h1:+IipglcvIyxkVeQV+sqLZzotDNed0iHc+mxBhWIkKug=
 github.com/michielvha/logger v0.0.1/go.mod h1:YJjpbm0AlPmmLBFO8tPyBAruWMJisu2sPo/DX9qxKJk=
-github.com/michielvha/stackweaver/core v0.500.0 h1:oNMilT0QCfj731abC9WMM5G8FBOCGNJivJ3RtzJeTe8=
-github.com/michielvha/stackweaver/core v0.500.0/go.mod h1:IqaOmqtO1BYRPzvFVRtuXq+V81oa1sus4SIBff9yom0=
+github.com/michielvha/stackweaver/core v0.502.0 h1:yEegS05sP7xiFLsntiv/Bnvwd0+Jf4yYEVQug5ym2TY=
+github.com/michielvha/stackweaver/core v0.502.0/go.mod h1:IqaOmqtO1BYRPzvFVRtuXq+V81oa1sus4SIBff9yom0=
 github.com/microsoft/go-mssqldb v1.7.2 h1:CHkFJiObW7ItKTJfHo1QX7QBBD1iV+mn1eOyRP3b/PA=
 github.com/microsoft/go-mssqldb v1.7.2/go.mod h1:kOvZKUdrhhFQmxLZqbwUV0rHkNkZpthMITIb2Ko1IoA=
 github.com/minio/crc64nvme v1.1.1 h1:8dwx/Pz49suywbO+auHCBpCtlW1OfpcLN7wYgVR6wAI=
