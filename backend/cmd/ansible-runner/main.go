@@ -75,11 +75,6 @@ type Config struct {
 	DatabaseUser      string
 	DatabasePassword  string
 	DatabaseName      string
-	StorageEndpoint   string
-	StorageAccessKey  string
-	StorageSecretKey  string
-	StorageBucket     string
-	StorageUseSSL     bool
 	EncryptionKey     []byte
 	WorkspacesDir     string
 	AnsibleBinaryPath string
@@ -134,13 +129,8 @@ func main() {
 	}
 
 	// Initialize storage client
-	storageClient, err := storage.NewMinIOClient(
-		config.StorageEndpoint,
-		config.StorageAccessKey,
-		config.StorageSecretKey,
-		config.StorageBucket,
-		config.StorageUseSSL,
-	)
+	storageCfg := storage.ConfigFromEnv()
+	storageClient, err := storage.NewClient(context.Background(), storageCfg)
 	if err != nil {
 		logger.Fatalf("Failed to connect to storage: %v", err)
 	}
@@ -1697,11 +1687,6 @@ func loadConfig() Config {
 		DatabaseUser:      getEnv("DATABASE_USER", "iac"),
 		DatabasePassword:  getEnv("DATABASE_PASSWORD", "iac_password"),
 		DatabaseName:      getEnv("DATABASE_NAME", "iac_platform"),
-		StorageEndpoint:   getEnv("STORAGE_ENDPOINT", "localhost:9000"),
-		StorageAccessKey:  getEnv("STORAGE_ACCESS_KEY", "minioadmin"),
-		StorageSecretKey:  getEnv("STORAGE_SECRET_KEY", "minioadmin"),
-		StorageBucket:     getEnv("STORAGE_BUCKET", "ansible-artifacts"),
-		StorageUseSSL:     getEnv("STORAGE_USE_SSL", "false") == "true",
 		WorkspacesDir:     getEnv("WORKSPACES_DIR", "/home/iac/workspaces"),
 		AnsibleBinaryPath: os.Getenv("ANSIBLE_BINARY_PATH"),
 	}
