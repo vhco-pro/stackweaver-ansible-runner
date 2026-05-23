@@ -65,8 +65,8 @@ jobs:
           trivy-exit-code: '0'
           cosign-sign: 'true'
           sbom: 'true'
-          attest-provenance: 'true'
-          attest-sbom: 'true'
+          attest-provenance: ${{ github.event.repository.visibility == 'public' }}
+          attest-sbom: ${{ github.event.repository.visibility == 'public' }}
 
   changelog:
     needs: merge
