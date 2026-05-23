@@ -7,12 +7,13 @@ on:
     tags:
       - '*.*.*'
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 jobs:
   build:
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -24,14 +25,14 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Create .netrc for private Go modules
         run: |
           printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.MONOREPO_READ_TOKEN }}\n" > .netrc
 
       - name: Build and push by digest
-        uses: michielvha/docker-release-action@v2
+        uses: michielvha/docker-release-action@01f1c91b9b79bca51b330b6a640ad6153277ff62 # v2 (supply-chain)
         with:
           matrix-mode: build
           version: ${{ github.ref_name }}
@@ -45,10 +46,15 @@ jobs:
 
   merge:
     needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     runs-on: ubuntu-latest
     steps:
       - name: Create multi-arch manifest
-        uses: michielvha/docker-release-action@v2
+        uses: michielvha/docker-release-action@01f1c91b9b79bca51b330b6a640ad6153277ff62 # v2 (supply-chain)
         with:
           matrix-mode: merge
           version: ${{ github.ref_name }}
@@ -57,15 +63,21 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
           project: stackweaver-ansible-runner
           trivy-exit-code: '0'
+          cosign-sign: 'true'
+          sbom: 'true'
+          attest-provenance: 'true'
+          attest-sbom: 'true'
 
   changelog:
     needs: merge
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Changelog & GitHub Release
-        uses: michielvha/changelog-release-action@main
+        uses: michielvha/changelog-release-action@81984f615bdcb8f88bbf92f49cae8d70f0fce099 # main snapshot 2026-05-23
         with:
           version: ${{ github.ref_name }}
