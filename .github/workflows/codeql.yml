@@ -1,0 +1,19 @@
+# Generated from vhco-pro/.github workflow-templates/codeql-go.yml
+
+name: CodeQL
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "33 4 * * 2"
+
+permissions: read-all
+
+jobs:
+  analyze:
+    uses: vhco-pro/.github/.github/workflows/reusable-codeql-go.yml@main
+    permissions:
+      security-events: write
+      contents: read

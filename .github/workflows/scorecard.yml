@@ -1,0 +1,25 @@
+# Generated from vhco-pro/.github workflow-templates/scorecard.yml
+# See vhco-pro/.github/workflow-templates/scorecard.yml for the source-of-truth template.
+
+name: Scorecard
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "21 6 * * 1"
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  scorecard:
+    uses: vhco-pro/.github/.github/workflows/reusable-scorecard.yml@main
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    with:
+      # Keep false while this repo is private. Flip to true after the public-flip
+      # wave of the OSPS audit lands (see osps-baseline-audit.md, Wave 6).
+      publish_results: false
