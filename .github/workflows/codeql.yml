@@ -9,7 +9,6 @@ on:
   schedule:
     - cron: "33 4 * * 2"
 
-permissions: read-all
 
 jobs:
   analyze:
