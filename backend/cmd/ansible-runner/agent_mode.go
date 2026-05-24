@@ -525,7 +525,7 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	if playbookPath == "" {
 		playbookPath = "site.yml"
 	}
-	// Strip leading slash — playbook paths are relative to the cloned repo root.
+	// Strip leading slash, playbook paths are relative to the cloned repo root.
 	// Azure DevOps file listing returns paths with a leading "/" which would cause
 	// filepath.IsAbs() to treat them as absolute system paths instead of repo-relative.
 	playbookPath = strings.TrimPrefix(playbookPath, "/")
