@@ -1,4 +1,4 @@
-# Stackweaver Ansible Runner
+# Stackweaver™ Ansible Runner
 
 The self-hosted Ansible runner for the [Stackweaver](https://github.com/vhco-pro/stackweaver) DevOps platform.
 
@@ -34,6 +34,10 @@ cosign verify \
 ```
 
 The full verification guide — including SLSA provenance, SBOM extraction, and `gitsign verify` for sync commits — lives at <https://sw.vhco.pro/docs/security/verifying-releases>.
+
+## Trademark
+
+Stackweaver™ is a trademark of VH & Co. The Stackweaver name and word mark identify the official Stackweaver project; the source-code licence does not grant a right to use the mark in product names, hosted services, or company names. See the [Trademark Policy](https://github.com/vhco-pro/.github/blob/main/TRADEMARK.md) for the full terms.
 
 ## License
 
