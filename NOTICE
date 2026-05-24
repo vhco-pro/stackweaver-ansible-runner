@@ -1,0 +1,16 @@
+Stackweaver Ansible Runner
+Copyright (c) 2025 VH & Co BV
+
+This product is licensed under Apache License 2.0 (see LICENSE).
+
+It includes and links against components from the Stackweaver project that
+are distributed under the Business Source License 1.1 with an Additional
+Use Grant restricting managed-SaaS resale. These components include
+(non-exhaustive; see go.mod and the published SBOM for the full list):
+
+  github.com/michielvha/stackweaver/core   BUSL-1.1
+
+When you run or distribute this product as a built binary or container
+image, the BSL Additional Use Grant applies to the assembled artefact.
+Refer to https://github.com/vhco-pro/.github/blob/main/SECURITY.md for
+the full upstream licence text.

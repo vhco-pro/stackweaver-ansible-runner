@@ -409,7 +409,7 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 			inventory.LastSyncLog = result.Stderr
 			logger.Infof("Inventory sync %s completed successfully (hosts: %d)", inventory.ID.String(), result.HostsDiscovered)
 			if result.HostsDiscovered == 0 {
-				logger.Warnf("Inventory sync %s: 0 hosts discovered — check plugin configuration and authentication", inventory.ID.String())
+				logger.Warnf("Inventory sync %s: 0 hosts discovered, check plugin configuration and authentication", inventory.ID.String())
 			}
 		}
 
@@ -1189,7 +1189,7 @@ func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *model
 	if playbookPath == "" {
 		playbookPath = "site.yml"
 	}
-	// Strip leading slash — playbook paths are relative to the cloned repo root.
+	// Strip leading slash, playbook paths are relative to the cloned repo root.
 	// Azure DevOps file listing returns paths with a leading "/" which would cause
 	// filepath.IsAbs() to treat them as absolute system paths instead of repo-relative.
 	playbookPath = strings.TrimPrefix(playbookPath, "/")
