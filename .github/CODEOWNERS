@@ -1,0 +1,6 @@
+# Default owner for everything in this repository.
+# This satellite is a sync target — source of truth is the private monorepo at
+# https://github.com/michielvha/stackweaver. Direct PRs against this repo will
+# still trigger reviewer assignment, but day-to-day changes flow in via the
+# sync-<component>.yml workflow on the monorepo, signed by gitsign.
+*       @michielvha
