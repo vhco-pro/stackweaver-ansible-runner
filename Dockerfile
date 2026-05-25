@@ -1,4 +1,5 @@
 # Ansible Runner Dockerfile
+# Sync smoke test 2026-05-25T17:08Z (D-SYNC-PR)
 # This builds the Ansible runner that executes Ansible playbooks
 # NOTE: This Dockerfile must be built with context set to the repository root
 # Example: docker build -f runner-images/ansible/Dockerfile -t ansible-runner .
