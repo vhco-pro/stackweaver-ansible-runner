@@ -12,7 +12,7 @@ on:
 
 jobs:
   scorecard:
-    uses: vhco-pro/.github/.github/workflows/reusable-scorecard.yml@main
+    uses: vhco-pro/.github/.github/workflows/reusable-scorecard.yml@420368737f7b821a3ea419dcc30ddcb405c75aaf # main
     if: github.event.repository.visibility == 'public'
     permissions:
       security-events: write
