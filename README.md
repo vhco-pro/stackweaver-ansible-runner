@@ -1,4 +1,4 @@
-# Stackweaver™ Ansible Runner
+# Stackweaver Ansible Runner
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/vhco-pro/stackweaver-ansible-runner/badge)](https://scorecard.dev/viewer/?uri=github.com/vhco-pro/stackweaver-ansible-runner)
 
