@@ -136,7 +136,7 @@ jobs:
           set -euo pipefail
           gh attestation download \
             "oci://ghcr.io/${{ github.repository }}@${DIGEST}" \
-            --predicate-type https://spdx.dev/Document \
+            --predicate-type https://spdx.dev/Document/v2.3 \
             -R "${{ github.repository }}" || {
               echo "::warning::SBOM download failed"; exit 0; }
           f=$(ls -1 *.jsonl 2>/dev/null | grep -v '^provenance.intoto.jsonl$' | head -1 || true)
