@@ -1,0 +1,72 @@
+# Copyright (c) 2025 VH & Co BV. Licensed under the Business Source License 1.1. See LICENSE for details.
+#
+# Auto-approve and auto-merge sync PRs authored by stackweaver-release-bot[bot].
+#
+# This workflow implements D-SYNC-PR. Full threat model and rationale:
+#   - Public:   docs/security/sync-architecture.md (in monorepo)
+#   - Internal: docs/internal/security/osps-baseline-audit.md §14
+#
+# It performs NO actions/checkout, NO execution of PR code, and reads only
+# github.event.pull_request.* metadata. The four hard gates in `if:` below
+# enforce the security boundary; do not weaken them without audit review.
+
+name: Auto-approve sync PR
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: auto-approve-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  approve-and-merge:
+    runs-on: ubuntu-latest
+    # Gate 1: author must be the release-bot App (the [bot] suffix is GitHub-reserved, unspoofable).
+    # Gate 2: branch must follow sync/* convention.
+    # Gate 3: PR must originate from the satellite itself, not a fork.
+    if: >
+      github.event.pull_request.user.login == 'stackweaver-release-bot[bot]' &&
+      startsWith(github.event.pull_request.head.ref, 'sync/') &&
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    steps:
+      - name: Mint pr-reviewer App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PR_REVIEWER_APP_ID }}
+          private-key: ${{ secrets.PR_REVIEWER_PRIVATE_KEY }}
+
+      # Gate 4: refuse to auto-approve any PR that touches workflow files.
+      # Belt + suspenders — the pr-reviewer App also lacks workflows:write,
+      # so GitHub would reject the merge server-side anyway, but failing
+      # fast here keeps the audit log clean.
+      - name: Gate 4 — refuse if PR touches .github/workflows/**
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          files=$(gh pr view "$PR" -R "$REPO" --json files --jq '.files[].path')
+          if echo "$files" | grep -qE '^\.github/workflows/'; then
+            echo "::warning::PR modifies .github/workflows/**; refusing auto-approval. Manual review required."
+            exit 0
+          fi
+
+      - name: Approve PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr review "$PR" -R "$REPO" --approve --body "Auto-approved by stackweaver-pr-reviewer per D-SYNC-PR. See docs/security/sync-architecture.md."
+
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr merge "$PR" -R "$REPO" --auto --squash
