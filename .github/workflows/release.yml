@@ -81,3 +81,86 @@ jobs:
         uses: michielvha/changelog-release-action@81984f615bdcb8f88bbf92f49cae8d70f0fce099 # main snapshot 2026-05-23
         with:
           version: ${{ github.ref_name }}
+
+  release-assets:
+    needs: [merge, changelog]
+    if: ${{ github.event.repository.visibility == 'public' }}
+    permissions:
+      contents: write       # upload to GitHub Release
+      packages: read        # read GHCR for digest lookup
+      attestations: read    # read attestation store
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve image digest
+        id: digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Container packages owned by an org → /orgs/<org>/packages
+          digest=$(gh api --paginate \
+            "/orgs/vhco-pro/packages/container/${REPO_NAME}/versions" \
+            --jq ".[] | select(.metadata.container.tags[]? == \"${TAG}\") | .name" | head -1)
+          if [ -z "${digest}" ]; then
+            echo "::error::Could not resolve digest for ${REPO_NAME}:${TAG}"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Resolved ghcr.io/${{ github.repository }}@${digest}"
+
+      - name: Download SLSA provenance bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation download \
+            "oci://ghcr.io/${{ github.repository }}@${DIGEST}" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            -R "${{ github.repository }}" || {
+              echo "::warning::SLSA provenance download failed"; exit 0; }
+          # gh attestation download writes <digest-without-prefix>.jsonl
+          f=$(ls -1 *.jsonl 2>/dev/null | head -1 || true)
+          if [ -n "${f}" ]; then
+            mv "${f}" provenance.intoto.jsonl
+            echo "Renamed ${f} -> provenance.intoto.jsonl"
+          fi
+
+      - name: Download SPDX SBOM bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation download \
+            "oci://ghcr.io/${{ github.repository }}@${DIGEST}" \
+            --predicate-type https://spdx.dev/Document \
+            -R "${{ github.repository }}" || {
+              echo "::warning::SBOM download failed"; exit 0; }
+          f=$(ls -1 *.jsonl 2>/dev/null | grep -v '^provenance.intoto.jsonl$' | head -1 || true)
+          if [ -n "${f}" ]; then
+            mv "${f}" sbom.spdx.intoto.jsonl
+            echo "Renamed ${f} -> sbom.spdx.intoto.jsonl"
+          fi
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          if ls *.intoto.jsonl 1>/dev/null 2>&1; then
+            sha256sum *.intoto.jsonl > checksums.txt
+            cat checksums.txt
+          else
+            echo "No .intoto.jsonl files present; skipping checksums" > checksums.txt
+          fi
+
+      - name: Attach assets to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            provenance.intoto.jsonl
+            sbom.spdx.intoto.jsonl
+            checksums.txt
+          fail_on_unmatched_files: false
