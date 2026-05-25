@@ -1,5 +1,7 @@
 # Stackweaver™ Ansible Runner
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/vhco-pro/stackweaver-ansible-runner/badge)](https://scorecard.dev/viewer/?uri=github.com/vhco-pro/stackweaver-ansible-runner)
+
 The self-hosted Ansible runner for the [Stackweaver](https://github.com/vhco-pro/stackweaver) DevOps platform.
 
 > [!IMPORTANT]
