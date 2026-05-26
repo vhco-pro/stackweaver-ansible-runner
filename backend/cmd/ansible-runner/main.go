@@ -28,6 +28,7 @@ import (
 	"github.com/michielvha/stackweaver/core/models"
 	"github.com/michielvha/stackweaver/core/queue"
 	"github.com/michielvha/stackweaver/core/repository"
+	"github.com/michielvha/stackweaver/core/security/archive"
 	"github.com/michielvha/stackweaver/core/services/ansible"
 	"github.com/michielvha/stackweaver/core/services/oidc"
 	"github.com/michielvha/stackweaver/core/services/vcs"
@@ -1760,9 +1761,16 @@ func extractTarGz(data []byte, targetDir string) error {
 			return fmt.Errorf("failed to read tar entry: %w", err)
 		}
 
-		target := filepath.Join(targetDir, header.Name) //nolint:gosec // path traversal protection below
+		// Validate the entry name BEFORE constructing any filesystem path.
+		// archive.SafeEntryName uses filepath.IsLocal which CodeQL's
+		// go/zipslip query recognises as a sanitiser (Wave 8 / D3).
+		safeName, err := archive.SafeEntryName(header.Name)
+		if err != nil {
+			return fmt.Errorf("invalid file path in archive: %w", err)
+		}
+		target := filepath.Join(targetDir, safeName) //nolint:gosec // safeName validated by archive.SafeEntryName
 
-		// Security: Prevent directory traversal - ensure target is within targetDir
+		// Defence-in-depth: also verify the joined path stays under targetDir.
 		cleanTarget := filepath.Clean(target)
 		cleanTargetDir := filepath.Clean(targetDir)
 		if !strings.HasPrefix(cleanTarget, cleanTargetDir+string(filepath.Separator)) && cleanTarget != cleanTargetDir {
