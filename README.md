@@ -14,7 +14,7 @@ This runner executes Ansible playbooks as part of the Stackweaver orchestration 
 docker pull ghcr.io/vhco-pro/stackweaver-ansible-runner:latest
 ```
 
-See the [Stackweaver documentation](https://github.com/vhco-pro/stackweaver) for deployment and configuration instructions.
+See the [Stackweaver documentation](https://sw.vhco.pro/docs) for deployment and configuration instructions.
 
 ## Customize
 
