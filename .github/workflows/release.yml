@@ -32,7 +32,7 @@ jobs:
           printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.MONOREPO_READ_TOKEN }}\n" > .netrc
 
       - name: Build and push by digest
-        uses: michielvha/docker-release-action@01f1c91b9b79bca51b330b6a640ad6153277ff62 # v2 (supply-chain)
+        uses: michielvha/docker-release-action@3a8c2ce62d95d241e922fe23af4c0eadd181cb12 # v2 (vex)
         with:
           matrix-mode: build
           version: ${{ github.ref_name }}
@@ -53,8 +53,11 @@ jobs:
       attestations: write
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Create multi-arch manifest
-        uses: michielvha/docker-release-action@01f1c91b9b79bca51b330b6a640ad6153277ff62 # v2 (supply-chain)
+        uses: michielvha/docker-release-action@3a8c2ce62d95d241e922fe23af4c0eadd181cb12 # v2 (vex)
         with:
           matrix-mode: merge
           version: ${{ github.ref_name }}
@@ -67,6 +70,8 @@ jobs:
           sbom: 'true'
           attest-provenance: ${{ github.event.repository.visibility == 'public' }}
           attest-sbom: ${{ github.event.repository.visibility == 'public' }}
+          vex: security/vex/stackweaver-ansible-runner.openvex.json
+          attest-vex: ${{ github.event.repository.visibility == 'public' }}
 
   changelog:
     needs: merge
