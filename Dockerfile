@@ -34,7 +34,8 @@ FROM python:3.14-slim@sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fa
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
         openssh-client git sshpass ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /usr/local/lib/python3.14/ensurepip /usr/local/lib/python3.14/site-packages/pip*
+    && rm -rf /usr/local/lib/python3.14/ensurepip /usr/local/lib/python3.14/site-packages/pip* \
+    && ln -sf /usr/local/bin/python3 /usr/bin/python3
 
 # Copy the pre-built venv from the python-deps stage
 COPY --from=python-deps /opt/ansible-deps/.venv /opt/ansible-deps/.venv
