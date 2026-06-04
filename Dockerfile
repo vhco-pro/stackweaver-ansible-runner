@@ -5,7 +5,7 @@
 # Example: docker build -f runner-images/ansible/Dockerfile -t ansible-runner .
 
 # ── Build stage: compile the Go binary ──────────────────────────────
-FROM golang:1.26-alpine@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d AS builder
+FROM golang:1.26-alpine@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f AS builder
 ENV GOPRIVATE=github.com/michielvha/stackweaver
 
 WORKDIR /app
@@ -34,7 +34,8 @@ FROM python:3.14-slim@sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fa
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
         openssh-client git sshpass ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /usr/local/lib/python3.14/ensurepip /usr/local/lib/python3.14/site-packages/pip*
+    && rm -rf /usr/local/lib/python3.14/ensurepip /usr/local/lib/python3.14/site-packages/pip* \
+    && ln -sf /usr/local/bin/python3 /usr/bin/python3
 
 # Copy the pre-built venv from the python-deps stage
 COPY --from=python-deps /opt/ansible-deps/.venv /opt/ansible-deps/.venv
@@ -61,13 +62,18 @@ USER iac
 
 # Working directories
 RUN mkdir -p /home/iac/workspaces/ansible-sync \
-             /home/iac/workspaces/ansible-jobs \
-             /home/iac/galaxy-cache/collections \
-             /home/iac/galaxy-cache/roles
+             /home/iac/workspaces/ansible-jobs
 
 WORKDIR /home/iac
 
 # Environment
 ENV WORKSPACES_DIR=/home/iac/workspaces
+# Default Ansible home under writable /tmp so Ansible can create its local temp
+# dir under the read-only root filesystem. The runner overrides this per
+# job/sync onto the workspaces volume; the Galaxy cache lives on that volume too.
+ENV ANSIBLE_HOME=/tmp/.ansible
+# Module "remote" temp dir. For local-connection tasks the target is this
+# read-only container, so it must live under writable /tmp (per-task namespaced).
+ENV ANSIBLE_REMOTE_TMP=/tmp/.ansible/tmp
 
 CMD ["/usr/local/bin/ansible-runner"]

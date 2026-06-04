@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -529,6 +530,10 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	cmdName := "ansible-inventory"
 	cmdArgs := []string{"-i", inventoryFilePath, "--list"}
 	cmdEnv := os.Environ()
+	// Isolate Ansible's home under the per-sync workspace so ansible-inventory
+	// works under a read-only root filesystem (it eagerly creates ~/.ansible/tmp
+	// on import).
+	cmdEnv = append(cmdEnv, "ANSIBLE_HOME="+filepath.Join(syncDir, ".ansible"))
 
 	if r.azureOIDCRepo != nil && r.oidcTokenService != nil {
 		configs, oidcErr := r.azureOIDCRepo.GetByOrganization(inventory.OrganizationID)
@@ -765,8 +770,10 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob) 
 		return fmt.Errorf("failed to prepare playbook: %w", err)
 	}
 
-	// Install Galaxy requirements if requirements.yml exists
-	if err := r.installGalaxyRequirements(ctx, job, playbookDir); err != nil {
+	// Install Galaxy requirements if requirements.yml exists. Returns the
+	// per-job collections/roles directories this run should use.
+	galaxyCollections, galaxyRoles, err := r.installGalaxyRequirements(ctx, job, jobDir, playbookDir)
+	if err != nil {
 		// Log warning but don't fail the job
 		logger.Warnf("Failed to install Galaxy requirements: %v", err)
 	}
@@ -802,6 +809,33 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob) 
 
 	// Build ansible-playbook command and get the working directory
 	args, workDir := r.buildAnsibleArgs(job, playbook, playbookDir, inventoryFile, sshKeyFile)
+
+	if envVars == nil {
+		envVars = map[string]string{}
+	}
+
+	// Isolate Ansible's home (tmp, cp, etc.) under the per-job workspace so it
+	// works under a read-only root filesystem. Ansible derives DEFAULT_LOCAL_TMP
+	// from ANSIBLE_HOME, auto-namespacing a tmp dir per invocation.
+	envVars["ANSIBLE_HOME"] = filepath.Join(jobDir, ".ansible")
+	// Keep the SSH ControlPath dir short to stay under the ~104-char unix socket
+	// path limit; the per-job ANSIBLE_HOME path is far too long for it.
+	envVars["ANSIBLE_SSH_CONTROL_PATH_DIR"] = "/tmp/.ansible-cp"
+
+	// Point collection/role lookups at this job's installed Galaxy cache plus the
+	// playbook-local directories.
+	playbookCollections := filepath.Join(workDir, "collections")
+	playbookRoles := filepath.Join(workDir, "roles")
+	if galaxyCollections != "" {
+		envVars["ANSIBLE_COLLECTIONS_PATH"] = galaxyCollections + ":" + playbookCollections
+	} else {
+		envVars["ANSIBLE_COLLECTIONS_PATH"] = playbookCollections
+	}
+	if galaxyRoles != "" {
+		envVars["ANSIBLE_ROLES_PATH"] = galaxyRoles + ":" + playbookRoles
+	} else {
+		envVars["ANSIBLE_ROLES_PATH"] = playbookRoles
+	}
 
 	// Prepare ansible.cfg from stored configuration (project > org priority)
 	if err := r.prepareAnsibleConfig(ctx, workDir, job); err != nil {
@@ -888,8 +922,22 @@ func (r *AnsibleRunner) cloneVCSRepoGeneric(ctx context.Context, targetDir strin
 
 // installGalaxyRequirements checks for requirements.yml in the playbook directory
 // and installs any Galaxy collections/roles defined there.
-// Uses a persistent cache directory to avoid re-downloading collections.
-func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *models.AnsibleJob, playbookDir string) error {
+//
+// Collections/roles are staged inside the per-job workspace (seeded from a warm,
+// per-project cache on the shared workspaces volume) so the run is isolated from
+// concurrent cache writes and works under a read-only root filesystem. After a
+// successful install the staged result is published back to the per-project
+// cache via a temp-dir + atomic rename so future jobs can reuse it.
+//
+// It returns the collections/roles directories this job should use. When no
+// requirements file is present it returns the warm per-project cache paths.
+func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *models.AnsibleJob, jobDir, playbookDir string) (collectionsDir, rolesDir string, err error) {
+	// Per-project Galaxy cache on the shared workspaces volume. Namespacing by
+	// project keeps one tenant's collections from being served to another.
+	cacheBase := filepath.Join(r.config.WorkspacesDir, "galaxy-cache", job.ProjectID.String())
+	canonicalCollections := filepath.Join(cacheBase, "collections")
+	canonicalRoles := filepath.Join(cacheBase, "roles")
+
 	// Common locations for requirements files
 	requirementsPaths := []string{
 		filepath.Join(playbookDir, "requirements.yml"),
@@ -899,31 +947,38 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 
 	var foundPath string
 	for _, path := range requirementsPaths {
-		if _, err := os.Stat(path); err == nil {
+		if _, statErr := os.Stat(path); statErr == nil {
 			foundPath = path
 			break
 		}
 	}
 
 	if foundPath == "" {
-		// No requirements file found, nothing to do
-		return nil
+		// No requirements file found; reuse the warm per-project cache if present.
+		return canonicalCollections, canonicalRoles, nil
 	}
 
 	logger.Infof("Found Galaxy requirements at: %s", foundPath)
 
-	// Create persistent cache directories for collections and roles
-	// These persist between job runs to avoid re-downloading
-	collectionsCache := "/home/iac/galaxy-cache/collections"
-	rolesCache := "/home/iac/galaxy-cache/roles"
-
-	if err := os.MkdirAll(collectionsCache, 0o755); err != nil { //nolint:gosec // cache directories need 0o755 for compatibility
-		logger.Warnf("Failed to create collections cache dir: %v", err)
-		collectionsCache = filepath.Join(playbookDir, "collections")
+	// Stage the install inside the per-job workspace, seeded from the warm cache.
+	// The job runs against this isolated copy, so a concurrent cache publish can
+	// never pull collections out from under it.
+	stageCollections := filepath.Join(jobDir, "galaxy", "collections")
+	stageRoles := filepath.Join(jobDir, "galaxy", "roles")
+	if mkErr := os.MkdirAll(filepath.Join(jobDir, "galaxy"), 0o755); mkErr != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
+		return "", "", fmt.Errorf("failed to create galaxy staging dir: %w", mkErr)
 	}
-	if err := os.MkdirAll(rolesCache, 0o755); err != nil { //nolint:gosec // cache directories need 0o755 for compatibility
-		logger.Warnf("Failed to create roles cache dir: %v", err)
-		rolesCache = filepath.Join(playbookDir, "roles")
+	if seedErr := seedGalaxyCache(canonicalCollections, stageCollections); seedErr != nil {
+		logger.Warnf("Failed to seed collections cache: %v", seedErr)
+	}
+	if seedErr := seedGalaxyCache(canonicalRoles, stageRoles); seedErr != nil {
+		logger.Warnf("Failed to seed roles cache: %v", seedErr)
+	}
+	if mkErr := os.MkdirAll(stageCollections, 0o755); mkErr != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
+		return "", "", fmt.Errorf("failed to create collections staging dir: %w", mkErr)
+	}
+	if mkErr := os.MkdirAll(stageRoles, 0o755); mkErr != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
+		return "", "", fmt.Errorf("failed to create roles staging dir: %w", mkErr)
 	}
 
 	// Create event for Galaxy installation
@@ -932,15 +987,14 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 		Event:   "galaxy_install",
 		Counter: 0,
 		Task:    "Installing Galaxy Requirements",
-		Stdout:  fmt.Sprintf("Installing collections/roles from %s (using cache: %s)\n", filepath.Base(foundPath), collectionsCache),
+		Stdout:  fmt.Sprintf("Installing collections/roles from %s\n", filepath.Base(foundPath)),
 	}
-	if err := r.jobRepo.CreateEvent(event); err != nil {
-		logger.Warnf("Failed to create Galaxy install event: %v", err)
+	if createErr := r.jobRepo.CreateEvent(event); createErr != nil {
+		logger.Warnf("Failed to create Galaxy install event: %v", createErr)
 	}
 
-	// Run ansible-galaxy collection install with --upgrade to check for new versions
-	// Using cache directory for persistence
-	galaxyCmd := exec.CommandContext(ctx, "ansible-galaxy", "collection", "install", "-r", foundPath, "-p", collectionsCache) //nolint:gosec // intentional: executing ansible command
+	// Run ansible-galaxy collection install into the staged directory.
+	galaxyCmd := exec.CommandContext(ctx, "ansible-galaxy", "collection", "install", "-r", foundPath, "-p", stageCollections) //nolint:gosec // intentional: executing ansible command
 	galaxyCmd.Dir = playbookDir
 
 	output, err := galaxyCmd.CombinedOutput()
@@ -957,11 +1011,11 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 		if createErr := r.jobRepo.CreateEvent(errorEvent); createErr != nil {
 			logger.Warnf("Failed to create error event: %v", createErr)
 		}
-		return fmt.Errorf("ansible-galaxy collection install failed: %w: %s", err, string(output))
+		return "", "", fmt.Errorf("ansible-galaxy collection install failed: %w: %s", err, string(output))
 	}
 
 	// Also install roles if the requirements file contains roles
-	rolesCmd := exec.CommandContext(ctx, "ansible-galaxy", "role", "install", "-r", foundPath, "-p", rolesCache) //nolint:gosec // intentional: executing ansible command
+	rolesCmd := exec.CommandContext(ctx, "ansible-galaxy", "role", "install", "-r", foundPath, "-p", stageRoles) //nolint:gosec // intentional: executing ansible command
 	rolesCmd.Dir = playbookDir
 	rolesOutput, rolesErr := rolesCmd.CombinedOutput()
 
@@ -979,11 +1033,80 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 		Task:    "Galaxy Requirements Installed",
 		Stdout:  resultStdout,
 	}
-	if err := r.jobRepo.CreateEvent(successEvent); err != nil {
-		logger.Warnf("Failed to create success event: %v", err)
+	if createErr := r.jobRepo.CreateEvent(successEvent); createErr != nil {
+		logger.Warnf("Failed to create success event: %v", createErr)
 	}
 
-	logger.Infof("Galaxy requirements installed successfully to cache")
+	// Publish the freshly installed cache back to the shared per-project cache for
+	// future jobs. Best-effort: failures here never fail the job.
+	if pubErr := publishGalaxyCache(stageCollections, canonicalCollections); pubErr != nil {
+		logger.Warnf("Failed to publish collections cache: %v", pubErr)
+	}
+	if pubErr := publishGalaxyCache(stageRoles, canonicalRoles); pubErr != nil {
+		logger.Warnf("Failed to publish roles cache: %v", pubErr)
+	}
+
+	logger.Infof("Galaxy requirements installed successfully")
+	return stageCollections, stageRoles, nil
+}
+
+// seedGalaxyCache copies a warm cache directory into a fresh staging directory so
+// ansible-galaxy can reuse already-downloaded collections. It is a no-op when the
+// source cache does not yet exist. The destination must not already exist.
+func seedGalaxyCache(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil || !info.IsDir() {
+		return nil //nolint:nilerr // no warm cache to seed from is not an error
+	}
+	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
+		return fmt.Errorf("seed %s -> %s: %w", src, dst, err)
+	}
+	return nil
+}
+
+// publishGalaxyCache atomically publishes a freshly installed staging directory to
+// the shared per-project cache using a temp-dir copy followed by an atomic rename.
+// It tolerates concurrent publishers without corrupting the cache.
+func publishGalaxyCache(src, dst string) error {
+	if info, err := os.Stat(src); err != nil || !info.IsDir() {
+		return nil //nolint:nilerr // nothing staged to publish
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil { //nolint:gosec // cache directories need 0o755 for compatibility
+		return fmt.Errorf("create cache parent: %w", err)
+	}
+
+	// Copy the staged tree to a sibling temp dir on the same filesystem so the
+	// final swap is an atomic rename.
+	tmp := dst + ".tmp-" + uuid.NewString()
+	if err := os.CopyFS(tmp, os.DirFS(src)); err != nil {
+		_ = os.RemoveAll(tmp)
+		return fmt.Errorf("stage cache copy: %w", err)
+	}
+
+	// rename(2) onto a non-empty directory fails, so move any existing cache aside
+	// first, then publish, then drop the old copy.
+	old := dst + ".old-" + uuid.NewString()
+	renamedAside := false
+	if err := os.Rename(dst, old); err == nil {
+		renamedAside = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		// A concurrent publisher already replaced dst; treat its result as
+		// authoritative and discard our temp copy.
+		_ = os.RemoveAll(tmp)
+		return nil //nolint:nilerr // concurrent publish won; not a failure
+	}
+
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.RemoveAll(tmp)
+		if renamedAside {
+			_ = os.Rename(old, dst) // best-effort restore
+		}
+		return fmt.Errorf("publish cache: %w", err)
+	}
+
+	if renamedAside {
+		_ = os.RemoveAll(old)
+	}
 	return nil
 }
 
@@ -1304,15 +1427,11 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING=false")
 	cmd.Env = append(cmd.Env, "ANSIBLE_RETRY_FILES_ENABLED=false")
 
-	// Use cached collections directory to avoid re-downloading
-	// This includes both the cache and the playbook's local collections
-	collectionsPath := "/home/iac/galaxy-cache/collections:" + filepath.Join(workDir, "collections")
-	cmd.Env = append(cmd.Env, fmt.Sprintf("ANSIBLE_COLLECTIONS_PATH=%s", collectionsPath))
-	// Also set roles path to include cache
-	rolesPath := "/home/iac/galaxy-cache/roles:" + filepath.Join(workDir, "roles")
-	cmd.Env = append(cmd.Env, fmt.Sprintf("ANSIBLE_ROLES_PATH=%s", rolesPath))
+	// ANSIBLE_HOME, ANSIBLE_SSH_CONTROL_PATH_DIR and the collection/role paths are
+	// supplied via envVars (set in executeJob) so they reference the per-job
+	// workspace under the read-only root filesystem.
 
-	// Add credential environment variables
+	// Add credential and runtime environment variables
 	for k, v := range envVars {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
