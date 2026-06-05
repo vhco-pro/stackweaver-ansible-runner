@@ -53,6 +53,12 @@ type PlaybookSyncMessage struct {
 // InventorySyncMessage represents a request to sync a VCS inventory from repository
 type InventorySyncMessage struct {
 	InventoryID uuid.UUID `json:"inventory_id"`
+	// CloneURL is a pre-authenticated, token-embedded clone URL resolved by the API
+	// at enqueue time. When set, the runner clones with it directly and does not
+	// need its own VCS OAuth credentials. Empty falls back to resolving from the DB.
+	CloneURL string `json:"clone_url,omitempty"`
+	// Branch accompanies CloneURL on the pre-resolved path.
+	Branch string `json:"branch,omitempty"`
 }
 
 // InventorySourceSyncMessage represents a request to sync a dynamic inventory source
@@ -164,9 +170,15 @@ func main() {
 	if err != nil {
 		logger.Warnf("GitHub App manager not configured: %v", err)
 	}
+	if githubAppManager == nil || !githubAppManager.IsEnabled() {
+		logger.Warn("GitHub App VCS manager is DISABLED (GITHUB_APP_ID / GITHUB_APP_NAME / GITHUB_APP_PRIVATE_KEY[_PATH] not set on this runner); GitHub App clones cannot mint installation tokens and will fail")
+	}
 	azureDevOpsManager, err := vcs.NewAzureDevOpsManager()
 	if err != nil {
 		logger.Warnf("Azure DevOps manager not configured: %v", err)
+	}
+	if azureDevOpsManager == nil || !azureDevOpsManager.IsEnabled() {
+		logger.Warn("Azure DevOps VCS manager is DISABLED (AZURE_DEVOPS_CLIENT_ID / AZURE_DEVOPS_CLIENT_SECRET not set on this runner); Azure DevOps OAuth tokens cannot be refreshed, so clones will fail once the stored access token expires (~1h)")
 	}
 	vcsRegistry := vcs.NewProviderRegistry(githubAppManager, azureDevOpsManager, func(conn *models.VCSConnection) error {
 		return vcsConnectionRepo.Update(conn)
@@ -393,7 +405,7 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 		}
 
 		// Execute the sync
-		result, err := r.syncInventory(ctx, inventory)
+		result, err := r.syncInventory(ctx, inventory, inventoryMsg.CloneURL, inventoryMsg.Branch)
 
 		// Update sync status
 		now := time.Now()
@@ -486,7 +498,7 @@ func (r *AnsibleRunner) syncPlaybook(ctx context.Context, playbook *models.Ansib
 	return nil
 }
 
-func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.AnsibleInventory) (syncResult, error) {
+func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.AnsibleInventory, cloneURL, branch string) (syncResult, error) {
 	var res syncResult
 
 	// Check if inventory has a VCS connection
@@ -511,8 +523,16 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 		}
 	}()
 
-	// Clone the repository
-	repoDir, err := r.cloneVCSRepoGeneric(ctx, syncDir, inventory.VCSConnectionID, inventory.VCSRepository, inventory.VCSBranch)
+	// Clone the repository. Prefer the pre-authenticated clone URL resolved by the
+	// API (so this runner never needs the provider's OAuth credentials); fall back
+	// to resolving the URL from the DB connection when one wasn't supplied.
+	var repoDir string
+	var err error
+	if cloneURL != "" {
+		repoDir, err = r.cloneVCSRepoWithURL(ctx, syncDir, cloneURL, branch)
+	} else {
+		repoDir, err = r.cloneVCSRepoGeneric(ctx, syncDir, inventory.VCSConnectionID, inventory.VCSRepository, inventory.VCSBranch)
+	}
 	if err != nil {
 		return res, fmt.Errorf("failed to clone repository: %w", err)
 	}
@@ -901,11 +921,28 @@ func (r *AnsibleRunner) cloneVCSRepoGeneric(ctx context.Context, targetDir strin
 
 	token, err := provider.GetFreshToken(ctx, vcsConn)
 	if err != nil {
-		logger.Warnf("Failed to get fresh token for VCS connection %s: %v", vcsConn.ID, err)
+		return "", fmt.Errorf("failed to obtain access token for %s VCS connection %s: %w (ensure this runner has the provider's OAuth credentials so tokens can be refreshed)", vcsConn.Provider, vcsConn.ID, err)
+	}
+	// A token that is still expired after GetFreshToken means the provider could not
+	// refresh it (e.g. the runner's OAuth manager is disabled because its credentials
+	// were not injected). Fail loudly with an actionable message instead of cloning
+	// with a stale token and surfacing a generic "Authentication failed" git error.
+	if vcsConn.IsExpired() {
+		return "", fmt.Errorf("access token for %s VCS connection %s is expired and could not be refreshed; configure the %s OAuth credentials on this runner so it can refresh tokens", vcsConn.Provider, vcsConn.ID, vcsConn.Provider)
 	}
 
 	repoURL := provider.BuildCloneURL(vcsConn, token, repository)
 
+	return r.cloneVCSRepoWithURL(ctx, targetDir, repoURL, branch)
+}
+
+// cloneVCSRepoWithURL clones using a pre-built, token-embedded clone URL. This is
+// the path used when the API has already resolved a fresh URL for us, so no VCS
+// OAuth credentials or token refresh are needed on the runner.
+func (r *AnsibleRunner) cloneVCSRepoWithURL(ctx context.Context, targetDir, repoURL, branch string) (string, error) {
+	if repoURL == "" {
+		return "", fmt.Errorf("clone URL is required")
+	}
 	if branch == "" {
 		branch = "main"
 	}
@@ -916,7 +953,7 @@ func (r *AnsibleRunner) cloneVCSRepoGeneric(ctx context.Context, targetDir strin
 		return "", fmt.Errorf("failed to clone repository: %w", err)
 	}
 
-	logger.Infof("Successfully cloned repository: %s (branch: %s)", repository, branch)
+	logger.Infof("Successfully cloned repository (branch: %s)", branch)
 	return targetDir, nil
 }
 
