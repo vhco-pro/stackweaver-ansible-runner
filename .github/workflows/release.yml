@@ -32,7 +32,7 @@ jobs:
           printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.MONOREPO_READ_TOKEN }}\n" > .netrc
 
       - name: Build and push by digest
-        uses: michielvha/docker-release-action@3a8c2ce62d95d241e922fe23af4c0eadd181cb12 # v2 (vex)
+        uses: michielvha/docker-release-action@c499e52a1a05e5bdd8cf03ba19a423d4c7ec25e3 # v2
         with:
           matrix-mode: build
           version: ${{ github.ref_name }}
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Create multi-arch manifest
-        uses: michielvha/docker-release-action@3a8c2ce62d95d241e922fe23af4c0eadd181cb12 # v2 (vex)
+        uses: michielvha/docker-release-action@c499e52a1a05e5bdd8cf03ba19a423d4c7ec25e3 # v2
         with:
           matrix-mode: merge
           version: ${{ github.ref_name }}
