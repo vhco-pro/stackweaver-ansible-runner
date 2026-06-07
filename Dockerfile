@@ -52,9 +52,9 @@ RUN ansible-galaxy collection install -r requirements.yml
 # Copy the Go binary from the builder stage
 COPY --from=builder /app/ansible-runner /usr/local/bin/ansible-runner
 
-# Copy the OIDC-aware ansible-inventory wrapper
-COPY backend/scripts/oidc-ansible-inventory /usr/local/bin/oidc-ansible-inventory
-RUN chmod +x /usr/local/bin/oidc-ansible-inventory
+# Note: the former oidc-ansible-inventory wrapper is retired — azure.azcollection >= 3.17.0 reads
+# AZURE_FEDERATED_TOKEN_FILE natively, so inventory sync runs plain ansible-inventory for every
+# auth mode. The script is kept as a historical artifact under backend/scripts/archive/.
 
 # Create non-root user with UID 1001 to match terraform runner (shared volume)
 RUN useradd -m -u 1001 iac

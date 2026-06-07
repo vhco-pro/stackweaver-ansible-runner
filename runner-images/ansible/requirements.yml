@@ -3,7 +3,10 @@ collections:
   - name: amazon.aws
     version: ">=9.0.0"
   - name: azure.azcollection
-    version: ">=3.0.0"
+    # >=3.17.0 required: that release added native OIDC / workload-identity federation to the
+    # azure_rm inventory plugin (oidc_token_file_path / AZURE_FEDERATED_TOKEN_FILE), which replaced
+    # the hand-rolled oidc-ansible-inventory wrapper (now archived). Do not lower this pin.
+    version: ">=3.17.0"
   - name: google.cloud
     version: ">=1.4.0"
   - name: community.vmware
