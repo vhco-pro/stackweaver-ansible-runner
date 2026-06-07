@@ -543,11 +543,11 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 		return res, fmt.Errorf("inventory file not found at path: %s", inventory.InventoryPath)
 	}
 
-	// Run ansible-inventory --list to parse the inventory file
-	// Determine the ansible-inventory command.
-	// For VCS inventories with Azure OIDC configured, use the OIDC-aware wrapper that
-	// monkey-patches the Azure RM collection to use azure-identity's WorkloadIdentityCredential.
-	cmdName := "ansible-inventory"
+	// Run ansible-inventory --list to parse the inventory file. VCS-backed inventories are pure
+	// passthrough: StackWeaver does not inject any Azure auth. The repo file's own auth_source
+	// (msi/auto/env/cli) plus the pod runtime — IMDS for Managed Identity, the AKS workload-identity
+	// webhook's projected token for Workload Identity (read natively by azure.azcollection >= 3.17.0)
+	// — decide how the azure_rm plugin authenticates. We never rewrite the user's azure_rm.yml.
 	cmdArgs := []string{"-i", inventoryFilePath, "--list"}
 	cmdEnv := os.Environ()
 	// Isolate Ansible's home under the per-sync workspace so ansible-inventory
@@ -555,50 +555,7 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	// on import).
 	cmdEnv = append(cmdEnv, "ANSIBLE_HOME="+filepath.Join(syncDir, ".ansible"))
 
-	if r.azureOIDCRepo != nil && r.oidcTokenService != nil {
-		configs, oidcErr := r.azureOIDCRepo.GetByOrganization(inventory.OrganizationID)
-		if oidcErr != nil {
-			logger.Warnf("Failed to look up Azure OIDC config for inventory sync (org %s): %v", inventory.OrganizationID, oidcErr)
-		} else if len(configs) > 0 {
-			oidcConfig := configs[0]
-			orgName := inventory.Organization.Name
-			projectName := "default"
-			if inventory.Project != nil {
-				projectName = inventory.Project.Name
-			}
-			token, tokenErr := r.oidcTokenService.GenerateWorkloadToken(oidc.WorkloadTokenRequest{
-				Audience:         "api://AzureADTokenExchange",
-				OrganizationName: orgName,
-				ProjectName:      projectName,
-				ResourceType:     oidc.ResourceTypeInventory,
-				ResourceName:     inventory.Name,
-				ActionKind:       oidc.ActionSync,
-				ActionID:         inventory.ID.String(),
-			})
-			if tokenErr != nil {
-				logger.Warnf("Failed to generate OIDC token for inventory sync (inventory %s): %v", inventory.ID, tokenErr)
-			} else {
-				// Write the signed JWT to a temp file for WorkloadIdentityCredential
-				tokenFile := filepath.Join(syncDir, "oidc-token.jwt")
-				if writeErr := os.WriteFile(tokenFile, []byte(token), 0o600); writeErr != nil {
-					logger.Warnf("Failed to write OIDC token file for inventory sync (inventory %s): %v", inventory.ID, writeErr)
-				} else {
-					cmdEnv = append(cmdEnv,
-						"AZURE_CLIENT_ID="+oidcConfig.ClientID,
-						"AZURE_TENANT_ID="+oidcConfig.TenantID,
-						"AZURE_SUBSCRIPTION_ID="+oidcConfig.SubscriptionID,
-						"AZURE_FEDERATED_TOKEN_FILE="+tokenFile,
-					)
-					// Use the OIDC-aware wrapper instead of ansible-inventory
-					cmdName = "python3"
-					cmdArgs = append([]string{"/usr/local/bin/oidc-ansible-inventory"}, cmdArgs...)
-					logger.Infof("Using OIDC workload identity wrapper for inventory sync (inventory %s, org %s)", inventory.ID, inventory.OrganizationID)
-				}
-			}
-		}
-	}
-
-	cmd := exec.CommandContext(ctx, cmdName, cmdArgs...) //nolint:gosec // intentional: executing ansible command
+	cmd := exec.CommandContext(ctx, "ansible-inventory", cmdArgs...) //nolint:gosec // intentional: executing ansible command
 	cmd.Env = cmdEnv
 
 	var stdout, stderr bytes.Buffer
