@@ -67,6 +67,21 @@ func upsertEnv(env []string, key, val string) []string {
 	return append(env, prefix+val)
 }
 
+// lookupOrgAzureSubscriptionID returns the subscription_id from the organization's
+// AzureOIDCConfiguration (the same row the runner uses for OIDC token generation), or "" if there
+// is no config / repo. Used as the subscription fallback for Azure Workload Identity when the
+// inventory file omits subscription_id.
+func (r *AnsibleRunner) lookupOrgAzureSubscriptionID(orgID uuid.UUID) string {
+	if r.azureOIDCRepo == nil {
+		return ""
+	}
+	configs, err := r.azureOIDCRepo.GetByOrganization(orgID)
+	if err != nil || len(configs) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(configs[0].SubscriptionID)
+}
+
 // AnsibleJobMessage represents the message received from the job queue
 type AnsibleJobMessage struct {
 	JobID       uuid.UUID `json:"job_id"`
@@ -599,11 +614,17 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	cmdEnv = append(cmdEnv, "ANSIBLE_HOME="+filepath.Join(syncDir, ".ansible"))
 
 	// Azure Workload Identity needs the subscription in AZURE_SUBSCRIPTION_ID (the azure_rm OIDC
-	// path doesn't read the inventory file's subscription_id there). For a VCS inventory the repo
-	// file is the source of truth, so export its subscription_id — this also gives per-inventory,
-	// multi-subscription support for free. If the file omits it, the inherited env (e.g.
-	// AZURE_SUBSCRIPTION_ID set on the runner pod via ansibleRunner.env) is the fallback.
-	if sub := parseAzureSubscriptionID(inventoryFilePath); sub != "" {
+	// path doesn't read the inventory file's subscription_id there). Resolution order:
+	//   1. subscription_id in the cloned azure_rm.yml (explicit per-inventory override → multi-sub),
+	//   2. the org's AzureOIDCConfiguration.SubscriptionID (already stored; same row used for OIDC),
+	//   3. the inherited env (e.g. AZURE_SUBSCRIPTION_ID set on the runner pod via ansibleRunner.env).
+	// Tags-only inventory files (no subscription_id) are the common case, so (2) is what makes
+	// Workload Identity work for an org without any per-inventory or per-deployment config.
+	sub := parseAzureSubscriptionID(inventoryFilePath)
+	if sub == "" {
+		sub = r.lookupOrgAzureSubscriptionID(inventory.OrganizationID)
+	}
+	if sub != "" {
 		cmdEnv = upsertEnv(cmdEnv, "AZURE_SUBSCRIPTION_ID", sub)
 	}
 
