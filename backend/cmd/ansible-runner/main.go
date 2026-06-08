@@ -35,7 +35,37 @@ import (
 	"github.com/michielvha/stackweaver/core/services/vcs"
 	"github.com/michielvha/stackweaver/core/storage"
 	vcsGitHub "github.com/michielvha/stackweaver/core/vcs/github"
+	"gopkg.in/yaml.v3"
 )
+
+// parseAzureSubscriptionID extracts the top-level subscription_id from a cloned azure_rm.yml
+// inventory file. Returns "" if the file can't be read/parsed or the key is absent.
+func parseAzureSubscriptionID(path string) string {
+	data, err := os.ReadFile(path) //nolint:gosec // path is a runner-controlled per-sync workspace file
+	if err != nil {
+		return ""
+	}
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return ""
+	}
+	if v, ok := doc["subscription_id"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// upsertEnv sets key=val in a KEY=VALUE env slice, replacing any existing entry for key.
+func upsertEnv(env []string, key, val string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + val
+			return env
+		}
+	}
+	return append(env, prefix+val)
+}
 
 // AnsibleJobMessage represents the message received from the job queue
 type AnsibleJobMessage struct {
@@ -92,6 +122,19 @@ func main() {
 	// Initialize logger first (reads LOG_LEVEL from environment)
 	logLevel := os.Getenv("LOG_LEVEL")
 	logger.Init(logLevel)
+
+	// AKS Workload Identity bridge: the workload-identity webhook injects AZURE_TENANT_ID, but the
+	// azure.azcollection azure_rm plugin reads tenant from AZURE_TENANT. Alias it once at startup so
+	// every Azure inventory sync (VCS passthrough and dynamic) gets the tenant for free — a pure
+	// rename of a webhook-injected var, no file parsing and no StackWeaver config. Subscription is
+	// not bridgeable here (the webhook never provides it): dynamic sources inject it from their
+	// config; VCS deployments set AZURE_SUBSCRIPTION_ID via the runner pod env (ansibleRunner.env).
+	if os.Getenv("AZURE_TENANT") == "" {
+		if tid := os.Getenv("AZURE_TENANT_ID"); tid != "" {
+			_ = os.Setenv("AZURE_TENANT", tid)
+			logger.Info("Bridged AZURE_TENANT_ID -> AZURE_TENANT for Azure Workload Identity")
+		}
+	}
 
 	// Check for agent mode - if set, run as self-hosted runner polling the API
 	if os.Getenv("RUNNER_MODE") == "agent" {
@@ -554,6 +597,15 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	// works under a read-only root filesystem (it eagerly creates ~/.ansible/tmp
 	// on import).
 	cmdEnv = append(cmdEnv, "ANSIBLE_HOME="+filepath.Join(syncDir, ".ansible"))
+
+	// Azure Workload Identity needs the subscription in AZURE_SUBSCRIPTION_ID (the azure_rm OIDC
+	// path doesn't read the inventory file's subscription_id there). For a VCS inventory the repo
+	// file is the source of truth, so export its subscription_id — this also gives per-inventory,
+	// multi-subscription support for free. If the file omits it, the inherited env (e.g.
+	// AZURE_SUBSCRIPTION_ID set on the runner pod via ansibleRunner.env) is the fallback.
+	if sub := parseAzureSubscriptionID(inventoryFilePath); sub != "" {
+		cmdEnv = upsertEnv(cmdEnv, "AZURE_SUBSCRIPTION_ID", sub)
+	}
 
 	cmd := exec.CommandContext(ctx, "ansible-inventory", cmdArgs...) //nolint:gosec // intentional: executing ansible command
 	cmd.Env = cmdEnv
