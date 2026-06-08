@@ -5,7 +5,11 @@ requires-python = ">=3.12"
 description = "Python dependencies for the Stackweaver Ansible runner image"
 
 dependencies = [
-    "ansible>=11.0,<14",
+    # Floor at 13.7 (bundles azure.azcollection 3.18.0, which has native Azure OIDC /
+    # workload-identity support) and NO upper cap, so Renovate tracks the latest ansible.
+    # The bundled collection is what loads at runtime; the galaxy install in requirements.yml
+    # does not reliably override it, so the ansible package version is the real lever.
+    "ansible>=13.7",
     "ansible-lint>=25.0",
     "jmespath>=1.0",
     "netaddr>=1.0",
