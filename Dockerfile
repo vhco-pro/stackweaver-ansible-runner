@@ -26,6 +26,18 @@ WORKDIR /opt/ansible-deps
 COPY runner-images/ansible/pyproject.toml runner-images/ansible/uv.lock ./
 RUN uv sync --frozen --group all --no-dev --no-install-project
 
+# Install azure.azcollection's full Python SDK dependency set. The azure_rm
+# inventory plugin and modules import dozens of azure-mgmt-* / msgraph clients at
+# load time; without them the native AZURE_FEDERATED_TOKEN_FILE (workload identity)
+# auth path fails to import (ClientAssertionCredential never defined), so dynamic
+# inventory sync falls back and fails with "Failed to get credentials". Sourced
+# from the collection's own requirements.txt (bundled with the ansible package) so
+# the pins always match the installed collection version and supersede the
+# narrower hand-picked azure-mgmt pins above.
+RUN req="$(find .venv -path '*azure/azcollection/requirements.txt' | head -1)" && \
+    test -n "$req" && \
+    uv pip install --python /opt/ansible-deps/.venv/bin/python -r "$req"
+
 # ── Runtime stage ────────────────────────────────────────────────────
 FROM python:3.14-slim@sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fad06a2fb068e97
 
