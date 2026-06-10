@@ -872,6 +872,28 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob) 
 	// path limit; the per-job ANSIBLE_HOME path is far too long for it.
 	envVars["ANSIBLE_SSH_CONTROL_PATH_DIR"] = "/tmp/.ansible-cp"
 
+	// ssh writes ~/.ssh (known_hosts) under $HOME. The container runs with a
+	// read-only root filesystem, so the default HOME (/home/iac) is not writable
+	// and ssh fails with "Could not create directory '/home/iac/.ssh'
+	// (Read-only file system)". Point HOME at a writable per-job dir under /tmp.
+	// cmd.Env appends these after os.Environ(), and os/exec uses the last value
+	// for a duplicate key, so this overrides the inherited HOME.
+	sshHome := filepath.Join("/tmp", "ansible-home", job.ID.String())
+	if err := os.MkdirAll(sshHome, 0o700); err != nil {
+		return fmt.Errorf("failed to create ssh home directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(sshHome); err != nil {
+			logger.Warnf("Failed to remove ssh home directory %s: %v", sshHome, err)
+		}
+	}()
+	envVars["HOME"] = sshHome
+	// Stop ssh from reading/writing the user known_hosts file (it lives under the
+	// read-only $HOME and is meaningless for ephemeral job hosts), and keep
+	// connections multiplexed. ANSIBLE_HOST_KEY_CHECKING=false disables strict
+	// checking; these args stop ssh from touching ~/.ssh at all.
+	envVars["ANSIBLE_SSH_ARGS"] = "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=60s"
+
 	// Point collection/role lookups at this job's installed Galaxy cache plus the
 	// playbook-local directories.
 	playbookCollections := filepath.Join(workDir, "collections")
@@ -1265,7 +1287,12 @@ func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, j
 		// Write SSH private key to file
 		if cred.SSHPrivateKey != "" {
 			sshKeyFile = filepath.Join(jobDir, "ssh_key")
-			if err := os.WriteFile(sshKeyFile, []byte(cred.SSHPrivateKey), 0o600); err != nil {
+			// Normalize at write-time too (not only at store-time) so credentials
+			// saved before normalization existed are repaired without re-entry.
+			// An un-normalized key (CRLF, missing trailing newline, stray
+			// whitespace) fails to load with "error in libcrypto".
+			key := ansible.NormalizePrivateKey(cred.SSHPrivateKey)
+			if err := os.WriteFile(sshKeyFile, []byte(key), 0o600); err != nil {
 				return nil, "", fmt.Errorf("failed to write SSH key: %w", err)
 			}
 		}
