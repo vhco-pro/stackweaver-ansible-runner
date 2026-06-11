@@ -780,7 +780,7 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	}
 
 	// Process the inventory output and update hosts/groups in database
-	hostsDiscovered, err := r.processInventoryOutput(ctx, inventory.ID, inventoryOutput)
+	hostsDiscovered, err := ansible.ProcessInventoryOutput(r.inventoryRepo, inventory.ID, inventoryOutput)
 	if err != nil {
 		return res, fmt.Errorf("failed to process inventory output: %w", err)
 	}
@@ -796,118 +796,6 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 		inventory.Name, inventory.VCSRepository, inventory.VCSBranch, inventory.InventoryPath, commitHash, hostsDiscovered)
 
 	return res, nil
-}
-
-// processInventoryOutput processes the ansible-inventory JSON output and updates the inventory
-// This is similar to InventorySourceService.processInventoryOutput but works directly with the inventory repo
-func (r *AnsibleRunner) processInventoryOutput(ctx context.Context, inventoryID uuid.UUID, output map[string]interface{}) (int, error) {
-	hostsDiscovered := 0
-
-	// Get _meta.hostvars for host variables
-	hostvars := make(map[string]map[string]interface{})
-	if meta, ok := output["_meta"].(map[string]interface{}); ok {
-		if hv, ok := meta["hostvars"].(map[string]interface{}); ok {
-			for host, vars := range hv {
-				if varsMap, ok := vars.(map[string]interface{}); ok {
-					hostvars[host] = varsMap
-				}
-			}
-		}
-	}
-
-	// Process each group
-	processedHosts := make(map[string]bool)
-	for groupName, groupData := range output {
-		if groupName == "_meta" {
-			continue
-		}
-
-		groupMap, ok := groupData.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		// Get hosts in this group
-		hosts, ok := groupMap["hosts"].([]interface{})
-		if !ok {
-			continue
-		}
-
-		// Find or create the group
-		var group *models.AnsibleInventoryGroup
-		existingGroup, _ := r.inventoryRepo.GetGroupByInventoryAndName(inventoryID, groupName)
-		if existingGroup != nil {
-			group = existingGroup
-		} else {
-			group = &models.AnsibleInventoryGroup{
-				InventoryID: inventoryID,
-				Name:        groupName,
-			}
-			if err := r.inventoryRepo.CreateGroup(group); err != nil {
-				logger.Warnf("Failed to create group %s: %v", groupName, err)
-				continue
-			}
-		}
-
-		// Process hosts
-		for _, hostInterface := range hosts {
-			hostName, ok := hostInterface.(string)
-			if !ok {
-				continue
-			}
-
-			if processedHosts[hostName] {
-				continue
-			}
-			processedHosts[hostName] = true
-			hostsDiscovered++
-
-			// Get host variables
-			vars := hostvars[hostName]
-			if vars == nil {
-				vars = make(map[string]interface{})
-			}
-
-			// Determine hostname
-			hostname := hostName
-			if ansibleHost, ok := vars["ansible_host"].(string); ok && ansibleHost != "" {
-				hostname = ansibleHost
-			}
-
-			// Find or create the host
-			existingHost, _ := r.inventoryRepo.GetHostByInventoryAndName(inventoryID, hostName)
-			var host *models.AnsibleInventoryHost
-			if existingHost != nil {
-				// Update existing host
-				existingHost.Hostname = hostname
-				existingHost.Variables = vars
-				if err := r.inventoryRepo.UpdateHost(existingHost); err != nil {
-					logger.Warnf("Failed to update host %s: %v", hostName, err)
-					continue
-				}
-				host = existingHost
-			} else {
-				host = &models.AnsibleInventoryHost{
-					InventoryID: inventoryID,
-					Name:        hostName,
-					Hostname:    hostname,
-					Variables:   vars,
-					Enabled:     true,
-				}
-				if err := r.inventoryRepo.CreateHost(host); err != nil {
-					logger.Warnf("Failed to create host %s: %v", hostName, err)
-					continue
-				}
-			}
-
-			// Associate host with group
-			if err := r.inventoryRepo.AddHostToGroup(host.ID, group.ID); err != nil {
-				logger.Warnf("Failed to add host %s to group %s: %v", host.ID, group.ID, err)
-			}
-		}
-	}
-
-	return hostsDiscovered, nil
 }
 
 func (r *AnsibleRunner) getLatestCommit(ctx context.Context, repoDir string) (string, error) {
