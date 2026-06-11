@@ -88,11 +88,24 @@ type AnsibleJobMessage struct {
 	PlaybookID  uuid.UUID `json:"playbook_id"`
 	InventoryID uuid.UUID `json:"inventory_id"`
 	JobType     string    `json:"job_type"`
+	// CloneURL is a pre-authenticated, token-embedded clone URL for the playbook
+	// repo, resolved by the API at enqueue time. When set, the runner clones the
+	// playbook with it directly and needs no VCS OAuth credentials. Empty falls
+	// back to resolving from the DB.
+	CloneURL string `json:"clone_url,omitempty"`
+	// Branch accompanies CloneURL on the pre-resolved path.
+	Branch string `json:"branch,omitempty"`
 }
 
 // PlaybookSyncMessage represents a request to sync a playbook from VCS
 type PlaybookSyncMessage struct {
 	PlaybookID uuid.UUID `json:"playbook_id"`
+	// CloneURL is a pre-authenticated, token-embedded clone URL resolved by the API
+	// at enqueue time. When set, the runner clones with it directly and needs no
+	// VCS OAuth credentials. Empty falls back to resolving from the DB.
+	CloneURL string `json:"clone_url,omitempty"`
+	// Branch accompanies CloneURL on the pre-resolved path.
+	Branch string `json:"branch,omitempty"`
 }
 
 // InventorySyncMessage represents a request to sync a VCS inventory from repository
@@ -385,8 +398,9 @@ func (r *AnsibleRunner) processJob(ctx context.Context) error {
 		return fmt.Errorf("failed to update job status: %w", err)
 	}
 
-	// Execute the job
-	err = r.executeJob(ctx, job)
+	// Execute the job. The pre-resolved clone URL (if any) is threaded through so
+	// the playbook clone needs no VCS OAuth credentials on this runner.
+	err = r.executeJob(ctx, job, msg.CloneURL, msg.Branch)
 
 	// Update job completion status
 	completedAt := time.Now()
@@ -428,7 +442,7 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 		}
 
 		// Execute the sync
-		err = r.syncPlaybook(ctx, playbook)
+		err = r.syncPlaybook(ctx, playbook, playbookMsg.CloneURL, playbookMsg.Branch)
 
 		// Update sync status
 		now := time.Now()
@@ -510,49 +524,162 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 	return fmt.Errorf("failed to unmarshal sync message: invalid message type")
 }
 
-func (r *AnsibleRunner) syncPlaybook(ctx context.Context, playbook *models.AnsiblePlaybook) error {
-	// Check if playbook has a VCS connection
+// snapshotStorageKey is the object-storage key for a playbook's cached snapshot.
+// Latest only — overwritten on each sync (no history).
+func snapshotStorageKey(playbookID uuid.UUID) string {
+	return fmt.Sprintf("playbooks/%s/snapshot.tar.gz", playbookID.String())
+}
+
+// captureAndStoreSnapshot clones the playbook repo (preferring the API-resolved
+// cloneURL so this runner needs no VCS OAuth credentials), validates the playbook
+// file exists, builds a dependency-scoped snapshot tarball, and uploads it to
+// object storage. It returns the snapshot bytes and resolved commit. It does NOT
+// persist the playbook row — callers set the Cached* metadata via
+// recordSnapshotMetadata and persist as appropriate.
+func (r *AnsibleRunner) captureAndStoreSnapshot(ctx context.Context, playbook *models.AnsiblePlaybook, cloneURL, branch string) ([]byte, string, error) {
 	if playbook.VCSConnectionID == nil {
-		return fmt.Errorf("playbook has no VCS connection configured")
+		return nil, "", fmt.Errorf("playbook has no VCS connection configured")
 	}
 	if playbook.VCSRepository == "" {
-		return fmt.Errorf("playbook has no VCS repository configured")
+		return nil, "", fmt.Errorf("playbook has no VCS repository configured")
 	}
 
-	// Create a temporary directory for the sync
-	syncDir := filepath.Join(r.config.WorkspacesDir, "ansible-sync", playbook.ID.String())
-	if err := os.MkdirAll(syncDir, 0o750); err != nil {
-		return fmt.Errorf("failed to create sync directory: %w", err)
+	// Use a unique working directory per capture. A sync-worker sync and a job's
+	// inline cache-miss auto-sync can run concurrently for the same playbook (the
+	// create-then-launch flow triggers exactly this), and a shared
+	// ansible-snapshot/<id> path makes them collide: git clone refuses a non-empty
+	// destination, and one capture's deferred cleanup yanks the other's clone.
+	snapshotBase := filepath.Join(r.config.WorkspacesDir, "ansible-snapshot")
+	if err := os.MkdirAll(snapshotBase, 0o750); err != nil {
+		return nil, "", fmt.Errorf("failed to create snapshot base dir: %w", err)
+	}
+	syncDir, err := os.MkdirTemp(snapshotBase, playbook.ID.String()+"-")
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create snapshot dir: %w", err)
 	}
 	defer func() {
 		if err := os.RemoveAll(syncDir); err != nil {
-			logger.Warnf("Failed to remove sync directory %s: %v", syncDir, err)
+			logger.Warnf("Failed to remove snapshot dir %s: %v", syncDir, err)
 		}
 	}()
 
-	// Clone the repository
-	repoDir, err := r.cloneVCSRepo(ctx, syncDir, playbook)
+	// Clone into a fresh subdir of the unique working dir (git clone wants a
+	// non-existent or empty destination). Prefer the pre-authenticated URL; fall
+	// back to the DB connection.
+	cloneTarget := filepath.Join(syncDir, "repo")
+	var repoDir string
+	if cloneURL != "" {
+		if branch == "" {
+			branch = playbook.VCSBranch
+		}
+		repoDir, err = r.cloneVCSRepoWithURL(ctx, cloneTarget, cloneURL, branch)
+	} else {
+		repoDir, err = r.cloneVCSRepo(ctx, cloneTarget, playbook)
+	}
 	if err != nil {
-		return fmt.Errorf("failed to clone repository: %w", err)
+		return nil, "", fmt.Errorf("failed to clone repository: %w", err)
 	}
 
-	// Verify playbook file exists (strip leading / for ADO paths)
-	playbookPath := filepath.Join(repoDir, strings.TrimPrefix(playbook.PlaybookPath, "/"))
-	if _, err := os.Stat(playbookPath); os.IsNotExist(err) {
-		return fmt.Errorf("playbook file not found at path: %s", playbook.PlaybookPath)
+	// Verify the playbook file exists (strip leading / for ADO paths).
+	if _, statErr := os.Stat(filepath.Join(repoDir, strings.TrimPrefix(playbook.PlaybookPath, "/"))); os.IsNotExist(statErr) {
+		return nil, "", fmt.Errorf("playbook file not found at path: %s", playbook.PlaybookPath)
 	}
 
-	// Get the latest commit hash
 	commitHash, err := r.getLatestCommit(ctx, repoDir)
 	if err != nil {
-		logger.Warnf("Could not get commit hash: %v", err)
-	} else {
-		playbook.LastSyncCommit = commitHash
+		logger.Warnf("Playbook %s: could not get commit hash: %v", playbook.ID, err)
+		commitHash = ""
 	}
 
-	logger.Infof("Successfully synced playbook %s from %s (branch: %s, commit: %s)",
-		playbook.Name, playbook.VCSRepository, playbook.VCSBranch, commitHash)
+	data, wholeRepo, err := buildPlaybookSnapshot(repoDir, playbook.PlaybookPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to build playbook snapshot: %w", err)
+	}
+	if wholeRepo {
+		logger.Infof("Playbook %s: snapshot used whole-repo fallback (could not statically scope dependencies)", playbook.ID)
+	}
 
+	if err := r.storageClient.Put(ctx, snapshotStorageKey(playbook.ID), data); err != nil {
+		return nil, "", fmt.Errorf("failed to store playbook snapshot: %w", err)
+	}
+
+	logger.Infof("Captured playbook %s snapshot from %s (branch: %s, commit: %s, %d bytes)",
+		playbook.Name, playbook.VCSRepository, playbook.VCSBranch, commitHash, len(data))
+	return data, commitHash, nil
+}
+
+// recordSnapshotMetadata stamps the playbook's cached-snapshot + sync metadata. When
+// persist is true it also writes the row (used by the inline auto-sync path); the
+// sync-worker path passes false because its caller persists.
+func (r *AnsibleRunner) recordSnapshotMetadata(playbook *models.AnsiblePlaybook, commit string, size int, persist bool) {
+	now := time.Now()
+	if commit != "" {
+		playbook.LastSyncCommit = commit
+		playbook.CachedCommit = commit
+	}
+	playbook.CachedAt = &now
+	playbook.CachedSizeBytes = int64(size)
+	playbook.LastSyncAt = &now
+	playbook.LastSyncStatus = "successful"
+	playbook.LastSyncError = ""
+	if persist {
+		if err := r.playbookRepo.Update(playbook); err != nil {
+			logger.Warnf("Failed to persist playbook %s snapshot metadata: %v", playbook.ID, err)
+		}
+	}
+}
+
+// recordSourceModeEvent emits a job-log event describing which playbook source the
+// run used. For cached runs it states the snapshot commit and capture time so an
+// operator can see at a glance that the job ran captured-at-sync-time code, not the
+// remote's current HEAD. It is a no-op for fresh runs and non-VCS playbooks, whose
+// output always reflects what was just fetched. The event carries counter 0 so it
+// sorts to the top of the combined job output.
+func (r *AnsibleRunner) recordSourceModeEvent(playbook *models.AnsiblePlaybook, job *models.AnsibleJob) {
+	// Mirror preparePlaybook's mode resolution: only VCS-backed playbooks have a
+	// source mode, and an empty or "cached" mode runs from the snapshot.
+	if playbook.VCSConnectionID == nil || playbook.VCSRepository == "" {
+		return
+	}
+	if playbook.SourceMode == models.PlaybookSourceModeFresh {
+		return
+	}
+
+	commit := playbook.CachedCommit
+	if commit == "" {
+		commit = "unknown"
+	} else if len(commit) > 7 {
+		commit = commit[:7]
+	}
+	capturedAt := "an earlier sync"
+	if playbook.CachedAt != nil {
+		capturedAt = playbook.CachedAt.UTC().Format("2006-01-02 15:04 MST")
+	}
+
+	stdout := fmt.Sprintf(
+		"Source: cached snapshot — running commit %s captured %s, not the remote's current HEAD. "+
+			"To run the latest commit, set the playbook source mode to \"fresh\" or trigger a sync.\n",
+		commit, capturedAt,
+	)
+	event := &models.AnsibleJobEvent{
+		JobID:   job.ID,
+		Event:   "playbook_source",
+		Counter: 0,
+		Task:    "Playbook source",
+		Stdout:  stdout,
+	}
+	if err := r.jobRepo.CreateEvent(event); err != nil {
+		logger.Warnf("Failed to create playbook-source event for job %s: %v", job.ID, err)
+	}
+}
+
+func (r *AnsibleRunner) syncPlaybook(ctx context.Context, playbook *models.AnsiblePlaybook, cloneURL, branch string) error {
+	data, commit, err := r.captureAndStoreSnapshot(ctx, playbook, cloneURL, branch)
+	if err != nil {
+		return err
+	}
+	// Stamp metadata on the struct; the sync-worker caller (processSyncJob) persists.
+	r.recordSnapshotMetadata(playbook, commit, len(data), false)
 	return nil
 }
 
@@ -793,7 +920,7 @@ func (r *AnsibleRunner) getLatestCommit(ctx context.Context, repoDir string) (st
 	return strings.TrimSpace(string(output)), nil
 }
 
-func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob) error {
+func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, playbookCloneURL, playbookBranch string) error {
 	// Create job workspace directory
 	jobDir := filepath.Join(r.config.WorkspacesDir, "ansible-jobs", job.ID.String())
 	if err := os.MkdirAll(jobDir, 0o755); err != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
@@ -815,10 +942,17 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob) 
 	}
 
 	// Prepare playbook files (sync from SCM or download from storage)
-	playbookDir, err := r.preparePlaybook(ctx, jobDir, playbook)
+	playbookDir, err := r.preparePlaybook(ctx, jobDir, playbook, playbookCloneURL, playbookBranch)
 	if err != nil {
 		return fmt.Errorf("failed to prepare playbook: %w", err)
 	}
+
+	// Surface in the job log when this run used a cached snapshot (a commit captured
+	// at sync time) rather than the remote's current HEAD, so an operator can tell at
+	// a glance they may be running stale code. preparePlaybook leaves the cached
+	// commit/time on the playbook (loaded from the DB on a cache hit, stamped inline
+	// on an auto-sync miss).
+	r.recordSourceModeEvent(playbook, job)
 
 	// Install Galaxy requirements if requirements.yml exists. Returns the
 	// per-job collections/roles directories this run should use.
@@ -920,16 +1054,50 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob) 
 	return r.runAnsiblePlaybook(ctx, job, workDir, args, envVars)
 }
 
-func (r *AnsibleRunner) preparePlaybook(ctx context.Context, jobDir string, playbook *models.AnsiblePlaybook) (string, error) {
+func (r *AnsibleRunner) preparePlaybook(ctx context.Context, jobDir string, playbook *models.AnsiblePlaybook, cloneURL, branch string) (string, error) {
 	playbookDir := filepath.Join(jobDir, "playbook")
 	if err := os.MkdirAll(playbookDir, 0o755); err != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
 		return "", err
 	}
 
-	// Check if playbook has a VCS connection (GitHub App integration)
+	// VCS-backed playbook: pick the source per the playbook's source mode.
 	if playbook.VCSConnectionID != nil && playbook.VCSRepository != "" {
-		// Use VCS connection to clone repository
-		return r.cloneVCSRepo(ctx, playbookDir, playbook)
+		mode := playbook.SourceMode
+		if mode == "" {
+			mode = models.PlaybookSourceModeCached
+		}
+
+		// fresh: clone from the remote at runtime (always latest HEAD). Prefer the
+		// API-resolved clone URL so this runner needs no VCS OAuth credentials.
+		if mode == models.PlaybookSourceModeFresh {
+			if cloneURL != "" {
+				if branch == "" {
+					branch = playbook.VCSBranch
+				}
+				return r.cloneVCSRepoWithURL(ctx, playbookDir, cloneURL, branch)
+			}
+			return r.cloneVCSRepo(ctx, playbookDir, playbook)
+		}
+
+		// cached: run the stored snapshot; on a cache miss, auto-sync inline (clone +
+		// capture + upload) then run from the freshly-built snapshot. After the first
+		// run the playbook no longer depends on the VCS being reachable at job time.
+		data, err := r.storageClient.Get(ctx, snapshotStorageKey(playbook.ID))
+		if err != nil {
+			logger.Infof("Playbook %s: no cached snapshot, auto-syncing inline before run", playbook.ID)
+			snap, commit, serr := r.captureAndStoreSnapshot(ctx, playbook, cloneURL, branch)
+			if serr != nil {
+				return "", fmt.Errorf("cached source mode: auto-sync failed: %w", serr)
+			}
+			r.recordSnapshotMetadata(playbook, commit, len(snap), true)
+			data = snap
+		} else {
+			logger.Infof("Playbook %s: running cached snapshot (commit %s)", playbook.ID, playbook.CachedCommit)
+		}
+		if err := extractTarGz(data, playbookDir); err != nil {
+			return "", fmt.Errorf("failed to extract cached playbook snapshot: %w", err)
+		}
+		return playbookDir, nil
 	}
 
 	// No VCS connection - check if playbook content is stored in storage
