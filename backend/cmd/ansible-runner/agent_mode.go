@@ -307,8 +307,19 @@ type JobArtifacts struct {
 	ExtraVars        map[string]interface{} `json:"extra_vars,omitempty"`
 	EnvironmentVars  map[string]string      `json:"environment_vars,omitempty"` // Cloud auth env vars (OIDC, etc.)
 	Credential       *CredentialData        `json:"credential,omitempty"`
-	JobConfig        *JobConfigData         `json:"job_config,omitempty"`
-	VCS              *VCSData               `json:"vcs,omitempty"`
+	// Vaults carries every attached vault credential (multi-vault support).
+	Vaults []VaultData `json:"vaults,omitempty"`
+	// GCPServiceAccount is a decrypted service-account JSON to write to a file
+	// and expose via GOOGLE_APPLICATION_CREDENTIALS.
+	GCPServiceAccount string         `json:"gcp_service_account,omitempty"`
+	JobConfig         *JobConfigData `json:"job_config,omitempty"`
+	VCS               *VCSData       `json:"vcs,omitempty"`
+}
+
+// VaultData is one decrypted vault password.
+type VaultData struct {
+	Password string `json:"password"` //nolint:gosec // G117: credential field, not a hardcoded secret
+	VaultID  string `json:"vault_id,omitempty"`
 }
 
 // VCSData contains VCS info for cloning the repository
@@ -325,17 +336,20 @@ type CredentialData struct {
 	Password   string `json:"password,omitempty"` //nolint:gosec // G117: credential field, not a hardcoded secret
 	SSHKey     string `json:"ssh_key,omitempty"`
 	VaultToken string `json:"vault_token,omitempty"`
+	// BecomePassword is injected as ansible_become_pass when the job escalates.
+	BecomePassword string `json:"become_password,omitempty"` //nolint:gosec // G117: credential field, not a hardcoded secret
 }
 
 // JobConfigData contains ansible execution config
 type JobConfigData struct {
-	Limit         string `json:"limit,omitempty"`
-	Tags          string `json:"tags,omitempty"`
-	SkipTags      string `json:"skip_tags,omitempty"`
-	Verbosity     int    `json:"verbosity"`
-	Forks         int    `json:"forks"`
-	BecomeEnabled bool   `json:"become_enabled"`
-	DiffMode      bool   `json:"diff_mode"`
+	Limit          string `json:"limit,omitempty"`
+	Tags           string `json:"tags,omitempty"`
+	SkipTags       string `json:"skip_tags,omitempty"`
+	Verbosity      int    `json:"verbosity"`
+	Forks          int    `json:"forks"`
+	BecomeEnabled  bool   `json:"become_enabled"`
+	DiffMode       bool   `json:"diff_mode"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"` // kills the run when exceeded (0 = none)
 }
 
 // executeJob executes a pending job
@@ -517,6 +531,19 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 		}
 	}
 
+	// Ad hoc jobs ship the generated transient playbook as content instead of
+	// a repository to clone; write it into the workspace (repoDir == workDir
+	// when no VCS artifact is present, so the path resolution below finds it).
+	if artifacts.PlaybookContent != "" {
+		contentName := artifacts.PlaybookPath
+		if contentName == "" {
+			contentName = "adhoc.yml"
+		}
+		if err := os.WriteFile(filepath.Join(workDir, contentName), []byte(artifacts.PlaybookContent), 0o600); err != nil {
+			return "failed", "Failed to write playbook content: " + err.Error()
+		}
+	}
+
 	// Build ansible-playbook command
 	args := []string{"-i", inventoryPath}
 
@@ -572,6 +599,35 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 		args = append(args, "-e", "@"+extraVarsPath)
 	}
 
+	// Vault credentials: one file per vault, labeled with --vault-id. A single
+	// unlabeled vault keeps the historical env-var behavior (set below).
+	var unlabeledVaultFile string
+	for i, vault := range artifacts.Vaults {
+		vaultFile := filepath.Join(workDir, fmt.Sprintf("vault_pass_%d", i))
+		if err := os.WriteFile(vaultFile, []byte(vault.Password), 0o600); err != nil {
+			return "failed", "Failed to write vault password file: " + err.Error()
+		}
+		if vault.VaultID != "" {
+			args = append(args, "--vault-id", vault.VaultID+"@"+vaultFile)
+		} else {
+			unlabeledVaultFile = vaultFile
+		}
+	}
+
+	// Become password: injected via a 0600 extra-vars file when escalating.
+	if artifacts.JobConfig != nil && artifacts.JobConfig.BecomeEnabled &&
+		artifacts.Credential != nil && artifacts.Credential.BecomePassword != "" {
+		becomeVars, merr := json.Marshal(map[string]string{"ansible_become_pass": artifacts.Credential.BecomePassword})
+		if merr == nil {
+			becomeFile := filepath.Join(workDir, "become_vars.json")
+			if werr := os.WriteFile(becomeFile, becomeVars, 0o600); werr == nil {
+				args = append(args, "-e", "@"+becomeFile)
+			} else {
+				logger.Warnf("Failed to write become password file: %v", werr)
+			}
+		}
+	}
+
 	// Add SSH key
 	if sshKeyPath != "" {
 		args = append(args, "--private-key", sshKeyPath)
@@ -590,8 +646,12 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 
 	logger.Infof("Running: ansible-playbook %v (workdir: %s)", args, ansibleWorkDir)
 
-	// Cancellable context: poll API for job cancellation and cancel to stop the playbook
+	// Cancellable context: poll API for job cancellation and cancel to stop the
+	// playbook. The template's job timeout (when set) becomes the deadline.
 	runCtx, cancelRun := context.WithCancel(context.Background())
+	if artifacts.JobConfig != nil && artifacts.JobConfig.TimeoutSeconds > 0 {
+		runCtx, cancelRun = context.WithTimeout(context.Background(), time.Duration(artifacts.JobConfig.TimeoutSeconds)*time.Second)
+	}
 	defer cancelRun()
 	go func() {
 		ticker := time.NewTicker(2 * time.Second)
@@ -630,6 +690,20 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	for k, v := range artifacts.EnvironmentVars {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
+	// A single unlabeled vault keeps the historical env-var behavior.
+	if unlabeledVaultFile != "" {
+		cmd.Env = append(cmd.Env, "ANSIBLE_VAULT_PASSWORD_FILE="+unlabeledVaultFile)
+	}
+	// GCP service-account credentials are file-based.
+	if artifacts.GCPServiceAccount != "" {
+		gcpFile := filepath.Join(workDir, "gcp_credentials.json")
+		if werr := os.WriteFile(gcpFile, []byte(artifacts.GCPServiceAccount), 0o600); werr == nil {
+			cmd.Env = append(cmd.Env, "GOOGLE_APPLICATION_CREDENTIALS="+gcpFile)
+			cmd.Env = append(cmd.Env, "GCP_AUTH_KIND=serviceaccount")
+		} else {
+			logger.Warnf("Failed to write GCP credentials file: %v", werr)
+		}
+	}
 	// Use JSONL callback for structured output (events as they happen)
 	// This enables host facts, task details, and stats parsing on the server
 	cmd.Env = append(cmd.Env, "ANSIBLE_STDOUT_CALLBACK=ansible.posix.jsonl")
@@ -645,6 +719,13 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	err := cmd.Run()
 	if runCtx.Err() == context.Canceled {
 		return "canceled", ""
+	}
+	if runCtx.Err() == context.DeadlineExceeded {
+		timeout := 0
+		if artifacts.JobConfig != nil {
+			timeout = artifacts.JobConfig.TimeoutSeconds
+		}
+		return "failed", fmt.Sprintf("job timeout exceeded (%ds): ansible-playbook was killed", timeout)
 	}
 	if err != nil {
 		exitErr, ok := err.(*exec.ExitError)
