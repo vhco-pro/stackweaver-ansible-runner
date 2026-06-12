@@ -82,6 +82,71 @@ func (r *AnsibleRunner) lookupOrgAzureSubscriptionID(orgID uuid.UUID) string {
 	return strings.TrimSpace(configs[0].SubscriptionID)
 }
 
+// injectAzureOIDCEnv adds the organization's Azure workload-identity environment
+// to a playbook run so tasks (e.g. azure.azcollection Key Vault lookups) can
+// authenticate via federated OIDC without a static credential. A job-attached
+// Azure credential wins: nothing is injected when AZURE_CLIENT_ID is already
+// set. Both the azure-identity SDK names (AZURE_TENANT_ID) and the
+// azure.azcollection names (AZURE_TENANT, AZURE_FEDERATED_TOKEN) are exported,
+// plus ARM_* for Terraform-style consumers — mirroring the self-hosted agent
+// artifact environment.
+func (r *AnsibleRunner) injectAzureOIDCEnv(job *models.AnsibleJob, jobDir string, envVars map[string]string) {
+	if envVars == nil || envVars["AZURE_CLIENT_ID"] != "" {
+		return
+	}
+	if r.azureOIDCRepo == nil || r.oidcTokenService == nil || r.projectRepo == nil || r.orgRepo == nil {
+		return
+	}
+	project, err := r.projectRepo.GetByID(job.ProjectID)
+	if err != nil {
+		return
+	}
+	configs, err := r.azureOIDCRepo.GetByOrganization(project.OrganizationID)
+	if err != nil || len(configs) == 0 {
+		return
+	}
+	cfg := configs[0]
+	org, err := r.orgRepo.GetByID(project.OrganizationID)
+	if err != nil {
+		return
+	}
+
+	token, err := r.oidcTokenService.GenerateWorkloadToken(oidc.WorkloadTokenRequest{
+		Audience:         "api://AzureADTokenExchange",
+		OrganizationName: org.Name,
+		ProjectName:      project.Name,
+		ResourceType:     oidc.ResourceTypeJob,
+		ResourceName:     job.Name,
+		ActionKind:       oidc.ActionRun,
+		ActionID:         job.ID.String(),
+	})
+	if err != nil {
+		logger.Warnf("Failed to generate Azure OIDC token for job %s: %v", job.ID, err)
+		return
+	}
+
+	tokenFile := filepath.Join(jobDir, "azure-oidc-token.jwt")
+	if err := os.WriteFile(tokenFile, []byte(token), 0o600); err != nil {
+		logger.Warnf("Failed to write Azure OIDC token file for job %s: %v", job.ID, err)
+		return
+	}
+
+	envVars["AZURE_CLIENT_ID"] = cfg.ClientID
+	envVars["AZURE_TENANT_ID"] = cfg.TenantID
+	envVars["AZURE_TENANT"] = cfg.TenantID
+	envVars["AZURE_FEDERATED_TOKEN"] = token
+	envVars["AZURE_FEDERATED_TOKEN_FILE"] = tokenFile
+	if sub := strings.TrimSpace(cfg.SubscriptionID); sub != "" {
+		envVars["AZURE_SUBSCRIPTION_ID"] = sub
+		envVars["ARM_SUBSCRIPTION_ID"] = sub
+	}
+	envVars["ARM_CLIENT_ID"] = cfg.ClientID
+	envVars["ARM_TENANT_ID"] = cfg.TenantID
+	envVars["ARM_OIDC_TOKEN"] = token
+	envVars["ARM_USE_OIDC"] = "true"
+	logger.Infof("Injected Azure OIDC workload identity env for job %s (org=%s)", job.ID, org.Name)
+}
+
 // AnsibleJobMessage represents the message received from the job queue
 type AnsibleJobMessage struct {
 	JobID       uuid.UUID `json:"job_id"`
@@ -111,6 +176,8 @@ type PlaybookSyncMessage struct {
 // InventorySyncMessage represents a request to sync a VCS inventory from repository
 type InventorySyncMessage struct {
 	InventoryID uuid.UUID `json:"inventory_id"`
+	// TriggeredBy records what started the sync; recorded in the sync history.
+	TriggeredBy string `json:"triggered_by,omitempty"`
 	// CloneURL is a pre-authenticated, token-embedded clone URL resolved by the API
 	// at enqueue time. When set, the runner clones with it directly and does not
 	// need its own VCS OAuth credentials. Empty falls back to resolving from the DB.
@@ -122,12 +189,16 @@ type InventorySyncMessage struct {
 // InventorySourceSyncMessage represents a request to sync a dynamic inventory source
 type InventorySourceSyncMessage struct {
 	SourceID uuid.UUID `json:"source_id"`
+	// TriggeredBy records what started the sync (manual | schedule | launch |
+	// workflow | webhook); recorded in the sync history. Empty = manual.
+	TriggeredBy string `json:"triggered_by,omitempty"`
 }
 
 // syncResult holds the outcome of an inventory sync operation
 type syncResult struct {
 	HostsDiscovered int    // Number of hosts found during sync
 	Stderr          string // Stderr output from ansible-inventory (warnings, debug info)
+	Commit          string // Resolved commit (VCS file syncs)
 }
 
 // Config holds the runner configuration
@@ -235,6 +306,9 @@ func main() {
 		logger.Fatalf("Failed to initialize crypto service: %v", cryptoErr)
 	}
 	inventorySourceService := ansible.NewInventorySourceService(inventorySourceRepo, inventoryRepo, credentialRepo, cryptoService)
+	// Record sync runs in the history table (Syncs tab)
+	inventorySyncRepo := repository.NewAnsibleInventorySyncRepository(db)
+	inventorySourceService.SetSyncRepo(inventorySyncRepo)
 
 	// Initialize VCS provider registry for multi-provider clone support
 	githubAppManager, err := vcs.NewGitHubAppManager()
@@ -280,6 +354,7 @@ func main() {
 		config:                 config,
 		queue:                  redisQueue,
 		jobRepo:                jobRepo,
+		templateRepo:           repository.NewAnsibleJobTemplateRepository(db),
 		playbookRepo:           playbookRepo,
 		inventoryRepo:          inventoryRepo,
 		vcsConnectionRepo:      vcsConnectionRepo,
@@ -292,6 +367,8 @@ func main() {
 		vcsRegistry:            vcsRegistry,
 		azureOIDCRepo:          azureOIDCRepo,
 		oidcTokenService:       oidcTokenService,
+		syncRepo:               inventorySyncRepo,
+		orgRepo:                orgRepo,
 	}
 
 	// Start worker
@@ -348,6 +425,7 @@ type AnsibleRunner struct {
 	config                 Config
 	queue                  *queue.RedisQueue
 	jobRepo                *repository.AnsibleJobRepository
+	templateRepo           *repository.AnsibleJobTemplateRepository
 	playbookRepo           *repository.AnsiblePlaybookRepository
 	inventoryRepo          *repository.AnsibleInventoryRepository
 	vcsConnectionRepo      *repository.VCSConnectionRepository
@@ -358,9 +436,11 @@ type AnsibleRunner struct {
 	inventorySourceService *ansible.InventorySourceService
 	storageClient          storage.Client
 	vcsRegistry            *vcs.ProviderRegistry
-	// OIDC workload identity for Azure dynamic inventory sync
+	// OIDC workload identity for Azure dynamic inventory sync and job runs
 	azureOIDCRepo    *repository.AzureOIDCConfigurationRepository
 	oidcTokenService *oidc.TokenService
+	orgRepo          *repository.OrganizationRepository
+	syncRepo         *repository.AnsibleInventorySyncRepository
 }
 
 func (r *AnsibleRunner) processJob(ctx context.Context) error {
@@ -422,6 +502,34 @@ func (r *AnsibleRunner) processJob(ctx context.Context) error {
 	return nil
 }
 
+// vcsSyncRunLog composes the sync-history log of a VCS file inventory sync:
+// clone/parse context, ansible-inventory diagnostics, and the result summary.
+func vcsSyncRunLog(inventory *models.AnsibleInventory, result syncResult) string {
+	var b strings.Builder
+	if inventory.Type == models.InventoryTypeConstructed {
+		b.WriteString("Rebuilding constructed inventory from its input inventories\n")
+		b.WriteString("$ ansible-inventory -i <inputs...> -i constructed.yml --list\n\n")
+	} else {
+		branch := inventory.VCSBranch
+		if branch == "" {
+			branch = "main"
+		}
+		fmt.Fprintf(&b, "Cloning %s (branch %s)\n", inventory.VCSRepository, branch)
+		if result.Commit != "" {
+			fmt.Fprintf(&b, "Parsing %s @ %s\n", inventory.InventoryPath, result.Commit)
+		} else {
+			fmt.Fprintf(&b, "Parsing %s\n", inventory.InventoryPath)
+		}
+		b.WriteString("$ ansible-inventory -i " + inventory.InventoryPath + " --list\n\n")
+	}
+	if result.Stderr != "" {
+		b.WriteString(result.Stderr)
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "\nDiscovered %d hosts\n", result.HostsDiscovered)
+	return b.String()
+}
+
 func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 	// Dequeue sync job
 	syncData, err := r.queue.Dequeue(ctx, "ansible_sync", 5*time.Second)
@@ -476,8 +584,38 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 			return fmt.Errorf("failed to get inventory: %w", err)
 		}
 
-		// Execute the sync
-		result, err := r.syncInventory(ctx, inventory, inventoryMsg.CloneURL, inventoryMsg.Branch)
+		// Record the run in the sync history (SourceID nil = VCS file sync)
+		trigger := inventoryMsg.TriggeredBy
+		if trigger == "" {
+			trigger = "manual"
+		}
+		var syncRun *models.AnsibleInventorySync
+		if r.syncRepo != nil {
+			startedAt := time.Now()
+			syncRun = &models.AnsibleInventorySync{
+				InventoryID: inventory.ID,
+				Status:      models.InventorySyncStatusRunning,
+				TriggeredBy: trigger,
+				StartedAt:   &startedAt,
+			}
+			if createErr := r.syncRepo.Create(syncRun); createErr != nil {
+				logger.Warnf("Failed to record inventory sync run: %v", createErr)
+				syncRun = nil
+			}
+		}
+
+		// Execute the sync (constructed inventories rebuild from their inputs;
+		// VCS inventories clone and parse their inventory file)
+		var result syncResult
+		if inventory.Type == models.InventoryTypeConstructed {
+			var tail *ansible.SyncRunTail
+			if syncRun != nil {
+				tail = ansible.NewSyncRunTail(r.syncRepo, syncRun.ID)
+			}
+			result, err = r.buildConstructedInventory(ctx, inventory, tail)
+		} else {
+			result, err = r.syncInventory(ctx, inventory, inventoryMsg.CloneURL, inventoryMsg.Branch)
+		}
 
 		// Update sync status
 		now := time.Now()
@@ -488,6 +626,11 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 			inventory.LastSyncError = err.Error()
 			inventory.LastSyncLog = result.Stderr // preserve stderr even on failure
 			logger.Infof("Inventory sync %s failed: %v", inventory.ID.String(), err)
+			if syncRun != nil {
+				if finishErr := r.syncRepo.Finish(syncRun.ID, models.InventorySyncStatusFailed, vcsSyncRunLog(inventory, result), err.Error(), 0, 0); finishErr != nil {
+					logger.Warnf("Failed to finalize inventory sync run: %v", finishErr)
+				}
+			}
 		} else {
 			inventory.LastSyncStatus = "successful"
 			inventory.LastSyncError = ""
@@ -496,6 +639,11 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 			logger.Infof("Inventory sync %s completed successfully (hosts: %d)", inventory.ID.String(), result.HostsDiscovered)
 			if result.HostsDiscovered == 0 {
 				logger.Warnf("Inventory sync %s: 0 hosts discovered, check plugin configuration and authentication", inventory.ID.String())
+			}
+			if syncRun != nil {
+				if finishErr := r.syncRepo.Finish(syncRun.ID, models.InventorySyncStatusSuccessful, vcsSyncRunLog(inventory, result), "", result.HostsDiscovered, 0); finishErr != nil {
+					logger.Warnf("Failed to finalize inventory sync run: %v", finishErr)
+				}
 			}
 		}
 
@@ -511,7 +659,11 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 	if err := json.Unmarshal(syncData, &sourceMsg); err == nil && sourceMsg.SourceID != uuid.Nil {
 		logger.Infof("Processing dynamic inventory source sync: SourceID=%s", sourceMsg.SourceID)
 
-		result, err := r.inventorySourceService.SyncInventorySource(ctx, sourceMsg.SourceID)
+		trigger := sourceMsg.TriggeredBy
+		if trigger == "" {
+			trigger = "manual"
+		}
+		result, err := r.inventorySourceService.SyncInventorySourceTriggered(ctx, sourceMsg.SourceID, trigger)
 		if err != nil {
 			logger.Infof("Inventory source sync %s failed: %v", sourceMsg.SourceID, err)
 		} else {
@@ -683,6 +835,101 @@ func (r *AnsibleRunner) syncPlaybook(ctx context.Context, playbook *models.Ansib
 	return nil
 }
 
+// buildConstructedInventory materializes a constructed inventory: every input
+// inventory is exported to a JSON file (the YAML-plugin dict shape Ansible
+// reads natively), a constructed.yml is generated from the inventory's
+// SourceVars rules, and `ansible-inventory --list` over all of them produces
+// the derived hosts/groups, persisted with full-overwrite semantics (the
+// constructed inventory wholly owns its rows).
+func (r *AnsibleRunner) buildConstructedInventory(ctx context.Context, inventory *models.AnsibleInventory, tail *ansible.SyncRunTail) (syncResult, error) {
+	res := syncResult{}
+
+	inputs, err := r.inventoryRepo.ListConstructedInputs(inventory.ID)
+	if err != nil {
+		return res, fmt.Errorf("failed to list input inventories: %w", err)
+	}
+	if len(inputs) == 0 {
+		return res, fmt.Errorf("constructed inventory has no input inventories")
+	}
+
+	tempDir, err := os.MkdirTemp("", "constructed-inventory-*")
+	if err != nil {
+		return res, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			logger.Warnf("Failed to remove temp directory %s: %v", tempDir, err)
+		}
+	}()
+
+	// Export each input in order; later sources can reference earlier hosts.
+	args := []string{}
+	for i := range inputs {
+		content, err := r.inventoryService.GenerateInventoryJSON(inputs[i].ID)
+		if err != nil {
+			return res, fmt.Errorf("failed to export input inventory %s: %w", inputs[i].Name, err)
+		}
+		inputFile := filepath.Join(tempDir, fmt.Sprintf("%02d_input.json", i))
+		if err := os.WriteFile(inputFile, []byte(content), 0o600); err != nil {
+			return res, fmt.Errorf("failed to write input inventory file: %w", err)
+		}
+		args = append(args, "-i", inputFile)
+	}
+
+	// Generate constructed.yml: user rules + the plugin header. Parsing the
+	// user YAML up front surfaces rule errors as a readable failure.
+	rules := map[string]interface{}{}
+	if strings.TrimSpace(inventory.SourceVars) != "" {
+		if err := yaml.Unmarshal([]byte(inventory.SourceVars), &rules); err != nil {
+			return res, fmt.Errorf("invalid source_vars YAML: %w", err)
+		}
+	}
+	rules["plugin"] = "ansible.builtin.constructed"
+	if _, ok := rules["strict"]; !ok {
+		rules["strict"] = false
+	}
+	constructedYAML, err := yaml.Marshal(rules)
+	if err != nil {
+		return res, fmt.Errorf("failed to generate constructed.yml: %w", err)
+	}
+	constructedFile := filepath.Join(tempDir, "constructed.yml")
+	if err := os.WriteFile(constructedFile, constructedYAML, 0o600); err != nil {
+		return res, fmt.Errorf("failed to write constructed.yml: %w", err)
+	}
+	args = append(args, "-i", constructedFile, "--list")
+	if inventory.ConstructedLimit != "" {
+		args = append(args, "--limit", inventory.ConstructedLimit)
+	}
+
+	tail.WriteString("Rebuilding constructed inventory from its input inventories\n$ ansible-inventory " + strings.Join(args, " ") + "\n\n")
+	cmd := exec.CommandContext(ctx, "ansible-inventory", args...) //nolint:gosec // intentional: executing ansible command
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	// Stream diagnostics into the live tail while the build runs.
+	cmd.Stderr = io.MultiWriter(&stderr, tail)
+	if err := cmd.Run(); err != nil {
+		res.Stderr = stderr.String()
+		return res, fmt.Errorf("ansible-inventory failed: %w\nstderr: %s", err, stderr.String())
+	}
+	res.Stderr = stderr.String()
+
+	var inventoryOutput map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &inventoryOutput); err != nil {
+		return res, fmt.Errorf("failed to parse ansible-inventory output: %w", err)
+	}
+
+	hostsDiscovered, err := ansible.ProcessInventoryOutputWithOptions(r.inventoryRepo, inventory.ID, inventoryOutput, ansible.SyncOptions{
+		OverwriteVars: true,
+		PruneUnseen:   true,
+	})
+	if err != nil {
+		return res, fmt.Errorf("failed to persist constructed inventory: %w", err)
+	}
+	res.HostsDiscovered = hostsDiscovered
+	logger.Infof("Constructed inventory %s rebuilt from %d inputs (hosts: %d)", inventory.Name, len(inputs), hostsDiscovered)
+	return res, nil
+}
+
 func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.AnsibleInventory, cloneURL, branch string) (syncResult, error) {
 	var res syncResult
 
@@ -791,6 +1038,7 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	if err != nil {
 		logger.Warnf("Could not get commit hash: %v", err)
 	}
+	res.Commit = commitHash
 
 	logger.Infof("Successfully synced inventory %s from %s (branch: %s, path: %s, commit: %s, hosts: %d)",
 		inventory.Name, inventory.VCSRepository, inventory.VCSBranch, inventory.InventoryPath, commitHash, hostsDiscovered)
@@ -808,6 +1056,20 @@ func (r *AnsibleRunner) getLatestCommit(ctx context.Context, repoDir string) (st
 	return strings.TrimSpace(string(output)), nil
 }
 
+// adHocPlaybookFileName is the generated transient playbook for ad hoc jobs.
+const adHocPlaybookFileName = "adhoc.yml"
+
+// writeAdHocPlaybook materializes the shared transient ad hoc playbook into
+// the job dir so ad hoc commands reuse the whole playbook pipeline: streaming
+// output, events, statistics, and the jobs UI.
+func writeAdHocPlaybook(jobDir string, job *models.AnsibleJob) error {
+	content, err := ansible.BuildAdHocPlaybook(job.Module, job.ModuleArgs)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(jobDir, adHocPlaybookFileName), content, 0o600)
+}
+
 func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, playbookCloneURL, playbookBranch string) error {
 	// Create job workspace directory
 	jobDir := filepath.Join(r.config.WorkspacesDir, "ansible-jobs", job.ID.String())
@@ -823,24 +1085,38 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		}
 	}()
 
-	// Get playbook
-	playbook, err := r.playbookRepo.GetByID(job.PlaybookID)
-	if err != nil {
-		return fmt.Errorf("failed to get playbook: %w", err)
-	}
+	// Get playbook. Ad hoc jobs have none — a transient one-task playbook is
+	// generated from module + args instead.
+	var playbook *models.AnsiblePlaybook
+	var playbookDir string
+	if job.JobType == models.AnsibleJobTypeAdHoc {
+		playbookDir = jobDir
+		if err := writeAdHocPlaybook(jobDir, job); err != nil {
+			return fmt.Errorf("failed to generate ad hoc playbook: %w", err)
+		}
+	} else {
+		if job.PlaybookID == nil {
+			return fmt.Errorf("job has no playbook")
+		}
+		var err error
+		playbook, err = r.playbookRepo.GetByID(*job.PlaybookID)
+		if err != nil {
+			return fmt.Errorf("failed to get playbook: %w", err)
+		}
 
-	// Prepare playbook files (sync from SCM or download from storage)
-	playbookDir, err := r.preparePlaybook(ctx, jobDir, playbook, playbookCloneURL, playbookBranch)
-	if err != nil {
-		return fmt.Errorf("failed to prepare playbook: %w", err)
-	}
+		// Prepare playbook files (sync from SCM or download from storage)
+		playbookDir, err = r.preparePlaybook(ctx, jobDir, playbook, playbookCloneURL, playbookBranch)
+		if err != nil {
+			return fmt.Errorf("failed to prepare playbook: %w", err)
+		}
 
-	// Surface in the job log when this run used a cached snapshot (a commit captured
-	// at sync time) rather than the remote's current HEAD, so an operator can tell at
-	// a glance they may be running stale code. preparePlaybook leaves the cached
-	// commit/time on the playbook (loaded from the DB on a cache hit, stamped inline
-	// on an auto-sync miss).
-	r.recordSourceModeEvent(playbook, job)
+		// Surface in the job log when this run used a cached snapshot (a commit captured
+		// at sync time) rather than the remote's current HEAD, so an operator can tell at
+		// a glance they may be running stale code. preparePlaybook leaves the cached
+		// commit/time on the playbook (loaded from the DB on a cache hit, stamped inline
+		// on an auto-sync miss).
+		r.recordSourceModeEvent(playbook, job)
+	}
 
 	// Install Galaxy requirements if requirements.yml exists. Returns the
 	// per-job collections/roles directories this run should use.
@@ -860,16 +1136,19 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	}
 
 	// Generate inventory file (will inject password if needed)
-	inventoryFile, err := r.prepareInventory(ctx, jobDir, job.InventoryID, cred)
+	inventoryFile, err := r.prepareInventory(ctx, jobDir, job, cred)
 	if err != nil {
 		return fmt.Errorf("failed to prepare inventory: %w", err)
 	}
 
 	// Prepare credentials
-	envVars, sshKeyFile, err := r.prepareCredentials(ctx, jobDir, job)
+	prep, err := r.prepareCredentials(ctx, jobDir, job)
 	if err != nil {
 		return fmt.Errorf("failed to prepare credentials: %w", err)
 	}
+	envVars := prep.envVars
+	sshKeyFile := prep.sshKeyFile
+	r.injectAzureOIDCEnv(job, jobDir, envVars)
 	defer func() {
 		// Securely delete SSH key file
 		if sshKeyFile != "" {
@@ -881,6 +1160,20 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 
 	// Build ansible-playbook command and get the working directory
 	args, workDir := r.buildAnsibleArgs(job, playbook, playbookDir, inventoryFile, sshKeyFile)
+	// Vault credentials contribute --vault-id arguments.
+	args = append(args, prep.extraArgs...)
+	// Inject the become password as an extra-vars file when escalating.
+	if job.BecomeEnabled && prep.becomePassword != "" {
+		becomeVars, merr := json.Marshal(map[string]string{"ansible_become_pass": prep.becomePassword})
+		if merr == nil {
+			becomeFile := filepath.Join(jobDir, "become_vars.json")
+			if werr := os.WriteFile(becomeFile, becomeVars, 0o600); werr == nil {
+				args = append(args, "-e", "@"+becomeFile)
+			} else {
+				logger.Warnf("Failed to write become password file for job %s: %v", job.ID, werr)
+			}
+		}
+	}
 
 	if envVars == nil {
 		envVars = map[string]string{}
@@ -1255,11 +1548,19 @@ func publishGalaxyCache(src, dst string) error {
 	return nil
 }
 
-func (r *AnsibleRunner) prepareInventory(ctx context.Context, jobDir string, inventoryID uuid.UUID, cred *models.AnsibleCredential) (string, error) {
+func (r *AnsibleRunner) prepareInventory(ctx context.Context, jobDir string, job *models.AnsibleJob, cred *models.AnsibleCredential) (string, error) {
 	// Generate inventory in JSON format
-	inventoryJSON, err := r.inventoryService.GenerateInventoryJSON(inventoryID)
+	inventoryJSON, err := r.inventoryService.GenerateInventoryJSON(job.InventoryID)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate inventory: %w", err)
+	}
+
+	// Job slicing: keep only this slice's modulo-partition of the hosts.
+	if job.SliceCount > 1 {
+		inventoryJSON, err = ansible.FilterInventoryJSONForSlice(inventoryJSON, job.SliceNumber, job.SliceCount)
+		if err != nil {
+			return "", fmt.Errorf("failed to slice inventory: %w", err)
+		}
 	}
 
 	// If we have a Machine SSH credential with a password, inject it into the inventory
@@ -1324,38 +1625,87 @@ func (r *AnsibleRunner) injectPasswordIntoInventory(inventoryJSON, password stri
 	return string(modifiedJSON), nil
 }
 
-func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, job *models.AnsibleJob) (map[string]string, string, error) {
-	envVars := make(map[string]string)
-	var sshKeyFile string
+// preparedCredentials is everything the attached credentials contribute to an
+// ansible-playbook invocation.
+type preparedCredentials struct {
+	envVars    map[string]string
+	sshKeyFile string
+	// extraArgs are appended to the ansible-playbook command line (e.g.
+	// --vault-id label@file for each attached vault credential).
+	extraArgs []string
+	// becomePassword is injected as ansible_become_pass via a 0600 extra-vars
+	// file when the job runs with privilege escalation.
+	becomePassword string
+}
 
-	if job.CredentialID == nil {
-		return envVars, "", nil
+// prepareCredentials resolves and applies every credential attached to the job:
+// the template's multi-credential set (AWX-style: one per type, multiple vaults
+// with distinct vault IDs) plus the job's own credential (the legacy single
+// machine credential, applied last so a launch-time override wins).
+func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, job *models.AnsibleJob) (*preparedCredentials, error) {
+	prep := &preparedCredentials{envVars: make(map[string]string)}
+
+	var credIDs []uuid.UUID
+	if job.TemplateID != nil && r.templateRepo != nil {
+		ids, err := r.templateRepo.ListCredentialIDs(*job.TemplateID)
+		if err != nil {
+			logger.Warnf("Failed to list template credentials for job %s: %v", job.ID, err)
+		} else {
+			credIDs = ids
+		}
+	}
+	if job.CredentialID != nil {
+		found := false
+		for _, id := range credIDs {
+			if id == *job.CredentialID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			credIDs = append(credIDs, *job.CredentialID)
+		}
 	}
 
-	// Get decrypted credential
-	cred, err := r.credentialService.GetDecryptedCredential(*job.CredentialID)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to get credential: %w", err)
+	vaultCount := 0
+	for _, id := range credIDs {
+		cred, err := r.credentialService.GetDecryptedCredential(id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get credential %s: %w", id, err)
+		}
+		if err := r.applyCredential(prep, cred, jobDir, &vaultCount); err != nil {
+			return nil, err
+		}
 	}
+	return prep, nil
+}
 
+// applyCredential maps one decrypted credential onto the prepared invocation.
+func (r *AnsibleRunner) applyCredential(prep *preparedCredentials, cred *models.AnsibleCredential, jobDir string, vaultCount *int) error {
+	envVars := prep.envVars
 	switch cred.Type {
 	case models.CredentialTypeSSH, models.CredentialTypeMachineSSH:
 		// Write SSH private key to file
 		if cred.SSHPrivateKey != "" {
-			sshKeyFile = filepath.Join(jobDir, "ssh_key")
+			sshKeyFile := filepath.Join(jobDir, "ssh_key")
 			// Normalize at write-time too (not only at store-time) so credentials
 			// saved before normalization existed are repaired without re-entry.
 			// An un-normalized key (CRLF, missing trailing newline, stray
 			// whitespace) fails to load with "error in libcrypto".
 			key := ansible.NormalizePrivateKey(cred.SSHPrivateKey)
 			if err := os.WriteFile(sshKeyFile, []byte(key), 0o600); err != nil {
-				return nil, "", fmt.Errorf("failed to write SSH key: %w", err)
+				return fmt.Errorf("failed to write SSH key: %w", err)
 			}
+			prep.sshKeyFile = sshKeyFile
 		}
 
 		// Set username if provided
 		if cred.Username != "" {
 			envVars["ANSIBLE_REMOTE_USER"] = cred.Username
+		}
+
+		if cred.BecomePassword != "" {
+			prep.becomePassword = cred.BecomePassword
 		}
 
 		// Set SSH passphrase if provided
@@ -1366,13 +1716,19 @@ func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, j
 		}
 
 	case models.CredentialTypeVault:
-		// Write vault password to file
 		if cred.VaultPassword != "" {
-			vaultPassFile := filepath.Join(jobDir, "vault_pass")
+			vaultPassFile := filepath.Join(jobDir, fmt.Sprintf("vault_pass_%d", *vaultCount))
 			if err := os.WriteFile(vaultPassFile, []byte(cred.VaultPassword), 0o600); err != nil {
-				return nil, "", fmt.Errorf("failed to write vault password: %w", err)
+				return fmt.Errorf("failed to write vault password: %w", err)
 			}
-			envVars["ANSIBLE_VAULT_PASSWORD_FILE"] = vaultPassFile
+			*vaultCount++
+			if cred.VaultID != "" {
+				prep.extraArgs = append(prep.extraArgs, "--vault-id", cred.VaultID+"@"+vaultPassFile)
+			} else {
+				// Unlabeled vault: keep the historical env-var behavior so a single
+				// legacy vault credential keeps working exactly as before.
+				envVars["ANSIBLE_VAULT_PASSWORD_FILE"] = vaultPassFile
+			}
 		}
 
 	case models.CredentialTypeAWSAccessKey:
@@ -1384,21 +1740,26 @@ func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, j
 		}
 
 	case models.CredentialTypeAzure:
+		// Export both naming schemes: AZURE_TENANT_ID/AZURE_CLIENT_SECRET for the
+		// azure-identity SDK, AZURE_TENANT/AZURE_SECRET for azure.azcollection
+		// modules (which read the legacy names).
 		if cred.AzureTenantID != "" {
 			envVars["AZURE_TENANT_ID"] = cred.AzureTenantID
+			envVars["AZURE_TENANT"] = cred.AzureTenantID
 		}
 		if cred.AzureClientID != "" {
 			envVars["AZURE_CLIENT_ID"] = cred.AzureClientID
 		}
 		if cred.AzureClientSecret != "" {
 			envVars["AZURE_CLIENT_SECRET"] = cred.AzureClientSecret
+			envVars["AZURE_SECRET"] = cred.AzureClientSecret
 		}
 
 	case models.CredentialTypeGCP:
 		if cred.GCPServiceAccount != "" {
 			gcpCredsFile := filepath.Join(jobDir, "gcp_credentials.json")
 			if err := os.WriteFile(gcpCredsFile, []byte(cred.GCPServiceAccount), 0o600); err != nil {
-				return nil, "", fmt.Errorf("failed to write GCP credentials: %w", err)
+				return fmt.Errorf("failed to write GCP credentials: %w", err)
 			}
 			envVars["GOOGLE_APPLICATION_CREDENTIALS"] = gcpCredsFile
 			envVars["GCP_AUTH_KIND"] = "serviceaccount"
@@ -1419,7 +1780,7 @@ func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, j
 		logger.Infof("SCM credential type detected - repository access should be handled via VCS connection")
 	}
 
-	return envVars, sshKeyFile, nil
+	return nil
 }
 
 // prepareAnsibleConfig fetches the ansible.cfg from the database (project > org priority) and writes it to the workDir
@@ -1458,8 +1819,11 @@ func (r *AnsibleRunner) prepareAnsibleConfig(ctx context.Context, workDir string
 }
 
 func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *models.AnsiblePlaybook, playbookDir, inventoryFile, sshKeyFile string) ([]string, string) {
-	// Determine playbook path
-	playbookPath := playbook.PlaybookPath
+	// Determine playbook path (ad hoc jobs run the generated transient playbook)
+	playbookPath := adHocPlaybookFileName
+	if playbook != nil {
+		playbookPath = playbook.PlaybookPath
+	}
 	if playbookPath == "" {
 		playbookPath = "site.yml"
 	}
@@ -1494,7 +1858,7 @@ func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *model
 
 	// Job type specific options
 	switch job.JobType {
-	case models.AnsibleJobTypeRun:
+	case models.AnsibleJobTypeRun, models.AnsibleJobTypeAdHoc:
 		// Normal execution - no special flags needed
 	case models.AnsibleJobTypeCheck:
 		args = append(args, "--check")
@@ -1549,6 +1913,14 @@ func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *model
 }
 
 func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.AnsibleJob, workDir string, args []string, envVars map[string]string) error {
+	// Enforce the template's job timeout: the context deadline kills the
+	// ansible-playbook process when exceeded.
+	if job.TimeoutSeconds > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(job.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+
 	// Determine ansible-playbook binary
 	ansibleBin := r.config.AnsibleBinaryPath
 	if ansibleBin == "" {
@@ -1720,6 +2092,9 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 		}
 
 		errMsg := err.Error()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			errMsg = fmt.Sprintf("job timeout exceeded (%ds): ansible-playbook was killed", job.TimeoutSeconds)
+		}
 		if stderrStr != "" {
 			errMsg = fmt.Sprintf("%s\nStderr: %s", errMsg, stderrStr)
 		}
