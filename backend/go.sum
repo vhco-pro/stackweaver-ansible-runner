@@ -106,8 +106,8 @@ github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6
 github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
-github.com/google/go-github/v73 v73.0.0 h1:aR+Utnh+Y4mMkS+2qLQwcQ/cF9mOTpdwnzlaw//rG24=
-github.com/google/go-github/v73 v73.0.0/go.mod h1:fa6w8+/V+edSU0muqdhCVY7Beh1M8F1IlQPZIANKIYw=
+github.com/google/go-github/v88 v88.0.0 h1:dZA9IKkPK1eXZj4ypngnpRj5FwdpTv4whix2PrQMP7M=
+github.com/google/go-github/v88 v88.0.0/go.mod h1:rufTDgn2N45wjhukLTyxmvc9nilSp3mr3Rgtt6b1MPw=
 github.com/google/go-querystring v1.2.0 h1:yhqkPbu2/OH+V9BfpCVPZkNmUXhb2gBxJArfhIxNtP0=
 github.com/google/go-querystring v1.2.0/go.mod h1:8IFJqpSRITyJ8QhQ13bmbeMBDfmeEJZD5A0egEOmkqU=
 github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
@@ -151,8 +151,8 @@ github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/michielvha/logger v0.0.3 h1:3GCqipsfvE4wkqZN+scH6bNvRrtXKOCRpmBNeqyWRFw=
 github.com/michielvha/logger v0.0.3/go.mod h1:YJjpbm0AlPmmLBFO8tPyBAruWMJisu2sPo/DX9qxKJk=
-github.com/michielvha/stackweaver/core v0.517.2 h1:Ha0XUoSC2AfqkufSlqQEXPbg61OcE8Yyje7GhNv4YoM=
-github.com/michielvha/stackweaver/core v0.517.2/go.mod h1:2hEH7uByA91WJ6pGq4l3ADAvv6KSIxqqp9ZHwseAJQ4=
+github.com/michielvha/stackweaver/core v0.517.3 h1:ZZiKAx/SUj6FagC8PvrJUYemZSj20E6hZJ0dOOdc/8Y=
+github.com/michielvha/stackweaver/core v0.517.3/go.mod h1:yWoLK9amBvIMyc9PEHvP3q/xDSL0hOGVeoFSH8DtbZo=
 github.com/microsoft/go-mssqldb v1.7.2 h1:CHkFJiObW7ItKTJfHo1QX7QBBD1iV+mn1eOyRP3b/PA=
 github.com/microsoft/go-mssqldb v1.7.2/go.mod h1:kOvZKUdrhhFQmxLZqbwUV0rHkNkZpthMITIb2Ko1IoA=
 github.com/mitchellh/go-wordwrap v1.0.1 h1:TLuKupo69TCn6TQSyGxwI1EblZZEsQ0vMlAFQflz0v0=
