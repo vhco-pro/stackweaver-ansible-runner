@@ -344,6 +344,14 @@ func main() {
 		if issuerURL == "" {
 			issuerURL = "http://localhost:8022"
 		}
+		// Fail-fast signal: a localhost issuer can never satisfy Azure OIDC
+		// federation (Entra fetches {issuer}/.well-known/openid-configuration over
+		// the public internet), so auth_method=oidc inventories would later die
+		// with an opaque AADSTS700211. Warn loudly at boot; the sync path itself
+		// then refuses with an actionable error. Other auth modes are unaffected.
+		if strings.Contains(issuerURL, "localhost") {
+			logger.Warnf("OIDC issuer is %q — auth_method=oidc Azure inventories will be rejected by Entra (AADSTS700211). Set oidc.issuerUrl (Helm) / OIDC_ISSUER_URL to the chart's public root host. (managed_identity / workload_identity / credential inventories are unaffected.)", issuerURL)
+		}
 		oidcTokenService = oidc.NewTokenService(oidcSigningKey, issuerURL)
 		logger.Info("OIDC workload identity token service initialized for inventory sync")
 		inventorySourceService.SetOIDCServices(azureOIDCRepo, oidcTokenService)
