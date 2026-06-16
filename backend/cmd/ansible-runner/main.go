@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/michielvha/logger"
+	"github.com/michielvha/stackweaver/backend/internal/services/encryptionkey"
 	"github.com/michielvha/stackweaver/core/crypto"
 	"github.com/michielvha/stackweaver/core/models"
 	"github.com/michielvha/stackweaver/core/queue"
@@ -418,6 +418,10 @@ func main() {
 			}
 		}
 	}()
+
+	// Background janitor: bound the per-project Galaxy cache on the dedicated
+	// cache volume by evicting caches idle past the TTL.
+	runner.startGalaxyCacheJanitor(ctx)
 
 	// Wait for interrupt
 	sigChan := make(chan os.Signal, 1)
@@ -1079,10 +1083,17 @@ func writeAdHocPlaybook(jobDir string, job *models.AnsibleJob) error {
 }
 
 func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, playbookCloneURL, playbookBranch string) error {
-	// Create job workspace directory
-	jobDir := filepath.Join(r.config.WorkspacesDir, "ansible-jobs", job.ID.String())
-	if err := os.MkdirAll(jobDir, 0o755); err != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
-		return fmt.Errorf("failed to create job directory: %w", err)
+	// Create a unique per-job scratch directory under the workspaces volume.
+	// Using os.MkdirTemp (rather than a deterministic ansible-jobs/{id} path)
+	// makes leftover credentials from a prior run impossible to inherit even if
+	// that run's cleanup was skipped, and prevents collisions between retries of
+	// the same job id. This mirrors the self-hosted agent mode's ephemeral model.
+	if err := os.MkdirAll(r.config.WorkspacesDir, 0o755); err != nil { //nolint:gosec // workspace root needs 0o755 for compatibility
+		return fmt.Errorf("failed to create workspaces directory: %w", err)
+	}
+	jobDir, mkErr := os.MkdirTemp(r.config.WorkspacesDir, fmt.Sprintf("ansible-job-%s-", job.ID.String()))
+	if mkErr != nil {
+		return fmt.Errorf("failed to create job directory: %w", mkErr)
 	}
 	defer func() {
 		// Cleanup job directory after execution (optional, can be disabled for debugging)
@@ -1554,6 +1565,67 @@ func publishGalaxyCache(src, dst string) error {
 		_ = os.RemoveAll(old)
 	}
 	return nil
+}
+
+// galaxyCacheTTL is how long an idle per-project Galaxy cache is kept before the
+// janitor evicts it. Configurable via GALAXY_CACHE_TTL_DAYS; 0 disables eviction.
+func galaxyCacheTTL() time.Duration {
+	days := getEnvInt("GALAXY_CACHE_TTL_DAYS", 14)
+	if days <= 0 {
+		return 0
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+// startGalaxyCacheJanitor periodically evicts per-project Galaxy caches that have
+// gone idle past the TTL, bounding growth on the dedicated cache volume. The
+// cache is regenerable (collections re-download on demand), so eviction never
+// loses anything a job needs. A project's cache mtime is refreshed on every
+// (re)publish, so an actively used cache is never evicted.
+func (r *AnsibleRunner) startGalaxyCacheJanitor(ctx context.Context) {
+	ttl := galaxyCacheTTL()
+	if ttl == 0 {
+		logger.Info("Galaxy cache eviction disabled (GALAXY_CACHE_TTL_DAYS<=0)")
+		return
+	}
+	go func() {
+		r.pruneGalaxyCache(ttl) // sweep once at startup
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.pruneGalaxyCache(ttl)
+			}
+		}
+	}()
+}
+
+// pruneGalaxyCache removes per-project cache directories not refreshed within ttl.
+func (r *AnsibleRunner) pruneGalaxyCache(ttl time.Duration) {
+	base := filepath.Join(r.config.WorkspacesDir, "galaxy-cache")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return // no cache yet — nothing to prune
+	}
+	cutoff := time.Now().Add(-ttl)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, infoErr := e.Info()
+		if infoErr != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		p := filepath.Join(base, e.Name())
+		if rmErr := os.RemoveAll(p); rmErr != nil {
+			logger.Warnf("Galaxy cache janitor: failed to evict %s: %v", p, rmErr)
+			continue
+		}
+		logger.Infof("Galaxy cache janitor: evicted idle project cache %s (last refreshed %s)", e.Name(), info.ModTime().Format(time.RFC3339))
+	}
 }
 
 func (r *AnsibleRunner) prepareInventory(ctx context.Context, jobDir string, job *models.AnsibleJob, cred *models.AnsibleCredential) (string, error) {
@@ -2350,25 +2422,10 @@ func loadConfig() Config {
 		encryptionKeyStr = os.Getenv("ENCRYPTION_KEY")
 	}
 
-	if encryptionKeyStr != "" {
-		var err error
-		config.EncryptionKey, err = hex.DecodeString(encryptionKeyStr)
-		if err != nil {
-			logger.Warnf("Failed to decode encryption key as hex, using raw bytes")
-			config.EncryptionKey = []byte(encryptionKeyStr)
-		}
-		// Ensure 32 bytes for AES-256
-		if len(config.EncryptionKey) < 32 {
-			paddedKey := make([]byte, 32)
-			copy(paddedKey, config.EncryptionKey)
-			config.EncryptionKey = paddedKey
-		} else if len(config.EncryptionKey) > 32 {
-			config.EncryptionKey = config.EncryptionKey[:32]
-		}
-	} else {
-		logger.Warn("No encryption key configured - credentials will not be decrypted")
-		config.EncryptionKey = make([]byte, 32)
-	}
+	// Fail loud on a missing/insecure key instead of silently encrypting
+	// credentials under a publicly known zero key (AUD-013). DEV_INSECURE_KEY=1
+	// is the explicit escape hatch for LOCAL DEVELOPMENT ONLY.
+	config.EncryptionKey = encryptionkey.Resolve(encryptionKeyStr)
 
 	return config
 }
