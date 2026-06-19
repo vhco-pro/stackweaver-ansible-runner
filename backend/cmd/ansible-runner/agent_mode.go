@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,11 @@ import (
 
 	"github.com/michielvha/logger"
 )
+
+// errJobClaimLost is returned by notifyJobStart when the server responds 409 —
+// another runner already claimed the job. The agent treats this as "skip", not
+// as a failure, so a runner that loses a claim race is a no-op.
+var errJobClaimLost = errors.New("job already claimed by another runner")
 
 // AgentConfig holds configuration for agent mode
 type AgentConfig struct {
@@ -359,8 +365,15 @@ func (a *AgentRunner) executeJob(job PendingJob) {
 	// Update status to busy
 	_, _ = a.sendHeartbeat("busy", 1)
 
-	// Notify server that job is starting
+	// Notify server that job is starting. A 409 means another runner already
+	// claimed this job — skip it entirely (no artifact download, no run) and
+	// return to idle so we can pick up other work.
 	if err := a.notifyJobStart(job.JobID); err != nil {
+		if errors.Is(err, errJobClaimLost) {
+			logger.Infof("Job %s already claimed by another runner, skipping", job.JobID)
+			_, _ = a.sendHeartbeat("online", 0)
+			return
+		}
 		logger.Warnf("Failed to notify job start: %v", err)
 	}
 
@@ -848,6 +861,11 @@ func (a *AgentRunner) notifyJobStart(jobID string) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusConflict {
+		// Another runner already claimed this job (or it is no longer claimable).
+		// This runner must skip it rather than execute it.
+		return errJobClaimLost
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("job start notification failed with status %d", resp.StatusCode)
 	}
