@@ -2,7 +2,7 @@
 
 <img src="https://sw.vhco.pro/logo.png" alt="Stackweaver" width="150" />
 
-# Stackweaver™ Ansible Runner
+# Stackweaver Ansible Runner
 
 [![Release](https://github.com/vhco-pro/stackweaver-ansible-runner/actions/workflows/release.yml/badge.svg)](https://github.com/vhco-pro/stackweaver-ansible-runner/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/vhco-pro/stackweaver-ansible-runner?sort=semver)](https://github.com/vhco-pro/stackweaver-ansible-runner/releases/latest)
