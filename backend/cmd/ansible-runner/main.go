@@ -327,7 +327,7 @@ func main() {
 	}
 	vcsRegistry := vcs.NewProviderRegistry(githubAppManager, azureDevOpsManager, func(conn *models.VCSConnection) error {
 		return vcsConnectionRepo.Update(conn)
-	})
+	}, cryptoService)
 
 	// OIDC Workload Identity: Initialize signing key and token service for Azure OIDC
 	// This allows inventory sync to authenticate to Azure for dynamic inventory plugins (azure_rm)
