@@ -18,7 +18,7 @@ COPY backend/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner
 
 # ── Python deps stage: install via uv into a venv ───────────────────
-FROM python:3.14-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061 AS python-deps
+FROM python:3.14-slim@sha256:63a4c7f612a00f92042cbdcc7cdc6a306f38485af0a200b9c89de7d9b1607d15 AS python-deps
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
 
@@ -39,7 +39,7 @@ RUN req="$(find .venv -path '*azure/azcollection/requirements.txt' | head -1)" &
     uv pip install --python /opt/ansible-deps/.venv/bin/python -r "$req"
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM python:3.14-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
+FROM python:3.14-slim@sha256:63a4c7f612a00f92042cbdcc7cdc6a306f38485af0a200b9c89de7d9b1607d15
 
 # System packages required by Ansible modules / connections (upgrade first to pull security patches)
 # Remove pip/ensurepip from stdlib — uv handles package management, pip is a vulnerability surface
