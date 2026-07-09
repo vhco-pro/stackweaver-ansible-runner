@@ -39,10 +39,22 @@ type AgentConfig struct {
 
 // AgentRunner handles the agent mode lifecycle
 type AgentRunner struct {
-	config   AgentConfig
-	runnerID string
-	client   *http.Client
-	shutdown chan struct{}
+	config      AgentConfig
+	runnerID    string
+	runnerToken string // Runner-scoped API key minted at registration (AUD-001); used for all control-plane calls
+	client      *http.Client
+	shutdown    chan struct{}
+}
+
+// authToken returns the credential for a control-plane call: the runner-scoped
+// token once registered, otherwise the org registration key (used only for the
+// initial /runner/register). AUD-001: post-registration calls authenticate as the
+// specific runner, not with the shared org key.
+func (a *AgentRunner) authToken() string {
+	if a.runnerToken != "" {
+		return a.runnerToken
+	}
+	return a.config.Token
 }
 
 // RegisterResponse is the response from the register endpoint
@@ -201,6 +213,8 @@ func (a *AgentRunner) register() ([]PendingJob, error) {
 		return nil, fmt.Errorf("failed to create register request: %w", err)
 	}
 
+	// Registration always authenticates with the org registration key (runner:register
+	// scope); the runner-scoped token cannot register. All other calls use authToken().
 	req.Header.Set("Authorization", "Bearer "+a.config.Token)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -223,6 +237,9 @@ func (a *AgentRunner) register() ([]PendingJob, error) {
 	}
 
 	a.runnerID = registerResp.RunnerID
+	if registerResp.RunnerAPIKey != "" {
+		a.runnerToken = registerResp.RunnerAPIKey
+	}
 
 	// Update poll interval if server specifies one
 	if registerResp.PollIntervalSeconds > 0 {
@@ -280,7 +297,7 @@ func (a *AgentRunner) sendHeartbeat(status string, currentJobs int) ([]PendingJo
 		return nil, fmt.Errorf("failed to create heartbeat request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is from trusted config, not user input
@@ -408,7 +425,7 @@ func (a *AgentRunner) downloadJobArtifacts(jobID string) (*JobArtifacts, error) 
 		return nil, err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is from trusted config, not user input
 	if err != nil {
@@ -437,7 +454,7 @@ func (a *AgentRunner) getJobStatus(ctx context.Context, jobID string) (string, e
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is from trusted config, not user input
 	if err != nil {
 		return "", err
@@ -821,7 +838,7 @@ func (a *AgentRunner) sendJobOutput(jobID, output, stream string) error {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is from trusted config, not user input
@@ -852,7 +869,7 @@ func (a *AgentRunner) notifyJobStart(jobID string) error {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is from trusted config, not user input
@@ -894,7 +911,7 @@ func (a *AgentRunner) notifyJobComplete(jobID, status, errorMsg string) error {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is the operator-configured server endpoint, not user-controlled
@@ -931,7 +948,7 @@ func (a *AgentRunner) deregister() {
 		return
 	}
 
-	req.Header.Set("Authorization", "Bearer "+a.config.Token)
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is the operator-configured server endpoint, not user-controlled
