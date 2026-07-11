@@ -250,6 +250,33 @@ func (a *AgentRunner) register() ([]PendingJob, error) {
 }
 
 // heartbeatLoop continuously polls for jobs
+// startHeartbeatKeepalive sends periodic "busy" heartbeats until the returned stop func is called,
+// so a runner executing a long playbook (which blocks the heartbeat loop) is not marked offline by
+// the server-side monitor after 30s (AUD-025). The stop func blocks until the goroutine has exited.
+func (a *AgentRunner) startHeartbeatKeepalive() func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-a.shutdown:
+				return
+			case <-ticker.C:
+				_, _ = a.sendHeartbeat("busy", 1)
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
 func (a *AgentRunner) heartbeatLoop() {
 	ticker := time.NewTicker(a.config.PollInterval)
 	defer ticker.Stop()
@@ -381,6 +408,11 @@ func (a *AgentRunner) executeJob(job PendingJob) {
 
 	// Update status to busy
 	_, _ = a.sendHeartbeat("busy", 1)
+
+	// AUD-025: keep heartbeating "busy" while the (synchronous, possibly long) playbook runs, so
+	// the server-side monitor doesn't mark this runner offline 30s in.
+	stopKeepalive := a.startHeartbeatKeepalive()
+	defer stopKeepalive()
 
 	// Notify server that job is starting. A 409 means another runner already
 	// claimed this job — skip it entirely (no artifact download, no run) and
@@ -738,7 +770,7 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	// This enables host facts, task details, and stats parsing on the server
 	cmd.Env = append(cmd.Env, "ANSIBLE_STDOUT_CALLBACK=ansible.posix.jsonl")
 	cmd.Env = append(cmd.Env, "ANSIBLE_LOAD_CALLBACK_PLUGINS=true")
-	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING=false")
+	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING="+ansibleHostKeyCheckingValue()) // AUD-116: operator-overridable
 	cmd.Env = append(cmd.Env, "ANSIBLE_RETRY_FILES_ENABLED=false")
 
 	// Capture output
