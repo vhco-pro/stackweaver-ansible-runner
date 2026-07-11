@@ -1,8 +1,9 @@
 module github.com/michielvha/stackweaver/backend
 
-go 1.26.4
+go 1.26.5
 
 require (
+	github.com/ProtonMail/go-crypto v1.4.1
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/google/uuid v1.6.0
@@ -44,6 +45,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
 	github.com/aws/smithy-go v1.27.1 // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-github/v88 v88.0.0 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
@@ -82,7 +84,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/michielvha/stackweaver/core v0.533.2
+	github.com/michielvha/stackweaver/core v0.533.23
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect

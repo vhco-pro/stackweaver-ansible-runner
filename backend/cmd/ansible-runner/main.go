@@ -358,9 +358,14 @@ func main() {
 	}
 
 	// Create runner
+	ansibleConsumerID, _ := os.Hostname()
+	if ansibleConsumerID == "" {
+		ansibleConsumerID = "ansible-runner"
+	}
 	runner := &AnsibleRunner{
 		config:                 config,
 		queue:                  redisQueue,
+		consumerID:             ansibleConsumerID,
 		jobRepo:                jobRepo,
 		templateRepo:           repository.NewAnsibleJobTemplateRepository(db),
 		playbookRepo:           playbookRepo,
@@ -383,6 +388,15 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// AUD-015: recover any jobs this consumer was mid-processing when it last crashed.
+	for _, qn := range []string{"ansible_jobs", "ansible_sync"} {
+		if n, rErr := redisQueue.RequeueProcessing(context.Background(), qn, runner.consumerID); rErr != nil {
+			logger.Warnf("Failed to recover in-flight %s from processing list: %v", qn, rErr)
+		} else if n > 0 {
+			logger.Infof("Recovered %d in-flight %s message(s) from a previous crash", n, qn)
+		}
+	}
+
 	// Job execution worker
 	go func() {
 		logger.Info("Ansible Runner started, waiting for jobs...")
@@ -391,12 +405,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			default:
-				if err := runner.processJob(ctx); err != nil {
-					if err != queue.ErrQueueEmpty {
-						logger.Infof("Error processing job: %v", err)
-					}
-					time.Sleep(1 * time.Second)
-				}
+				runner.consumeReliable(ctx, "ansible_jobs", runner.processJob)
 			}
 		}
 	}()
@@ -409,12 +418,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			default:
-				if err := runner.processSyncJob(ctx); err != nil {
-					if err != queue.ErrQueueEmpty {
-						logger.Infof("Error processing sync job: %v", err)
-					}
-					time.Sleep(1 * time.Second)
-				}
+				runner.consumeReliable(ctx, "ansible_sync", runner.processSyncJob)
 			}
 		}
 	}()
@@ -436,6 +440,7 @@ func main() {
 type AnsibleRunner struct {
 	config                 Config
 	queue                  *queue.RedisQueue
+	consumerID             string // stable per-instance ID for reliable-queue processing lists (AUD-015)
 	jobRepo                *repository.AnsibleJobRepository
 	templateRepo           *repository.AnsibleJobTemplateRepository
 	playbookRepo           *repository.AnsiblePlaybookRepository
@@ -455,16 +460,42 @@ type AnsibleRunner struct {
 	syncRepo         *repository.AnsibleInventorySyncRepository
 }
 
-func (r *AnsibleRunner) processJob(ctx context.Context) error {
-	// Dequeue job
-	jobData, err := r.queue.Dequeue(ctx, "ansible_jobs", 5*time.Second)
-	if err != nil {
-		return err
-	}
+// errPoisonMessage marks a queue message that can never be processed (unmarshalable / unknown
+// type) so consumeReliable dead-letters it instead of retrying it forever or dropping it (AUD-015).
+var errPoisonMessage = errors.New("unprocessable message")
 
+// consumeReliable BLMOVEs one message to this consumer's processing list, runs the handler, then
+// acks it (or dead-letters a poison message). A crash before the ack leaves the message in-flight
+// for RequeueProcessing to recover on restart — the previous plain BRPop lost it (AUD-015).
+func (r *AnsibleRunner) consumeReliable(ctx context.Context, queueName string, handler func(context.Context, []byte) error) {
+	payload, err := r.queue.DequeueReliable(ctx, queueName, r.consumerID, 5*time.Second)
+	if err != nil {
+		if err != queue.ErrQueueEmpty {
+			logger.Infof("Error dequeuing from %s: %v", queueName, err)
+			time.Sleep(1 * time.Second)
+		}
+		return
+	}
+	perr := handler(ctx, payload)
+	if errors.Is(perr, errPoisonMessage) {
+		logger.Infof("Dead-lettering unprocessable %s message: %v", queueName, perr)
+		if dErr := r.queue.DeadLetter(context.Background(), queueName, r.consumerID, payload); dErr != nil { //nolint:contextcheck
+			logger.Warnf("Failed to dead-letter %s message: %v", queueName, dErr)
+		}
+		return
+	}
+	if perr != nil {
+		logger.Infof("Error processing %s message: %v", queueName, perr)
+	}
+	if aErr := r.queue.Ack(context.Background(), queueName, r.consumerID, payload); aErr != nil { //nolint:contextcheck
+		logger.Warnf("Failed to ack %s message: %v", queueName, aErr)
+	}
+}
+
+func (r *AnsibleRunner) processJob(ctx context.Context, jobData []byte) error {
 	var msg AnsibleJobMessage
 	if err := json.Unmarshal(jobData, &msg); err != nil {
-		return fmt.Errorf("failed to unmarshal job message: %w", err)
+		return fmt.Errorf("%w: failed to unmarshal job message: %v", errPoisonMessage, err)
 	}
 
 	logger.Infof("Processing Ansible job: JobID=%s, PlaybookID=%s, InventoryID=%s",
@@ -507,8 +538,13 @@ func (r *AnsibleRunner) processJob(ctx context.Context) error {
 		logger.Infof("Job %s completed successfully", job.ID.String())
 	}
 
-	if updateErr := r.jobRepo.Update(job); updateErr != nil {
+	// AUD-118: write the terminal result only if the job is still `running`. The previous
+	// unconditional whole-struct Update clobbered a concurrent API cancel (which set
+	// status=canceled) back to successful/failed. CompleteIfRunning row-locks and re-checks.
+	if ok, updateErr := r.jobRepo.CompleteIfRunning(job); updateErr != nil {
 		logger.Warnf("Failed to update job completion status: %v", updateErr)
+	} else if !ok {
+		logger.Infof("Job %s was canceled during execution; leaving canceled status intact", job.ID.String())
 	}
 
 	return nil
@@ -542,13 +578,7 @@ func vcsSyncRunLog(inventory *models.AnsibleInventory, result syncResult) string
 	return b.String()
 }
 
-func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
-	// Dequeue sync job
-	syncData, err := r.queue.Dequeue(ctx, "ansible_sync", 5*time.Second)
-	if err != nil {
-		return err
-	}
-
+func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) error {
 	// Try to determine message type by checking for presence of fields
 	// First try playbook sync
 	var playbookMsg PlaybookSyncMessage
@@ -685,7 +715,7 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context) error {
 		return nil
 	}
 
-	return fmt.Errorf("failed to unmarshal sync message: invalid message type")
+	return fmt.Errorf("%w: sync message has no recognized type", errPoisonMessage)
 }
 
 // snapshotStorageKey is the object-storage key for a playbook's cached snapshot.
@@ -1222,11 +1252,16 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		}
 	}()
 	envVars["HOME"] = sshHome
-	// Stop ssh from reading/writing the user known_hosts file (it lives under the
-	// read-only $HOME and is meaningless for ephemeral job hosts), and keep
-	// connections multiplexed. ANSIBLE_HOST_KEY_CHECKING=false disables strict
-	// checking; these args stop ssh from touching ~/.ssh at all.
-	envVars["ANSIBLE_SSH_ARGS"] = "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=60s"
+	// Keep ssh connections multiplexed. By default (AUD-116) we also stop ssh from reading/writing
+	// the user known_hosts file and disable strict checking — ephemeral job hosts have no stable
+	// host keys. An operator who sets ANSIBLE_HOST_KEY_CHECKING=true on the runner opts into real
+	// host-key verification, so we must NOT inject the insecure args (they would defeat it); ssh and
+	// the project/org ansible.cfg then govern known_hosts.
+	if hostKeyChecking() {
+		envVars["ANSIBLE_SSH_ARGS"] = "-o ControlMaster=auto -o ControlPersist=60s"
+	} else {
+		envVars["ANSIBLE_SSH_ARGS"] = "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=60s"
+	}
 
 	// Point collection/role lookups at this job's installed Galaxy cache plus the
 	// playbook-local directories.
@@ -1993,13 +2028,43 @@ func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *model
 }
 
 func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.AnsibleJob, workDir string, args []string, envVars map[string]string) error {
-	// Enforce the template's job timeout: the context deadline kills the
-	// ansible-playbook process when exceeded.
+	// AUD-118: per-job cancellable context so a mid-run API cancel actually stops the playbook.
+	// The parent ctx is the long-lived worker context (shutdown-scoped only), so previously a
+	// cancel was checked once before execution and never honored during the run — the playbook ran
+	// to completion. Poll the job status on a ticker and cancel the exec context when it flips to
+	// canceled. Agent mode does the same via an HTTP /status poll; platform mode reads the DB via
+	// jobRepo. When the process dies from this cancel, the terminal write is skipped by
+	// CompleteIfRunning (status is already canceled), so the canceled state is preserved.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	// Enforce the template's job timeout: the context deadline kills the ansible-playbook process
+	// when exceeded.
 	if job.TimeoutSeconds > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(job.TimeoutSeconds)*time.Second)
-		defer cancel()
+		var cancelTimeout context.CancelFunc
+		runCtx, cancelTimeout = context.WithTimeout(runCtx, time.Duration(job.TimeoutSeconds)*time.Second)
+		defer cancelTimeout()
 	}
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				current, err := r.jobRepo.GetByID(job.ID)
+				if err != nil {
+					continue
+				}
+				if current.Status == models.AnsibleJobStatusCanceled {
+					logger.Infof("Job %s canceled via API, stopping ansible-playbook", job.ID.String())
+					cancelRun()
+					return
+				}
+			}
+		}
+	}()
+	ctx = runCtx
 
 	// Determine ansible-playbook binary
 	ansibleBin := r.config.AnsibleBinaryPath
@@ -2026,7 +2091,7 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 	// Use JSONL callback for streaming output (events as they happen)
 	cmd.Env = append(cmd.Env, "ANSIBLE_STDOUT_CALLBACK=ansible.posix.jsonl")
 	cmd.Env = append(cmd.Env, "ANSIBLE_LOAD_CALLBACK_PLUGINS=true")
-	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING=false")
+	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING="+ansibleHostKeyCheckingValue()) // AUD-116: operator-overridable
 	cmd.Env = append(cmd.Env, "ANSIBLE_RETRY_FILES_ENABLED=false")
 
 	// ANSIBLE_HOME, ANSIBLE_SSH_CONTROL_PATH_DIR and the collection/role paths are
@@ -2435,6 +2500,22 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// hostKeyChecking reports whether SSH host-key checking should be enabled for ansible runs.
+// Defaults to false (the historical behavior — ephemeral job hosts have no stable host keys), but
+// an operator can set ANSIBLE_HOST_KEY_CHECKING=true on the runner to enforce it (AUD-116 — it was
+// hardcoded off, which silently overrode any host_key_checking set in a project/org ansible.cfg).
+func hostKeyChecking() bool {
+	return strings.EqualFold(os.Getenv("ANSIBLE_HOST_KEY_CHECKING"), "true")
+}
+
+// ansibleHostKeyCheckingValue returns "true"/"false" for the ANSIBLE_HOST_KEY_CHECKING env var.
+func ansibleHostKeyCheckingValue() string {
+	if hostKeyChecking() {
+		return "true"
+	}
+	return "false"
 }
 
 func getEnvInt(key string, defaultValue int) int {
