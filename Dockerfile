@@ -5,7 +5,7 @@
 # Example: docker build -f runner-images/ansible/Dockerfile -t ansible-runner .
 
 # ── Build stage: compile the Go binary ──────────────────────────────
-FROM golang:1.26-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS builder
+FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
 ENV GOPRIVATE=github.com/michielvha/stackweaver
 
 WORKDIR /app
@@ -18,7 +18,7 @@ COPY backend/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner
 
 # ── Python deps stage: install via uv into a venv ───────────────────
-FROM python:3.14-slim@sha256:63a4c7f612a00f92042cbdcc7cdc6a306f38485af0a200b9c89de7d9b1607d15 AS python-deps
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1 AS python-deps
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
 
@@ -39,7 +39,7 @@ RUN req="$(find .venv -path '*azure/azcollection/requirements.txt' | head -1)" &
     uv pip install --python /opt/ansible-deps/.venv/bin/python -r "$req"
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM python:3.14-slim@sha256:63a4c7f612a00f92042cbdcc7cdc6a306f38485af0a200b9c89de7d9b1607d15
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1
 
 # System packages required by Ansible modules / connections (upgrade first to pull security patches)
 # Remove pip/ensurepip from stdlib — uv handles package management, pip is a vulnerability surface
