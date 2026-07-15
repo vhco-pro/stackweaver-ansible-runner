@@ -3,10 +3,11 @@ collections:
   - name: amazon.aws
     version: ">=9.0.0"
   - name: azure.azcollection
-    # >=3.17.0 required: that release added native OIDC / workload-identity federation to the
-    # azure_rm inventory plugin (oidc_token_file_path / AZURE_FEDERATED_TOKEN_FILE), which replaced
-    # the hand-rolled oidc-ansible-inventory wrapper (now archived). Do not lower this pin.
-    version: ">=3.17.0"
+    # >=3.20.0 required: 3.17.0 added native OIDC / workload-identity federation to the azure_rm
+    # inventory plugin (oidc_token_file_path / AZURE_FEDERATED_TOKEN_FILE), replacing the archived
+    # oidc-ansible-inventory wrapper; 3.20.0 added the AZURE_TENANT_ID fallback and caller
+    # subscription_id merge on that auth path (ansible-collections/azure#2274). Do not lower.
+    version: ">=3.20.0"
   - name: google.cloud
     version: ">=1.4.0"
   - name: community.vmware
