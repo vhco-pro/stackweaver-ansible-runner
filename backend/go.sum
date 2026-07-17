@@ -159,8 +159,8 @@ github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/michielvha/logger v0.0.5 h1:zcepKGWRMgo32j6nU++RBWtzzz2Q5txVquGDbaSlCro=
 github.com/michielvha/logger v0.0.5/go.mod h1:YJjpbm0AlPmmLBFO8tPyBAruWMJisu2sPo/DX9qxKJk=
-github.com/michielvha/stackweaver/core v0.551.0 h1:Zo1ZvKxv7OzUqWhK+bmlVY0qx523Y2SqbHayghJLI9s=
-github.com/michielvha/stackweaver/core v0.551.0/go.mod h1:vnHaZhZk98vg1wRzl4DRzUG2TDYhuYksrlyUoAggSC0=
+github.com/michielvha/stackweaver/core v0.552.0 h1:PXy8aAB87/HC1edpQS/qMCgefsnVqdDtTfLKhjp2OQo=
+github.com/michielvha/stackweaver/core v0.552.0/go.mod h1:vnHaZhZk98vg1wRzl4DRzUG2TDYhuYksrlyUoAggSC0=
 github.com/microsoft/go-mssqldb v1.7.2 h1:CHkFJiObW7ItKTJfHo1QX7QBBD1iV+mn1eOyRP3b/PA=
 github.com/microsoft/go-mssqldb v1.7.2/go.mod h1:kOvZKUdrhhFQmxLZqbwUV0rHkNkZpthMITIb2Ko1IoA=
 github.com/mitchellh/go-wordwrap v1.0.1 h1:TLuKupo69TCn6TQSyGxwI1EblZZEsQ0vMlAFQflz0v0=
