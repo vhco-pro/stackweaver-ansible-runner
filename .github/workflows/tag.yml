@@ -36,6 +36,6 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Tag with GitVersion
-        uses: michielvha/gitversion-tag-action@71eb5b08849c8867ee613dc9c929af41d145d91d # main snapshot 2026-05-23
+        uses: michielvha/gitversion-tag-action@af3e2ec1a4f126a5f08c89b8de27032064d196f5 # main snapshot 2026-05-23
         with:
           configFilePath: 'gitversion.yml'
