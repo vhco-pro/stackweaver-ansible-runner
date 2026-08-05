@@ -114,8 +114,8 @@ github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6
 github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
-github.com/google/go-github/v89 v89.0.0 h1:35bEK5XoEcF3PZrlVbl9XN63f5BcJRA/UGkxeC9xPg0=
-github.com/google/go-github/v89 v89.0.0/go.mod h1:QLcbU0ipeAqQuR5KSg8c2lql4Qk1EwJ2dWz/0rP4Nho=
+github.com/google/go-github/v90 v90.0.0 h1:EnX9HvTfqvuJbUSWu1/jLrYH6JJLMz0w0qfQVbTxPzE=
+github.com/google/go-github/v90 v90.0.0/go.mod h1:pLzt1FZURZyoTHT5/Z1UQY3b9fYyrbXH6aj7X+qgID4=
 github.com/google/go-querystring v1.2.0 h1:yhqkPbu2/OH+V9BfpCVPZkNmUXhb2gBxJArfhIxNtP0=
 github.com/google/go-querystring v1.2.0/go.mod h1:8IFJqpSRITyJ8QhQ13bmbeMBDfmeEJZD5A0egEOmkqU=
 github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
@@ -159,8 +159,8 @@ github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/michielvha/logger v0.0.5 h1:zcepKGWRMgo32j6nU++RBWtzzz2Q5txVquGDbaSlCro=
 github.com/michielvha/logger v0.0.5/go.mod h1:YJjpbm0AlPmmLBFO8tPyBAruWMJisu2sPo/DX9qxKJk=
-github.com/michielvha/stackweaver/core v0.554.12 h1:0WuG4lM6BiipyYf8IcORN8diV2jZM+d6JfTOT6pu03s=
-github.com/michielvha/stackweaver/core v0.554.12/go.mod h1:la8CK+aPRa6RKtIHVZK15JiMd6yHIbh2v3z1U5lEEk4=
+github.com/michielvha/stackweaver/core v0.554.13 h1:XPWzyXMf+82VxabjlMRaYR1IdWkORSfpmV0W0kVAVik=
+github.com/michielvha/stackweaver/core v0.554.13/go.mod h1:1K0d+n+vhF+aPdEF6JJxpX+kgNAQDGq/gcwzJXCpeIw=
 github.com/microsoft/go-mssqldb v1.7.2 h1:CHkFJiObW7ItKTJfHo1QX7QBBD1iV+mn1eOyRP3b/PA=
 github.com/microsoft/go-mssqldb v1.7.2/go.mod h1:kOvZKUdrhhFQmxLZqbwUV0rHkNkZpthMITIb2Ko1IoA=
 github.com/mitchellh/go-wordwrap v1.0.1 h1:TLuKupo69TCn6TQSyGxwI1EblZZEsQ0vMlAFQflz0v0=
