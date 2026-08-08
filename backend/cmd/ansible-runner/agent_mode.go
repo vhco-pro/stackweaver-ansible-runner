@@ -23,7 +23,7 @@ import (
 	"github.com/michielvha/stackweaver/core/security/gitargs"
 )
 
-// errJobClaimLost is returned by notifyJobStart when the server responds 409 —
+// errJobClaimLost is returned by notifyJobStart when the server responds 409 -
 // another runner already claimed the job. The agent treats this as "skip", not
 // as a failure, so a runner that loses a claim race is a no-op.
 var errJobClaimLost = errors.New("job already claimed by another runner")
@@ -416,7 +416,7 @@ func (a *AgentRunner) executeJob(job PendingJob) {
 	defer stopKeepalive()
 
 	// Notify server that job is starting. A 409 means another runner already
-	// claimed this job — skip it entirely (no artifact download, no run) and
+	// claimed this job - skip it entirely (no artifact download, no run) and
 	// return to idle so we can pick up other work.
 	if err := a.notifyJobStart(job.JobID); err != nil {
 		if errors.Is(err, errJobClaimLost) {
