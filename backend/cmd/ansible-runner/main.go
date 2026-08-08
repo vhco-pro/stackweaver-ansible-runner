@@ -88,7 +88,7 @@ func (r *AnsibleRunner) lookupOrgAzureSubscriptionID(orgID uuid.UUID) string {
 // Azure credential wins: nothing is injected when AZURE_CLIENT_ID is already
 // set. Both the azure-identity SDK names (AZURE_TENANT_ID) and the
 // azure.azcollection names (AZURE_TENANT, AZURE_FEDERATED_TOKEN) are exported,
-// plus ARM_* for Terraform-style consumers — mirroring the self-hosted agent
+// plus ARM_* for Terraform-style consumers - mirroring the self-hosted agent
 // artifact environment.
 func (r *AnsibleRunner) injectAzureOIDCEnv(job *models.AnsibleJob, jobDir string, envVars map[string]string) {
 	if envVars == nil || envVars["AZURE_CLIENT_ID"] != "" {
@@ -226,7 +226,7 @@ func main() {
 
 	// Azure Workload Identity compatibility shim: the AKS webhook injects AZURE_TENANT_ID, and the
 	// image-bundled azure.azcollection >= 3.20.0 reads it natively (ansible-collections/azure#2274)
-	// — but a playbook repo's own galaxy requirements can pin an older collection, which is
+	// - but a playbook repo's own galaxy requirements can pin an older collection, which is
 	// installed per job and shadows the bundled one via ANSIBLE_COLLECTIONS_PATH. Alias the tenant
 	// once at startup so those jobs keep working; an explicit AZURE_TENANT always wins. Subscription
 	// is not bridgeable here (the webhook never provides it): dynamic sources inject it from their
@@ -353,7 +353,7 @@ func main() {
 		// with an opaque AADSTS700211. Warn loudly at boot; the sync path itself
 		// then refuses with an actionable error. Other auth modes are unaffected.
 		if strings.Contains(issuerURL, "localhost") {
-			logger.Warnf("OIDC issuer is %q — auth_method=oidc Azure inventories will be rejected by Entra (AADSTS700211). Set oidc.issuerUrl (Helm) / OIDC_ISSUER_URL to the chart's public root host. (managed_identity / workload_identity / credential inventories are unaffected.)", issuerURL)
+			logger.Warnf("OIDC issuer is %q - auth_method=oidc Azure inventories will be rejected by Entra (AADSTS700211). Set oidc.issuerUrl (Helm) / OIDC_ISSUER_URL to the chart's public root host. (managed_identity / workload_identity / credential inventories are unaffected.)", issuerURL)
 		}
 		oidcTokenService = oidc.NewTokenService(oidcSigningKey, issuerURL)
 		logger.Info("OIDC workload identity token service initialized for inventory sync")
@@ -469,7 +469,7 @@ var errPoisonMessage = errors.New("unprocessable message")
 
 // consumeReliable BLMOVEs one message to this consumer's processing list, runs the handler, then
 // acks it (or dead-letters a poison message). A crash before the ack leaves the message in-flight
-// for RequeueProcessing to recover on restart — the previous plain BRPop lost it (AUD-015).
+// for RequeueProcessing to recover on restart - the previous plain BRPop lost it (AUD-015).
 func (r *AnsibleRunner) consumeReliable(ctx context.Context, queueName string, handler func(context.Context, []byte) error) {
 	payload, err := r.queue.DequeueReliable(ctx, queueName, r.consumerID, 5*time.Second)
 	if err != nil {
@@ -518,7 +518,7 @@ func (r *AnsibleRunner) processJob(ctx context.Context, jobData []byte) error {
 
 	// AUD-141: transition to running via a guarded conditional UPDATE (WHERE
 	// status = pending) instead of the previous check-then-Update, which raced a
-	// concurrent API cancel — a cancel landing between the read above and the
+	// concurrent API cancel - a cancel landing between the read above and the
 	// write would be clobbered back to running and the playbook would run anyway.
 	now := time.Now()
 	started, err := r.jobRepo.StartIfPending(job.ID, now)
@@ -730,7 +730,7 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) err
 }
 
 // snapshotStorageKey is the object-storage key for a playbook's cached snapshot.
-// Latest only — overwritten on each sync (no history).
+// Latest only - overwritten on each sync (no history).
 func snapshotStorageKey(playbookID uuid.UUID) string {
 	return fmt.Sprintf("playbooks/%s/snapshot.tar.gz", playbookID.String())
 }
@@ -739,7 +739,7 @@ func snapshotStorageKey(playbookID uuid.UUID) string {
 // cloneURL so this runner needs no VCS OAuth credentials), validates the playbook
 // file exists, builds a dependency-scoped snapshot tarball, and uploads it to
 // object storage. It returns the snapshot bytes and resolved commit. It does NOT
-// persist the playbook row — callers set the Cached* metadata via
+// persist the playbook row - callers set the Cached* metadata via
 // recordSnapshotMetadata and persist as appropriate.
 func (r *AnsibleRunner) captureAndStoreSnapshot(ctx context.Context, playbook *models.AnsiblePlaybook, cloneURL, branch string) ([]byte, string, error) {
 	if playbook.VCSConnectionID == nil {
@@ -862,7 +862,7 @@ func (r *AnsibleRunner) recordSourceModeEvent(playbook *models.AnsiblePlaybook, 
 	}
 
 	stdout := fmt.Sprintf(
-		"Source: cached snapshot — running commit %s captured %s, not the remote's current HEAD. "+
+		"Source: cached snapshot - running commit %s captured %s, not the remote's current HEAD. "+
 			"To run the latest commit, set the playbook source mode to \"fresh\" or trigger a sync.\n",
 		commit, capturedAt,
 	)
@@ -1030,9 +1030,9 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 
 	// Run ansible-inventory --list to parse the inventory file. VCS-backed inventories are pure
 	// passthrough: StackWeaver does not inject any Azure auth. The repo file's own auth_source
-	// (msi/auto/env/cli) plus the pod runtime — IMDS for Managed Identity, the AKS workload-identity
+	// (msi/auto/env/cli) plus the pod runtime - IMDS for Managed Identity, the AKS workload-identity
 	// webhook's projected token for Workload Identity (read natively by azure.azcollection >= 3.17.0)
-	// — decide how the azure_rm plugin authenticates. We never rewrite the user's azure_rm.yml.
+	// - decide how the azure_rm plugin authenticates. We never rewrite the user's azure_rm.yml.
 	cmdArgs := []string{"-i", inventoryFilePath, "--list"}
 	cmdEnv := os.Environ()
 	// Isolate Ansible's home under the per-sync workspace so ansible-inventory
@@ -1145,7 +1145,7 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		}
 	}()
 
-	// Get playbook. Ad hoc jobs have none — a transient one-task playbook is
+	// Get playbook. Ad hoc jobs have none - a transient one-task playbook is
 	// generated from module + args instead.
 	var playbook *models.AnsiblePlaybook
 	var playbookDir string
@@ -1264,7 +1264,7 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	}()
 	envVars["HOME"] = sshHome
 	// Keep ssh connections multiplexed. By default (AUD-116) we also stop ssh from reading/writing
-	// the user known_hosts file and disable strict checking — ephemeral job hosts have no stable
+	// the user known_hosts file and disable strict checking - ephemeral job hosts have no stable
 	// host keys. An operator who sets ANSIBLE_HOST_KEY_CHECKING=true on the runner opts into real
 	// host-key verification, so we must NOT inject the insecure args (they would defeat it); ssh and
 	// the project/org ansible.cfg then govern known_hosts.
@@ -1654,7 +1654,7 @@ func (r *AnsibleRunner) pruneGalaxyCache(ttl time.Duration) {
 	base := filepath.Join(r.config.WorkspacesDir, "galaxy-cache")
 	entries, err := os.ReadDir(base)
 	if err != nil {
-		return // no cache yet — nothing to prune
+		return // no cache yet - nothing to prune
 	}
 	cutoff := time.Now().Add(-ttl)
 	for _, e := range entries {
@@ -2041,7 +2041,7 @@ func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *model
 func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.AnsibleJob, workDir string, args []string, envVars map[string]string) error {
 	// AUD-118: per-job cancellable context so a mid-run API cancel actually stops the playbook.
 	// The parent ctx is the long-lived worker context (shutdown-scoped only), so previously a
-	// cancel was checked once before execution and never honored during the run — the playbook ran
+	// cancel was checked once before execution and never honored during the run - the playbook ran
 	// to completion. Poll the job status on a ticker and cancel the exec context when it flips to
 	// canceled. Agent mode does the same via an HTTP /status poll; platform mode reads the DB via
 	// jobRepo. When the process dies from this cancel, the terminal write is skipped by
@@ -2514,8 +2514,8 @@ func getEnv(key, defaultValue string) string {
 }
 
 // hostKeyChecking reports whether SSH host-key checking should be enabled for ansible runs.
-// Defaults to false (the historical behavior — ephemeral job hosts have no stable host keys), but
-// an operator can set ANSIBLE_HOST_KEY_CHECKING=true on the runner to enforce it (AUD-116 — it was
+// Defaults to false (the historical behavior - ephemeral job hosts have no stable host keys), but
+// an operator can set ANSIBLE_HOST_KEY_CHECKING=true on the runner to enforce it (AUD-116 - it was
 // hardcoded off, which silently overrode any host_key_checking set in a project/org ansible.cfg).
 func hostKeyChecking() bool {
 	return strings.EqualFold(os.Getenv("ANSIBLE_HOST_KEY_CHECKING"), "true")

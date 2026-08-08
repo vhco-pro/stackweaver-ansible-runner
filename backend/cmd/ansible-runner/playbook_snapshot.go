@@ -68,7 +68,7 @@ func resolvePlaybookSnapshotPaths(repoDir, playbookPath string) (paths []string,
 
 		raw, err := os.ReadFile(filepath.Join(repoDir, filepath.FromSlash(rel))) //nolint:gosec // rel derived from repo content, read-only
 		if err != nil {
-			dynamic = true // can't read it — be safe
+			dynamic = true // can't read it - be safe
 			return
 		}
 		var plays []map[string]interface{}

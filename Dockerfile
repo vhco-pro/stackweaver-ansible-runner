@@ -42,7 +42,7 @@ RUN req="$(find .venv -path '*azure/azcollection/requirements.txt' | head -1)" &
 FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6
 
 # System packages required by Ansible modules / connections (upgrade first to pull security patches)
-# Remove pip/ensurepip from stdlib — uv handles package management, pip is a vulnerability surface
+# Remove pip/ensurepip from stdlib - uv handles package management, pip is a vulnerability surface
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
         openssh-client git sshpass ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -64,7 +64,7 @@ RUN ansible-galaxy collection install -r requirements.yml
 # Copy the Go binary from the builder stage
 COPY --from=builder /app/ansible-runner /usr/local/bin/ansible-runner
 
-# Note: the former oidc-ansible-inventory wrapper is retired — azure.azcollection >= 3.17.0 reads
+# Note: the former oidc-ansible-inventory wrapper is retired - azure.azcollection >= 3.17.0 reads
 # AZURE_FEDERATED_TOKEN_FILE natively, so inventory sync runs plain ansible-inventory for every
 # auth mode. The script is kept as a historical artifact under backend/scripts/archive/.
 
