@@ -1189,12 +1189,22 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		logger.Warnf("Failed to install Galaxy requirements: %v", err)
 	}
 
-	// Get credential early so we can inject password into inventory if needed
+	// Get the machine credential early so we can inject a password into the
+	// inventory if needed. The job's set holds at most one credential of that
+	// type, so the first match is the one.
 	var cred *models.AnsibleCredential
-	if job.CredentialID != nil {
-		cred, err = r.credentialService.GetDecryptedCredential(*job.CredentialID)
-		if err != nil {
-			return fmt.Errorf("failed to get credential: %w", err)
+	jobCredIDs, err := r.jobRepo.ListCredentialIDs(job.ID)
+	if err != nil {
+		return fmt.Errorf("failed to list credentials for job %s: %w", job.ID, err)
+	}
+	for _, id := range jobCredIDs {
+		candidate, credErr := r.credentialService.GetDecryptedCredential(id)
+		if credErr != nil {
+			return fmt.Errorf("failed to get credential: %w", credErr)
+		}
+		if candidate.Type == models.CredentialTypeSSH || candidate.Type == models.CredentialTypeMachineSSH {
+			cred = candidate
+			break
 		}
 	}
 
@@ -1791,26 +1801,13 @@ type preparedCredentials struct {
 func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, job *models.AnsibleJob) (*preparedCredentials, error) {
 	prep := &preparedCredentials{envVars: make(map[string]string)}
 
-	var credIDs []uuid.UUID
-	if job.TemplateID != nil && r.templateRepo != nil {
-		ids, err := r.templateRepo.ListCredentialIDs(*job.TemplateID)
-		if err != nil {
-			logger.Warnf("Failed to list template credentials for job %s: %v", job.ID, err)
-		} else {
-			credIDs = ids
-		}
-	}
-	if job.CredentialID != nil {
-		found := false
-		for _, id := range credIDs {
-			if id == *job.CredentialID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			credIDs = append(credIDs, *job.CredentialID)
-		}
+	// The job carries its own credential set, snapshotted at launch. Reading it
+	// (rather than the template's live set) is what makes a run reproducible:
+	// editing the template afterwards cannot change what an in-flight or
+	// relaunched job authenticates with.
+	credIDs, err := r.jobRepo.ListCredentialIDs(job.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list credentials for job %s: %w", job.ID, err)
 	}
 
 	vaultCount := 0
