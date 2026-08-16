@@ -867,13 +867,16 @@ func (r *AnsibleRunner) recordSourceModeEvent(playbook *models.AnsiblePlaybook, 
 		commit, capturedAt,
 	)
 	event := &models.AnsibleJobEvent{
-		JobID:   job.ID,
-		Event:   "playbook_source",
-		Counter: 0,
-		Task:    "Playbook source",
-		Stdout:  stdout,
+		JobID:     job.ID,
+		Event:     "playbook_source",
+		Task:      "Playbook source",
+		Stdout:    stdout,
+		Timestamp: time.Now().UTC(),
 	}
-	if err := r.jobRepo.CreateEvent(event); err != nil {
+	// Counter comes from the job's own sequence (see CreateEventNextCounter),
+	// never a hardcoded 0/1/2 - those collided with the playbook's counters and
+	// made `?after=<counter>` ambiguous for a live poller.
+	if err := r.jobRepo.CreateEventNextCounter(event); err != nil {
 		logger.Warnf("Failed to create playbook-source event for job %s: %v", job.ID, err)
 	}
 }
@@ -1486,13 +1489,13 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 
 	// Create event for Galaxy installation
 	event := &models.AnsibleJobEvent{
-		JobID:   job.ID,
-		Event:   "galaxy_install",
-		Counter: 0,
-		Task:    "Installing Galaxy Requirements",
-		Stdout:  fmt.Sprintf("Installing collections/roles from %s\n", filepath.Base(foundPath)),
+		JobID:     job.ID,
+		Event:     "galaxy_install",
+		Task:      "Installing Galaxy Requirements",
+		Stdout:    fmt.Sprintf("Installing collections/roles from %s\n", filepath.Base(foundPath)),
+		Timestamp: time.Now().UTC(),
 	}
-	if createErr := r.jobRepo.CreateEvent(event); createErr != nil {
+	if createErr := r.jobRepo.CreateEventNextCounter(event); createErr != nil {
 		logger.Warnf("Failed to create Galaxy install event: %v", createErr)
 	}
 
@@ -1504,14 +1507,14 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 	if err != nil {
 		// Create error event
 		errorEvent := &models.AnsibleJobEvent{
-			JobID:   job.ID,
-			Event:   "galaxy_install_failed",
-			Counter: 1,
-			Task:    "Galaxy Installation Failed",
-			Stderr:  string(output),
-			Failed:  true,
+			JobID:     job.ID,
+			Event:     "galaxy_install_failed",
+			Task:      "Galaxy Installation Failed",
+			Stderr:    string(output),
+			Failed:    true,
+			Timestamp: time.Now().UTC(),
 		}
-		if createErr := r.jobRepo.CreateEvent(errorEvent); createErr != nil {
+		if createErr := r.jobRepo.CreateEventNextCounter(errorEvent); createErr != nil {
 			logger.Warnf("Failed to create error event: %v", createErr)
 		}
 		return "", "", fmt.Errorf("ansible-galaxy collection install failed: %w: %s", err, string(output))
@@ -1530,13 +1533,13 @@ func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *mode
 
 	// Create success event
 	successEvent := &models.AnsibleJobEvent{
-		JobID:   job.ID,
-		Event:   "galaxy_install_complete",
-		Counter: 2,
-		Task:    "Galaxy Requirements Installed",
-		Stdout:  resultStdout,
+		JobID:     job.ID,
+		Event:     "galaxy_install_complete",
+		Task:      "Galaxy Requirements Installed",
+		Stdout:    resultStdout,
+		Timestamp: time.Now().UTC(),
 	}
-	if createErr := r.jobRepo.CreateEvent(successEvent); createErr != nil {
+	if createErr := r.jobRepo.CreateEventNextCounter(successEvent); createErr != nil {
 		logger.Warnf("Failed to create success event: %v", createErr)
 	}
 
@@ -2131,7 +2134,16 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 
 	// Capture output and create events
 	var stderrOutput strings.Builder
+	// Continue the job's existing counter sequence rather than restarting at 1:
+	// the synthetic playbook-source and galaxy events were already written under
+	// this job, and a restart would hand out counters that already exist, which
+	// a `?after=<counter>` poller reads as "nothing new".
 	var eventCounter int64 // atomic counter for thread safety
+	if lastCounter, counterErr := r.jobRepo.GetLastEventCounter(job.ID); counterErr == nil {
+		eventCounter = int64(lastCounter)
+	} else {
+		logger.Warnf("Failed to read last event counter for job %s, starting from 0: %v", job.ID, counterErr)
+	}
 	var wg sync.WaitGroup
 
 	// Track stats incrementally
@@ -2323,6 +2335,7 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 			EventData: eventData,
 			Counter:   counter,
 			Stdout:    rawLine + "\n",
+			Timestamp: ansible.EventTimestamp(eventData, time.Now().UTC()),
 		}
 		if err := r.jobRepo.CreateEvent(event); err != nil {
 			logger.Warnf("Failed to store stats event: %v", err)
@@ -2466,10 +2479,25 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 		Changed:   changed,
 		Failed:    failed,
 		Skipped:   skipped,
+		Timestamp: ansible.EventTimestamp(eventData, time.Now().UTC()),
 	}
 
 	if unreachable {
 		event.Failed = true
+	}
+
+	// The flags read above come from top-level keys the jsonl callback does not
+	// emit on a result line - the real answer is inside hosts[<name>]. When it
+	// is there it wins, which is what makes host/event/changed/failed/skipped
+	// usable as query columns instead of dead weight.
+	if derived, ok := ansible.DeriveHostResult(eventData, ansible.EventVerb(eventData)); ok {
+		if derived.Host != "" {
+			event.Host = derived.Host
+		}
+		event.Event = derived.Event
+		event.Changed = derived.Changed
+		event.Failed = derived.Failed
+		event.Skipped = derived.Skipped
 	}
 
 	if err := r.jobRepo.CreateEvent(event); err != nil {
