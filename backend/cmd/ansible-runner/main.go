@@ -1248,7 +1248,24 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	envVars["ANSIBLE_HOME"] = filepath.Join(jobDir, ".ansible")
 	// Keep the SSH ControlPath dir short to stay under the ~104-char unix socket
 	// path limit; the per-job ANSIBLE_HOME path is far too long for it.
-	envVars["ANSIBLE_SSH_CONTROL_PATH_DIR"] = "/tmp/.ansible-cp"
+	//
+	// It must also be namespaced PER JOB. A single shared directory lets ssh
+	// ControlMaster hand one job a live, already-authenticated connection opened
+	// by another job to the same host+user - so a job whose credential the target
+	// rejects still runs successfully for as long as ControlPersist keeps the
+	// socket alive. On the platform runner, which serves every organization from
+	// one queue, that is a cross-tenant credential bypass. An 8-char job prefix
+	// keeps the path short while isolating the socket namespace.
+	controlPathDir := filepath.Join("/tmp/.ansible-cp", job.ID.String()[:8])
+	if err := os.MkdirAll(controlPathDir, 0o700); err != nil {
+		return fmt.Errorf("failed to create ssh control path directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(controlPathDir); err != nil {
+			logger.Warnf("Failed to remove ssh control path directory %s: %v", controlPathDir, err)
+		}
+	}()
+	envVars["ANSIBLE_SSH_CONTROL_PATH_DIR"] = controlPathDir
 
 	// ssh writes ~/.ssh (known_hosts) under $HOME. The container runs with a
 	// read-only root filesystem, so the default HOME (/home/iac) is not writable
@@ -2147,8 +2164,7 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 	var wg sync.WaitGroup
 
 	// Track stats incrementally
-	var hostsOk, hostsChanged, hostsFailed, hostsSkipped, hostsUnreachable, hostsRescued, hostsIgnored int64
-	var warningsCount int64 // atomic counter for warnings
+	var stats hostStatCounters
 
 	// Process stdout - stream JSONL events line by line
 	wg.Add(1)
@@ -2183,7 +2199,7 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 			}
 
 			// Parse JSONL event and store - pass raw line for output display
-			r.parseAndStoreJSONLEvent(job.ID, eventData, line, &eventCounter, &hostsOk, &hostsChanged, &hostsFailed, &hostsSkipped, &hostsUnreachable, &hostsRescued, &hostsIgnored, &warningsCount)
+			r.parseAndStoreJSONLEvent(job.ID, eventData, line, &eventCounter, &stats)
 		}
 
 		if err := scanner.Err(); err != nil {
@@ -2205,7 +2221,7 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 			if strings.TrimSpace(line) != "" {
 				// Check for warnings in stderr and count them
 				if strings.Contains(line, "[WARNING]:") || strings.Contains(line, "[DEPRECATION WARNING]:") {
-					atomic.AddInt64(&warningsCount, 1)
+					atomic.AddInt64(&stats.warnings, 1)
 				}
 
 				counter := int(atomic.AddInt64(&eventCounter, 1))
@@ -2237,15 +2253,7 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 	}
 
 	// Update job stats with final counts from streaming
-	job.HostsOk = int(atomic.LoadInt64(&hostsOk))
-	job.HostsChanged = int(atomic.LoadInt64(&hostsChanged))
-	job.HostsFailed = int(atomic.LoadInt64(&hostsFailed))
-	job.HostsSkipped = int(atomic.LoadInt64(&hostsSkipped))
-	job.HostsUnreachable = int(atomic.LoadInt64(&hostsUnreachable))
-	job.HostsRescued = int(atomic.LoadInt64(&hostsRescued))
-	job.HostsIgnored = int(atomic.LoadInt64(&hostsIgnored))
-	job.WarningsCount = int(atomic.LoadInt64(&warningsCount))
-	job.HasWarnings = job.WarningsCount > 0
+	stats.applyTo(job)
 
 	// If command failed, include stderr in error message
 	if err != nil {
@@ -2272,8 +2280,37 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 	return nil
 }
 
+// hostStatCounters accumulates the per-host tallies a run reports. The fields are
+// written from the goroutine draining the runner's stdout and read back on the
+// main goroutine after the command exits, so every access goes through sync/atomic.
+type hostStatCounters struct {
+	total       int64
+	ok          int64
+	changed     int64
+	failed      int64
+	skipped     int64
+	unreachable int64
+	rescued     int64
+	ignored     int64
+	warnings    int64
+}
+
+// applyTo copies the accumulated counters onto the job.
+func (c *hostStatCounters) applyTo(job *models.AnsibleJob) {
+	job.HostsTotal = int(atomic.LoadInt64(&c.total))
+	job.HostsOk = int(atomic.LoadInt64(&c.ok))
+	job.HostsChanged = int(atomic.LoadInt64(&c.changed))
+	job.HostsFailed = int(atomic.LoadInt64(&c.failed))
+	job.HostsSkipped = int(atomic.LoadInt64(&c.skipped))
+	job.HostsUnreachable = int(atomic.LoadInt64(&c.unreachable))
+	job.HostsRescued = int(atomic.LoadInt64(&c.rescued))
+	job.HostsIgnored = int(atomic.LoadInt64(&c.ignored))
+	job.WarningsCount = int(atomic.LoadInt64(&c.warnings))
+	job.HasWarnings = job.WarningsCount > 0
+}
+
 // parseAndStoreJSONLEvent parses a single JSONL event line and stores it
-func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[string]interface{}, rawLine string, eventCounter *int64, hostsOk, hostsChanged, hostsFailed, hostsSkipped, hostsUnreachable, hostsRescued, hostsIgnored, warningsCount *int64) {
+func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[string]interface{}, rawLine string, eventCounter *int64, counters *hostStatCounters) {
 	counter := int(atomic.AddInt64(eventCounter, 1))
 
 	// Extract common fields from JSONL event
@@ -2319,14 +2356,17 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 					}
 				}
 			}
-			// Set the final stats (overwrite any previous incremental counts)
-			atomic.StoreInt64(hostsOk, totalOk)
-			atomic.StoreInt64(hostsChanged, totalChanged)
-			atomic.StoreInt64(hostsFailed, totalFailed)
-			atomic.StoreInt64(hostsSkipped, totalSkipped)
-			atomic.StoreInt64(hostsUnreachable, totalUnreachable)
-			atomic.StoreInt64(hostsRescued, totalRescued)
-			atomic.StoreInt64(hostsIgnored, totalIgnored)
+			// Set the final stats (overwrite any previous incremental counts).
+			// The stats map is keyed by host, so its size is the authoritative
+			// host count for the run - the only place it is reported.
+			atomic.StoreInt64(&counters.total, int64(len(stats)))
+			atomic.StoreInt64(&counters.ok, totalOk)
+			atomic.StoreInt64(&counters.changed, totalChanged)
+			atomic.StoreInt64(&counters.failed, totalFailed)
+			atomic.StoreInt64(&counters.skipped, totalSkipped)
+			atomic.StoreInt64(&counters.unreachable, totalUnreachable)
+			atomic.StoreInt64(&counters.rescued, totalRescued)
+			atomic.StoreInt64(&counters.ignored, totalIgnored)
 		}
 		// Store the stats event
 		event := &models.AnsibleJobEvent{
@@ -2391,7 +2431,7 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 		// Count warnings in msg
 		warningMatches := strings.Count(msg, "[WARNING]:") + strings.Count(msg, "[DEPRECATION WARNING]:")
 		if warningMatches > 0 {
-			atomic.AddInt64(warningsCount, int64(warningMatches))
+			atomic.AddInt64(&counters.warnings, int64(warningMatches))
 		}
 		stdoutStr = msg
 	}
@@ -2403,7 +2443,7 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 			// Count warnings in stdout
 			warningMatches := strings.Count(stdout, "[WARNING]:") + strings.Count(stdout, "[DEPRECATION WARNING]:")
 			if warningMatches > 0 {
-				atomic.AddInt64(warningsCount, int64(warningMatches))
+				atomic.AddInt64(&counters.warnings, int64(warningMatches))
 			}
 			if stdoutStr != "" {
 				stdoutStr += "\n" + stdout
@@ -2416,7 +2456,7 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 			// Count warnings in msg
 			warningMatches := strings.Count(msg, "[WARNING]:") + strings.Count(msg, "[DEPRECATION WARNING]:")
 			if warningMatches > 0 {
-				atomic.AddInt64(warningsCount, int64(warningMatches))
+				atomic.AddInt64(&counters.warnings, int64(warningMatches))
 			}
 			if stdoutStr != "" {
 				stdoutStr += "\n" + msg
@@ -2457,13 +2497,13 @@ func (r *AnsibleRunner) parseAndStoreJSONLEvent(jobID uuid.UUID, eventData map[s
 	if stderrVal, ok := eventData["stderr"].(string); ok && stderrVal != "" {
 		warningMatches := strings.Count(stderrVal, "[WARNING]:") + strings.Count(stderrVal, "[DEPRECATION WARNING]:")
 		if warningMatches > 0 {
-			atomic.AddInt64(warningsCount, int64(warningMatches))
+			atomic.AddInt64(&counters.warnings, int64(warningMatches))
 		}
 	}
 	if stdoutVal, ok := eventData["stdout"].(string); ok && stdoutVal != "" {
 		warningMatches := strings.Count(stdoutVal, "[WARNING]:") + strings.Count(stdoutVal, "[DEPRECATION WARNING]:")
 		if warningMatches > 0 {
-			atomic.AddInt64(warningsCount, int64(warningMatches))
+			atomic.AddInt64(&counters.warnings, int64(warningMatches))
 		}
 	}
 
