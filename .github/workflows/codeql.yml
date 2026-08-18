@@ -16,7 +16,7 @@ permissions: {}
 jobs:
   analyze:
     if: ${{ github.event.repository.visibility == 'public' }}
-    uses: vhco-pro/.github/.github/workflows/reusable-codeql-go.yml@03dd0ce7721fbd6f8d34746edbb19c69d8a10f7a # main # main
+    uses: vhco-pro/.github/.github/workflows/reusable-codeql-go.yml@226e62858dad89c38a8e436777a594839ba4299f # main # main
     with:
       # Pin the exact Go release rather than "stable": actions/setup-go resolves
       # "stable" from its own versions-manifest, which lags a Go release by days.
@@ -25,7 +25,10 @@ jobs:
       # so Go cannot self-upgrade - every sync PR failed analyze and stalled the
       # satellite release. An exact version is fetched from go.dev even when the
       # manifest lacks it. Keep this in lockstep with the monorepo go.mod.
-      go-version: "1.26.6"
+      # Track backend/go.mod (synced from the monorepo) rather than hand-copying the
+      # version here. Four hand-maintained pins drifting out of lockstep with go.mod is
+      # exactly what stalled satellite releases three times.
+      go-version-file: backend/go.mod
     permissions:
       security-events: write
       contents: read
