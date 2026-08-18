@@ -27,9 +27,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Short-lived, read-only, scoped to the monorepo alone. Replaces the long-lived
+      # MONOREPO_READ_TOKEN PAT (D-APP: no long-lived credentials). The app is owned by
+      # the monorepo's account because an org-owned app cannot reach a personal repo.
+      - name: Mint monorepo read token
+        id: monorepo-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MONOREPO_READER_APP_ID }}
+          private-key: ${{ secrets.MONOREPO_READER_PRIVATE_KEY }}
+          owner: michielvha
+          repositories: stackweaver
+
       - name: Create .netrc for private Go modules
+        env:
+          MONOREPO_TOKEN: ${{ steps.monorepo-token.outputs.token }}
         run: |
-          printf "machine github.com\nlogin x-access-token\npassword ${{ secrets.MONOREPO_READ_TOKEN }}\n" > .netrc
+          # %s with an argument, not interpolation into the format string: a token
+          # containing a % would otherwise be mangled by printf.
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "$MONOREPO_TOKEN" > .netrc
+          chmod 600 .netrc
 
       - name: Build and push by digest
         uses: michielvha/docker-release-action@c499e52a1a05e5bdd8cf03ba19a423d4c7ec25e3 # v2
