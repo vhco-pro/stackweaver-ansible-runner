@@ -214,6 +214,7 @@ type Config struct {
 	DatabaseUser      string
 	DatabasePassword  string
 	DatabaseName      string
+	DatabaseSSLMode   string
 	EncryptionKey     []byte
 	WorkspacesDir     string
 	AnsibleBinaryPath string
@@ -261,17 +262,7 @@ func main() {
 	}()
 
 	// Initialize database
-	db, err := repository.NewDatabase(repository.Config{
-		Host:            config.DatabaseHost,
-		Port:            config.DatabasePort,
-		User:            config.DatabaseUser,
-		Password:        config.DatabasePassword,
-		DBName:          config.DatabaseName,
-		SSLMode:         "disable",
-		MaxOpenConns:    10,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: 5 * time.Minute,
-	})
+	db, err := repository.NewDatabase(databaseConfig(config))
 	if err != nil {
 		// Close Redis queue before exiting
 		if closeErr := redisQueue.Close(); closeErr != nil {
@@ -2553,6 +2544,7 @@ func loadConfig() Config {
 		DatabaseUser:      getEnv("DATABASE_USER", "iac"),
 		DatabasePassword:  getEnv("DATABASE_PASSWORD", "iac_password"),
 		DatabaseName:      getEnv("DATABASE_NAME", "iac_platform"),
+		DatabaseSSLMode:   getEnv("DATABASE_SSLMODE", "disable"),
 		WorkspacesDir:     getEnv("WORKSPACES_DIR", "/home/iac/workspaces"),
 		AnsibleBinaryPath: os.Getenv("ANSIBLE_BINARY_PATH"),
 	}
@@ -2569,6 +2561,23 @@ func loadConfig() Config {
 	config.EncryptionKey = encryptionkey.Resolve(encryptionKeyStr)
 
 	return config
+}
+
+// databaseConfig maps the runner config onto the repository's database config. Split out of main
+// so the env-driven fields - DatabaseSSLMode especially, which used to be hardcoded to "disable"
+// and broke every TLS-enforcing Postgres (#707) - are covered by a test.
+func databaseConfig(config Config) repository.Config {
+	return repository.Config{
+		Host:            config.DatabaseHost,
+		Port:            config.DatabasePort,
+		User:            config.DatabaseUser,
+		Password:        config.DatabasePassword,
+		DBName:          config.DatabaseName,
+		SSLMode:         config.DatabaseSSLMode,
+		MaxOpenConns:    10,
+		MaxIdleConns:    5,
+		ConnMaxLifetime: 5 * time.Minute,
+	}
 }
 
 func getEnv(key, defaultValue string) string {
