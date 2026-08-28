@@ -68,18 +68,19 @@ COPY --from=builder /app/ansible-runner /usr/local/bin/ansible-runner
 # AZURE_FEDERATED_TOKEN_FILE natively, so inventory sync runs plain ansible-inventory for every
 # auth mode. The script is kept as a historical artifact under backend/scripts/archive/.
 
-# Create non-root user with UID 1001 to match terraform runner (shared volume)
-RUN useradd -m -u 1001 iac
-USER iac
+# Create non-root user with UID 1001 to match the OpenTofu runner (shared volume). The UID, not
+# the name, is what matters there - it stayed 1001 across the iac -> stackweaver rename.
+RUN useradd -m -u 1001 stackweaver
+USER stackweaver
 
 # Working directories
-RUN mkdir -p /home/iac/workspaces/ansible-sync \
-             /home/iac/workspaces/ansible-jobs
+RUN mkdir -p /home/stackweaver/workspaces/ansible-sync \
+             /home/stackweaver/workspaces/ansible-jobs
 
-WORKDIR /home/iac
+WORKDIR /home/stackweaver
 
 # Environment
-ENV WORKSPACES_DIR=/home/iac/workspaces
+ENV WORKSPACES_DIR=/home/stackweaver/workspaces
 # Default Ansible home under writable /tmp so Ansible can create its local temp
 # dir under the read-only root filesystem. The runner overrides this per
 # job/sync onto the workspaces volume; the Galaxy cache lives on that volume too.
