@@ -1269,8 +1269,8 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	envVars["ANSIBLE_SSH_CONTROL_PATH_DIR"] = controlPathDir
 
 	// ssh writes ~/.ssh (known_hosts) under $HOME. The container runs with a
-	// read-only root filesystem, so the default HOME (/home/iac) is not writable
-	// and ssh fails with "Could not create directory '/home/iac/.ssh'
+	// read-only root filesystem, so the default HOME (/home/stackweaver) is not writable
+	// and ssh fails with "Could not create directory '/home/stackweaver/.ssh'
 	// (Read-only file system)". Point HOME at a writable per-job dir under /tmp.
 	// cmd.Env appends these after os.Environ(), and os/exec uses the last value
 	// for a duplicate key, so this overrides the inherited HOME.
@@ -2545,7 +2545,7 @@ func loadConfig() Config {
 		DatabasePassword:  getEnv("DATABASE_PASSWORD", "iac_password"),
 		DatabaseName:      getEnv("DATABASE_NAME", "iac_platform"),
 		DatabaseSSLMode:   getEnv("DATABASE_SSLMODE", "disable"),
-		WorkspacesDir:     getEnv("WORKSPACES_DIR", "/home/iac/workspaces"),
+		WorkspacesDir:     getEnv("WORKSPACES_DIR", "/home/stackweaver/workspaces"),
 		AnsibleBinaryPath: os.Getenv("ANSIBLE_BINARY_PATH"),
 	}
 
