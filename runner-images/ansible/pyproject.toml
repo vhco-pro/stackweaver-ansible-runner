@@ -52,5 +52,5 @@ all = [
 environments = [
     "sys_platform == 'linux' and python_version >= '3.12'",
 ]
-# azure-cli-core >= 2.69 requires msal pre-release; allow it when necessary
+# Some Azure SDK packages the collection needs ship only as pre-releases; allow them when necessary
 prerelease = "allow"
