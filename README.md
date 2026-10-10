@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://sw.vhco.pro/logo.png" alt="Stackweaver" width="150" />
+<img src="https://raw.githubusercontent.com/vhco-pro/.github/main/profile/assets/stackweaver.png" alt="Stackweaver" width="150" />
 
 # Stackweaver Ansible Runner
 
@@ -9,13 +9,13 @@
 [![CodeQL](https://github.com/vhco-pro/stackweaver-ansible-runner/actions/workflows/codeql.yml/badge.svg)](https://github.com/vhco-pro/stackweaver-ansible-runner/actions/workflows/codeql.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/vhco-pro/stackweaver-ansible-runner/badge)](https://scorecard.dev/viewer/?uri=github.com/vhco-pro/stackweaver-ansible-runner)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-sw.vhco.pro-0ea5e9)](https://sw.vhco.pro/docs)
+[![Docs](https://img.shields.io/badge/docs-stackweaver.sh-0ea5e9)](https://stackweaver.sh/docs)
 
-The self-hosted Ansible runner for the [Stackweaver](https://sw.vhco.pro) DevOps platform.
+The self-hosted Ansible runner for the [Stackweaver](https://stackweaver.sh) DevOps platform.
 
 </div>
 
-This is the public release repository for the Stackweaver Ansible Runner. It is published from the Stackweaver source tree on every release. See the [release sync architecture](https://sw.vhco.pro/docs/security/sync-architecture) for how releases are built, signed, and mirrored here.
+This is the public release repository for the Stackweaver Ansible Runner. It is published from the Stackweaver source tree on every release. See the [release sync architecture](https://stackweaver.sh/docs/security/sync-architecture) for how releases are built, signed, and mirrored here.
 
 ## Overview
 
@@ -27,7 +27,7 @@ This runner executes Ansible playbooks as part of the Stackweaver orchestration 
 docker pull ghcr.io/vhco-pro/stackweaver-ansible-runner:latest
 ```
 
-See the [Stackweaver documentation](https://sw.vhco.pro/docs) for deployment and configuration instructions.
+See the [Stackweaver documentation](https://stackweaver.sh/docs) for deployment and configuration instructions.
 
 ## Customize
 
@@ -45,7 +45,7 @@ cosign verify \
   ghcr.io/vhco-pro/stackweaver-ansible-runner:<tag>
 ```
 
-The full verification guide including SBOM extraction, SLSA provenance (live after the Wave-6 visibility flip), and `gitsign verify` for sync commits lives at <https://sw.vhco.pro/docs/security/verifying-releases>.
+The full verification guide including SBOM extraction, SLSA provenance (live after the Wave-6 visibility flip), and `gitsign verify` for sync commits lives at <https://stackweaver.sh/docs/security/verifying-releases>.
 
 ## Trademark
 
