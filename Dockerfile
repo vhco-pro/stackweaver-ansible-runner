@@ -18,7 +18,7 @@ COPY backend/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner
 
 # ── Python deps stage: install via uv into a venv ───────────────────
-FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS python-deps
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS python-deps
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
 
@@ -34,12 +34,24 @@ RUN uv sync --frozen --group all --no-dev --no-install-project
 # from the collection's own requirements.txt (bundled with the ansible package) so
 # the pins always match the installed collection version and supersede the
 # narrower hand-picked azure-mgmt pins above.
-RUN req="$(find .venv -path '*azure/azcollection/requirements.txt' | head -1)" && \
+#
+# The collection pins azure-cli-core to a release whose msal caps cryptography at an old
+# version, so an unconstrained install here downgrades the CLI, auth and crypto packages below
+# what uv.lock resolved - and below their security fixes - while the alert on uv.lock closes.
+# The lock therefore stays authoritative for those packages (--override), and the collection's
+# pins govern only the azure-mgmt-* / msgraph clients it needs. `uv pip check` fails the build
+# if the two ever stop being compatible.
+RUN uv export --frozen --group all --no-dev --no-emit-project --no-hashes \
+      | grep -E '^(azure-cli-core|azure-cli-telemetry|azure-core|msal|msal-extensions|cryptography|pyopenssl|knack|pyjwt|urllib3|oauthlib)==' \
+      > /tmp/lock-overrides.txt && \
+    test -s /tmp/lock-overrides.txt && \
+    req="$(find .venv -path '*azure/azcollection/requirements.txt' | head -1)" && \
     test -n "$req" && \
-    uv pip install --python /opt/ansible-deps/.venv/bin/python -r "$req"
+    uv pip install --python /opt/ansible-deps/.venv/bin/python -r "$req" --override /tmp/lock-overrides.txt && \
+    uv pip check --python /opt/ansible-deps/.venv/bin/python
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
 # System packages required by Ansible modules / connections (upgrade first to pull security patches)
 # Remove pip/ensurepip from stdlib - uv handles package management, pip is a vulnerability surface
