@@ -16,7 +16,7 @@ permissions: {}
 
 jobs:
   scorecard:
-    uses: vhco-pro/.github/.github/workflows/reusable-scorecard.yml@1ba869a38721249cfbf6df0d2320fdb491d6a5eb # main
+    uses: vhco-pro/.github/.github/workflows/reusable-scorecard.yml@de04290ceb4232e4ec50b4873712d76b1bf48aa6 # v1.0.0
     secrets: inherit
     if: github.event.repository.visibility == 'public'
     permissions:
