@@ -164,17 +164,6 @@ type AnsibleJobMessage struct {
 	Branch string `json:"branch,omitempty"`
 }
 
-// PlaybookSyncMessage represents a request to sync a playbook from VCS
-type PlaybookSyncMessage struct {
-	PlaybookID uuid.UUID `json:"playbook_id"`
-	// CloneURL is a pre-authenticated, token-embedded clone URL resolved by the API
-	// at enqueue time. When set, the runner clones with it directly and needs no
-	// VCS OAuth credentials. Empty falls back to resolving from the DB.
-	CloneURL string `json:"clone_url,omitempty"`
-	// Branch accompanies CloneURL on the pre-resolved path.
-	Branch string `json:"branch,omitempty"`
-}
-
 // InventorySyncMessage represents a request to sync a VCS inventory from repository
 type InventorySyncMessage struct {
 	InventoryID uuid.UUID `json:"inventory_id"`
@@ -391,6 +380,11 @@ func main() {
 		}
 	}
 
+	// Background janitor: bound the per-project Galaxy cache on the dedicated
+	// cache volume by evicting caches idle past the TTL. Started before the workers:
+	// its first sweep runs before any job can be seeding from a cache.
+	startGalaxyCacheJanitor(ctx, runner.galaxyCacheDir())
+
 	// Job execution worker
 	go func() {
 		logger.Info("Ansible Runner started, waiting for jobs...")
@@ -416,10 +410,6 @@ func main() {
 			}
 		}
 	}()
-
-	// Background janitor: bound the per-project Galaxy cache on the dedicated
-	// cache volume by evicting caches idle past the TTL.
-	runner.startGalaxyCacheJanitor(ctx)
 
 	// Wait for interrupt
 	sigChan := make(chan os.Signal, 1)
@@ -583,7 +573,7 @@ func vcsSyncRunLog(inventory *models.AnsibleInventory, result syncResult) string
 func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) error {
 	// Try to determine message type by checking for presence of fields
 	// First try playbook sync
-	var playbookMsg PlaybookSyncMessage
+	var playbookMsg ansible.PlaybookSyncMessage
 	if err := json.Unmarshal(syncData, &playbookMsg); err == nil && playbookMsg.PlaybookID != uuid.Nil {
 		logger.Infof("Processing playbook sync: PlaybookID=%s", playbookMsg.PlaybookID)
 
@@ -720,10 +710,43 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) err
 	return fmt.Errorf("%w: sync message has no recognized type", errPoisonMessage)
 }
 
-// snapshotStorageKey is the object-storage key for a playbook's cached snapshot.
-// Latest only - overwritten on each sync (no history).
+// galaxyCacheDir is the base of the per-project Galaxy caches on the shared workspaces
+// volume.
+func (r *AnsibleRunner) galaxyCacheDir() string {
+	return filepath.Join(r.config.WorkspacesDir, "galaxy-cache")
+}
+
+// repoEventSink is the platform runner's jobEventSink: it has a database, so it writes
+// the event row itself.
+type repoEventSink struct {
+	jobRepo *repository.AnsibleJobRepository
+	jobID   uuid.UUID
+}
+
+// Emit stores ev as the job's next event. The counter comes from the job's own
+// sequence (see CreateEventNextCounter), never a hardcoded 0/1/2: those collided with
+// the playbook's counters and made `?after=<counter>` ambiguous for a live poller.
+func (s repoEventSink) Emit(_ context.Context, ev jobEvent) error {
+	return s.jobRepo.CreateEventNextCounter(&models.AnsibleJobEvent{
+		JobID:     s.jobID,
+		Event:     ev.Event,
+		Task:      ev.Task,
+		Stdout:    ev.Stdout,
+		Stderr:    ev.Stderr,
+		Failed:    ev.Failed,
+		Timestamp: time.Now().UTC(),
+	})
+}
+
+func (r *AnsibleRunner) eventSink(jobID uuid.UUID) repoEventSink {
+	return repoEventSink{jobRepo: r.jobRepo, jobID: jobID}
+}
+
+// snapshotStorageKey is the object-storage key for a playbook's cached snapshot. The
+// key itself is defined in core so the API derives the same one when it serves the
+// snapshot to a self-hosted agent.
 func snapshotStorageKey(playbookID uuid.UUID) string {
-	return fmt.Sprintf("playbooks/%s/snapshot.tar.gz", playbookID.String())
+	return ansible.PlaybookSnapshotKey(playbookID)
 }
 
 // captureAndStoreSnapshot clones the playbook repo (preferring the API-resolved
@@ -829,9 +852,9 @@ func (r *AnsibleRunner) recordSnapshotMetadata(playbook *models.AnsiblePlaybook,
 // run used. For cached runs it states the snapshot commit and capture time so an
 // operator can see at a glance that the job ran captured-at-sync-time code, not the
 // remote's current HEAD. It is a no-op for fresh runs and non-VCS playbooks, whose
-// output always reflects what was just fetched. The event carries counter 0 so it
-// sorts to the top of the combined job output.
-func (r *AnsibleRunner) recordSourceModeEvent(playbook *models.AnsiblePlaybook, job *models.AnsibleJob) {
+// output always reflects what was just fetched. The text comes from
+// playbookSourceMessage, which the self-hosted agent path shares.
+func (r *AnsibleRunner) recordSourceModeEvent(ctx context.Context, playbook *models.AnsiblePlaybook, job *models.AnsibleJob) {
 	// Mirror preparePlaybook's mode resolution: only VCS-backed playbooks have a
 	// source mode, and an empty or "cached" mode runs from the snapshot.
 	if playbook.VCSConnectionID == nil || playbook.VCSRepository == "" {
@@ -841,35 +864,8 @@ func (r *AnsibleRunner) recordSourceModeEvent(playbook *models.AnsiblePlaybook, 
 		return
 	}
 
-	commit := playbook.CachedCommit
-	if commit == "" {
-		commit = "unknown"
-	} else if len(commit) > 7 {
-		commit = commit[:7]
-	}
-	capturedAt := "an earlier sync"
-	if playbook.CachedAt != nil {
-		capturedAt = playbook.CachedAt.UTC().Format("2006-01-02 15:04 MST")
-	}
-
-	stdout := fmt.Sprintf(
-		"Source: cached snapshot - running commit %s captured %s, not the remote's current HEAD. "+
-			"To run the latest commit, set the playbook source mode to \"fresh\" or trigger a sync.\n",
-		commit, capturedAt,
-	)
-	event := &models.AnsibleJobEvent{
-		JobID:     job.ID,
-		Event:     "playbook_source",
-		Task:      "Playbook source",
-		Stdout:    stdout,
-		Timestamp: time.Now().UTC(),
-	}
-	// Counter comes from the job's own sequence (see CreateEventNextCounter),
-	// never a hardcoded 0/1/2 - those collided with the playbook's counters and
-	// made `?after=<counter>` ambiguous for a live poller.
-	if err := r.jobRepo.CreateEventNextCounter(event); err != nil {
-		logger.Warnf("Failed to create playbook-source event for job %s: %v", job.ID, err)
-	}
+	ev := playbookSourceEvent(playbookSourceMessage(playbook.CachedCommit, playbook.CachedAt))
+	emitJobEvent(ctx, r.eventSink(job.ID), ev)
 }
 
 func (r *AnsibleRunner) syncPlaybook(ctx context.Context, playbook *models.AnsiblePlaybook, cloneURL, branch string) error {
@@ -1169,12 +1165,16 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		// a glance they may be running stale code. preparePlaybook leaves the cached
 		// commit/time on the playbook (loaded from the DB on a cache hit, stamped inline
 		// on an auto-sync miss).
-		r.recordSourceModeEvent(playbook, job)
+		r.recordSourceModeEvent(ctx, playbook, job)
 	}
 
 	// Install Galaxy requirements if requirements.yml exists. Returns the
 	// per-job collections/roles directories this run should use.
-	galaxyCollections, galaxyRoles, err := r.installGalaxyRequirements(ctx, job, jobDir, playbookDir)
+	galaxyCollections, galaxyRoles, err := installGalaxyRequirements(ctx, r.eventSink(job.ID), galaxyInstallInput{
+		cacheBase:   filepath.Join(r.galaxyCacheDir(), job.ProjectID.String()),
+		jobDir:      jobDir,
+		playbookDir: playbookDir,
+	})
 	if err != nil {
 		// Log warning but don't fail the job
 		logger.Warnf("Failed to install Galaxy requirements: %v", err)
@@ -1442,257 +1442,6 @@ func (r *AnsibleRunner) cloneVCSRepoWithURL(ctx context.Context, targetDir, repo
 
 	logger.Infof("Successfully cloned repository (branch: %s)", branch)
 	return targetDir, nil
-}
-
-// installGalaxyRequirements checks for requirements.yml in the playbook directory
-// and installs any Galaxy collections/roles defined there.
-//
-// Collections/roles are staged inside the per-job workspace (seeded from a warm,
-// per-project cache on the shared workspaces volume) so the run is isolated from
-// concurrent cache writes and works under a read-only root filesystem. After a
-// successful install the staged result is published back to the per-project
-// cache via a temp-dir + atomic rename so future jobs can reuse it.
-//
-// It returns the collections/roles directories this job should use. When no
-// requirements file is present it returns the warm per-project cache paths.
-func (r *AnsibleRunner) installGalaxyRequirements(ctx context.Context, job *models.AnsibleJob, jobDir, playbookDir string) (collectionsDir, rolesDir string, err error) {
-	// Per-project Galaxy cache on the shared workspaces volume. Namespacing by
-	// project keeps one tenant's collections from being served to another.
-	cacheBase := filepath.Join(r.config.WorkspacesDir, "galaxy-cache", job.ProjectID.String())
-	canonicalCollections := filepath.Join(cacheBase, "collections")
-	canonicalRoles := filepath.Join(cacheBase, "roles")
-
-	// Common locations for requirements files
-	requirementsPaths := []string{
-		filepath.Join(playbookDir, "requirements.yml"),
-		filepath.Join(playbookDir, "collections", "requirements.yml"),
-		filepath.Join(playbookDir, "roles", "requirements.yml"),
-	}
-
-	var foundPath string
-	for _, path := range requirementsPaths {
-		if _, statErr := os.Stat(path); statErr == nil {
-			foundPath = path
-			break
-		}
-	}
-
-	if foundPath == "" {
-		// No requirements file found; reuse the warm per-project cache if present.
-		return canonicalCollections, canonicalRoles, nil
-	}
-
-	logger.Infof("Found Galaxy requirements at: %s", foundPath)
-
-	// Stage the install inside the per-job workspace, seeded from the warm cache.
-	// The job runs against this isolated copy, so a concurrent cache publish can
-	// never pull collections out from under it.
-	stageCollections := filepath.Join(jobDir, "galaxy", "collections")
-	stageRoles := filepath.Join(jobDir, "galaxy", "roles")
-	if mkErr := os.MkdirAll(filepath.Join(jobDir, "galaxy"), 0o755); mkErr != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
-		return "", "", fmt.Errorf("failed to create galaxy staging dir: %w", mkErr)
-	}
-	if seedErr := seedGalaxyCache(canonicalCollections, stageCollections); seedErr != nil {
-		logger.Warnf("Failed to seed collections cache: %v", seedErr)
-	}
-	if seedErr := seedGalaxyCache(canonicalRoles, stageRoles); seedErr != nil {
-		logger.Warnf("Failed to seed roles cache: %v", seedErr)
-	}
-	if mkErr := os.MkdirAll(stageCollections, 0o755); mkErr != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
-		return "", "", fmt.Errorf("failed to create collections staging dir: %w", mkErr)
-	}
-	if mkErr := os.MkdirAll(stageRoles, 0o755); mkErr != nil { //nolint:gosec // workspace directories need 0o755 for compatibility
-		return "", "", fmt.Errorf("failed to create roles staging dir: %w", mkErr)
-	}
-
-	// Create event for Galaxy installation
-	event := &models.AnsibleJobEvent{
-		JobID:     job.ID,
-		Event:     "galaxy_install",
-		Task:      "Installing Galaxy Requirements",
-		Stdout:    fmt.Sprintf("Installing collections/roles from %s\n", filepath.Base(foundPath)),
-		Timestamp: time.Now().UTC(),
-	}
-	if createErr := r.jobRepo.CreateEventNextCounter(event); createErr != nil {
-		logger.Warnf("Failed to create Galaxy install event: %v", createErr)
-	}
-
-	// Run ansible-galaxy collection install into the staged directory.
-	galaxyCmd := exec.CommandContext(ctx, "ansible-galaxy", "collection", "install", "-r", foundPath, "-p", stageCollections) //nolint:gosec // intentional: executing ansible command
-	galaxyCmd.Dir = playbookDir
-
-	output, err := galaxyCmd.CombinedOutput()
-	if err != nil {
-		// Create error event
-		errorEvent := &models.AnsibleJobEvent{
-			JobID:     job.ID,
-			Event:     "galaxy_install_failed",
-			Task:      "Galaxy Installation Failed",
-			Stderr:    string(output),
-			Failed:    true,
-			Timestamp: time.Now().UTC(),
-		}
-		if createErr := r.jobRepo.CreateEventNextCounter(errorEvent); createErr != nil {
-			logger.Warnf("Failed to create error event: %v", createErr)
-		}
-		return "", "", fmt.Errorf("ansible-galaxy collection install failed: %w: %s", err, string(output))
-	}
-
-	// Also install roles if the requirements file contains roles
-	rolesCmd := exec.CommandContext(ctx, "ansible-galaxy", "role", "install", "-r", foundPath, "-p", stageRoles) //nolint:gosec // intentional: executing ansible command
-	rolesCmd.Dir = playbookDir
-	rolesOutput, rolesErr := rolesCmd.CombinedOutput()
-
-	// Log results
-	resultStdout := string(output)
-	if rolesErr == nil && len(rolesOutput) > 0 {
-		resultStdout += "\n" + string(rolesOutput)
-	}
-
-	// Create success event
-	successEvent := &models.AnsibleJobEvent{
-		JobID:     job.ID,
-		Event:     "galaxy_install_complete",
-		Task:      "Galaxy Requirements Installed",
-		Stdout:    resultStdout,
-		Timestamp: time.Now().UTC(),
-	}
-	if createErr := r.jobRepo.CreateEventNextCounter(successEvent); createErr != nil {
-		logger.Warnf("Failed to create success event: %v", createErr)
-	}
-
-	// Publish the freshly installed cache back to the shared per-project cache for
-	// future jobs. Best-effort: failures here never fail the job.
-	if pubErr := publishGalaxyCache(stageCollections, canonicalCollections); pubErr != nil {
-		logger.Warnf("Failed to publish collections cache: %v", pubErr)
-	}
-	if pubErr := publishGalaxyCache(stageRoles, canonicalRoles); pubErr != nil {
-		logger.Warnf("Failed to publish roles cache: %v", pubErr)
-	}
-
-	logger.Infof("Galaxy requirements installed successfully")
-	return stageCollections, stageRoles, nil
-}
-
-// seedGalaxyCache copies a warm cache directory into a fresh staging directory so
-// ansible-galaxy can reuse already-downloaded collections. It is a no-op when the
-// source cache does not yet exist. The destination must not already exist.
-func seedGalaxyCache(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil || !info.IsDir() {
-		return nil //nolint:nilerr // no warm cache to seed from is not an error
-	}
-	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
-		return fmt.Errorf("seed %s -> %s: %w", src, dst, err)
-	}
-	return nil
-}
-
-// publishGalaxyCache atomically publishes a freshly installed staging directory to
-// the shared per-project cache using a temp-dir copy followed by an atomic rename.
-// It tolerates concurrent publishers without corrupting the cache.
-func publishGalaxyCache(src, dst string) error {
-	if info, err := os.Stat(src); err != nil || !info.IsDir() {
-		return nil //nolint:nilerr // nothing staged to publish
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil { //nolint:gosec // cache directories need 0o755 for compatibility
-		return fmt.Errorf("create cache parent: %w", err)
-	}
-
-	// Copy the staged tree to a sibling temp dir on the same filesystem so the
-	// final swap is an atomic rename.
-	tmp := dst + ".tmp-" + uuid.NewString()
-	if err := os.CopyFS(tmp, os.DirFS(src)); err != nil {
-		_ = os.RemoveAll(tmp)
-		return fmt.Errorf("stage cache copy: %w", err)
-	}
-
-	// rename(2) onto a non-empty directory fails, so move any existing cache aside
-	// first, then publish, then drop the old copy.
-	old := dst + ".old-" + uuid.NewString()
-	renamedAside := false
-	if err := os.Rename(dst, old); err == nil {
-		renamedAside = true
-	} else if !errors.Is(err, os.ErrNotExist) {
-		// A concurrent publisher already replaced dst; treat its result as
-		// authoritative and discard our temp copy.
-		_ = os.RemoveAll(tmp)
-		return nil //nolint:nilerr // concurrent publish won; not a failure
-	}
-
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.RemoveAll(tmp)
-		if renamedAside {
-			_ = os.Rename(old, dst) // best-effort restore
-		}
-		return fmt.Errorf("publish cache: %w", err)
-	}
-
-	if renamedAside {
-		_ = os.RemoveAll(old)
-	}
-	return nil
-}
-
-// galaxyCacheTTL is how long an idle per-project Galaxy cache is kept before the
-// janitor evicts it. Configurable via GALAXY_CACHE_TTL_DAYS; 0 disables eviction.
-func galaxyCacheTTL() time.Duration {
-	days := getEnvInt("GALAXY_CACHE_TTL_DAYS", 14)
-	if days <= 0 {
-		return 0
-	}
-	return time.Duration(days) * 24 * time.Hour
-}
-
-// startGalaxyCacheJanitor periodically evicts per-project Galaxy caches that have
-// gone idle past the TTL, bounding growth on the dedicated cache volume. The
-// cache is regenerable (collections re-download on demand), so eviction never
-// loses anything a job needs. A project's cache mtime is refreshed on every
-// (re)publish, so an actively used cache is never evicted.
-func (r *AnsibleRunner) startGalaxyCacheJanitor(ctx context.Context) {
-	ttl := galaxyCacheTTL()
-	if ttl == 0 {
-		logger.Info("Galaxy cache eviction disabled (GALAXY_CACHE_TTL_DAYS<=0)")
-		return
-	}
-	go func() {
-		r.pruneGalaxyCache(ttl) // sweep once at startup
-		ticker := time.NewTicker(6 * time.Hour)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				r.pruneGalaxyCache(ttl)
-			}
-		}
-	}()
-}
-
-// pruneGalaxyCache removes per-project cache directories not refreshed within ttl.
-func (r *AnsibleRunner) pruneGalaxyCache(ttl time.Duration) {
-	base := filepath.Join(r.config.WorkspacesDir, "galaxy-cache")
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return // no cache yet - nothing to prune
-	}
-	cutoff := time.Now().Add(-ttl)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		info, infoErr := e.Info()
-		if infoErr != nil || !info.ModTime().Before(cutoff) {
-			continue
-		}
-		p := filepath.Join(base, e.Name())
-		if rmErr := os.RemoveAll(p); rmErr != nil {
-			logger.Warnf("Galaxy cache janitor: failed to evict %s: %v", p, rmErr)
-			continue
-		}
-		logger.Infof("Galaxy cache janitor: evicted idle project cache %s (last refreshed %s)", e.Name(), info.ModTime().Format(time.RFC3339))
-	}
 }
 
 func (r *AnsibleRunner) prepareInventory(ctx context.Context, jobDir string, job *models.AnsibleJob, cred *models.AnsibleCredential) (string, error) {
@@ -2613,11 +2362,32 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
+// extractLimits bound what one archive may unpack to, against decompression bombs and
+// runaway snapshots. A snapshot download is capped at 1 GiB compressed
+// (maxPlaybookSnapshotBytes), so the total allows a few times that once unpacked; the
+// per-file limit is the long-standing one. Variables so tests can shrink them.
+var extractLimits = struct {
+	perFile int64 // bytes one entry may unpack to
+	total   int64 // bytes the whole archive may unpack to
+	entries int   // entries (files, directories, anything) the archive may hold
+}{
+	perFile: 100 << 20,
+	total:   4 << 30,
+	entries: 200_000,
+}
+
 // extractTarGz extracts a tar.gz archive to the target directory
 func extractTarGz(data []byte, targetDir string) error {
-	gzr, err := gzip.NewReader(bytes.NewReader(data))
+	return extractTarGzStream(bytes.NewReader(data), targetDir)
+}
+
+// extractTarGzStream is extractTarGz for an archive that is read rather than held in
+// memory, such as a snapshot a self-hosted agent downloaded to disk. It applies the
+// same entry-name validation and per-file decompression cap.
+func extractTarGzStream(r io.Reader, targetDir string) error {
+	gzr, err := gzip.NewReader(r)
 	if err != nil {
-		return fmt.Errorf("failed to create gzip reader: %w", err)
+		return fmt.Errorf("creating gzip reader: %w", err)
 	}
 	defer func() {
 		if err := gzr.Close(); err != nil {
@@ -2627,13 +2397,21 @@ func extractTarGz(data []byte, targetDir string) error {
 
 	tr := tar.NewReader(gzr)
 
+	var (
+		entries   int
+		extracted int64
+	)
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("failed to read tar entry: %w", err)
+			return fmt.Errorf("reading tar entry: %w", err)
+		}
+		entries++
+		if entries > extractLimits.entries {
+			return fmt.Errorf("archive has more than %d entries", extractLimits.entries)
 		}
 
 		// Validate the entry name BEFORE constructing any filesystem path.
@@ -2674,17 +2452,22 @@ func extractTarGz(data []byte, targetDir string) error {
 				return fmt.Errorf("failed to create file: %w", err)
 			}
 
-			// Security: Limit decompression size to prevent decompression bombs (100MB limit)
-			const maxDecompressedSize = 100 * 1024 * 1024 // 100MB
-			limitedReader := io.LimitReader(tr, maxDecompressedSize)
-			if _, err := io.Copy(f, limitedReader); err != nil {
-				if closeErr := f.Close(); closeErr != nil {
-					logger.Warnf("Failed to close file after copy error: %v", closeErr)
-				}
-				return fmt.Errorf("failed to write file: %w", err)
+			// Security: bound what one entry may decompress to. One byte past the limit is
+			// read so a file at the limit is told apart from one over it: an oversized file
+			// fails the extraction, because cutting it off would run a truncated playbook.
+			written, err := io.Copy(f, io.LimitReader(tr, extractLimits.perFile+1))
+			if closeErr := f.Close(); closeErr != nil {
+				logger.Warnf("Failed to close file %s: %v", target, closeErr)
 			}
-			if err := f.Close(); err != nil {
-				logger.Warnf("Failed to close file: %v", err)
+			if err != nil {
+				return fmt.Errorf("writing file: %w", err)
+			}
+			if written > extractLimits.perFile {
+				return fmt.Errorf("archive entry %s is larger than the %d byte per-file limit", header.Name, extractLimits.perFile)
+			}
+			extracted += written
+			if extracted > extractLimits.total {
+				return fmt.Errorf("archive unpacks to more than the %d byte limit", extractLimits.total)
 			}
 		}
 	}
