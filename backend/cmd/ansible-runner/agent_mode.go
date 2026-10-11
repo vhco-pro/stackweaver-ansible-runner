@@ -18,7 +18,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/michielvha/logger"
 	"github.com/michielvha/stackweaver/core/security/gitargs"
 )
@@ -36,6 +38,9 @@ type AgentConfig struct {
 	RunnerName   string
 	Labels       []string
 	PollInterval time.Duration
+	// GalaxyCacheDir is the base of the per-project Galaxy caches on this host
+	// (GALAXY_CACHE_DIR). Mount a volume there to keep the cache across restarts.
+	GalaxyCacheDir string
 }
 
 // AgentRunner handles the agent mode lifecycle
@@ -109,6 +114,19 @@ func RunAgentMode() {
 
 	logger.Infof("Runner registered successfully with ID: %s", agent.runnerID)
 
+	// Bound the per-project Galaxy caches on this host the same way the platform
+	// runner does. The janitor's context ends when the agent is told to stop.
+	janitorCtx, stopJanitor := context.WithCancel(context.Background())
+	defer stopJanitor()
+	go func() {
+		select {
+		case <-agent.shutdown:
+			stopJanitor()
+		case <-janitorCtx.Done():
+		}
+	}()
+	startGalaxyCacheJanitor(janitorCtx, config.GalaxyCacheDir)
+
 	// Process any pending jobs returned with the register response (re-registration case)
 	if len(initialJobs) > 0 {
 		logger.Infof("Received %d pending job(s) from registration, processing...", len(initialJobs))
@@ -168,13 +186,28 @@ func loadAgentConfig() AgentConfig {
 	}
 
 	return AgentConfig{
-		ServerURL:    serverURL,
-		Token:        token,
-		AgentPoolID:  agentPoolID,
-		RunnerName:   runnerName,
-		Labels:       labels,
-		PollInterval: pollInterval,
+		ServerURL:      serverURL,
+		Token:          token,
+		AgentPoolID:    agentPoolID,
+		RunnerName:     runnerName,
+		Labels:         labels,
+		PollInterval:   pollInterval,
+		GalaxyCacheDir: agentGalaxyCacheDir(),
 	}
+}
+
+// defaultAgentWorkspacesDir is the runner image's WORKSPACES_DIR, used when the
+// variable is not set on the agent host.
+const defaultAgentWorkspacesDir = "/home/stackweaver/workspaces"
+
+// agentGalaxyCacheDir resolves where an agent keeps its per-project Galaxy caches:
+// GALAXY_CACHE_DIR when set, otherwise galaxy-cache under WORKSPACES_DIR, the same
+// place the platform runner uses.
+func agentGalaxyCacheDir() string {
+	if dir := os.Getenv("GALAXY_CACHE_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(getEnv("WORKSPACES_DIR", defaultAgentWorkspacesDir), "galaxy-cache")
 }
 
 // register registers the runner with the StackWeaver server.
@@ -364,7 +397,37 @@ type JobArtifacts struct {
 	// and expose via GOOGLE_APPLICATION_CREDENTIALS.
 	GCPServiceAccount string         `json:"gcp_service_account,omitempty"`
 	JobConfig         *JobConfigData `json:"job_config,omitempty"`
-	VCS               *VCSData       `json:"vcs,omitempty"`
+	// VCS is set only when this run has to clone: a fresh playbook, or a cached one
+	// that has no snapshot yet.
+	VCS *VCSData `json:"vcs,omitempty"`
+	// ProjectID namespaces the Galaxy cache on this host, one cache per project.
+	ProjectID string `json:"project_id,omitempty"`
+	// PlaybookSource says where a VCS-backed playbook's files come from. Nil for ad hoc
+	// jobs and playbooks without a repository.
+	PlaybookSource *PlaybookSourceData `json:"playbook_source,omitempty"`
+}
+
+// PlaybookSourceData is a VCS-backed playbook's source mode as the API resolved it for
+// one job.
+type PlaybookSourceData struct {
+	Mode       string     `json:"mode"` // "cached" or "fresh"
+	Commit     string     `json:"commit,omitempty"`
+	CapturedAt *time.Time `json:"captured_at,omitempty"`
+	SizeBytes  int64      `json:"size_bytes,omitempty"`
+}
+
+const playbookSourceCached = "cached"
+
+// hasSnapshot reports whether the job runs the playbook's cached snapshot, which the
+// agent downloads from the API.
+func (p *PlaybookSourceData) hasSnapshot() bool {
+	return p != nil && p.Mode == playbookSourceCached && p.CapturedAt != nil
+}
+
+// awaitsSnapshot reports whether the playbook is in cached mode but has no snapshot
+// yet. The API then sends the clone URL for this one run and queues a sync.
+func (p *PlaybookSourceData) awaitsSnapshot() bool {
+	return p != nil && p.Mode == playbookSourceCached && p.CapturedAt == nil
 }
 
 // VaultData is one decrypted vault password.
@@ -448,6 +511,15 @@ func (a *AgentRunner) executeJob(job PendingJob) {
 	_, _ = a.sendHeartbeat("online", 0)
 }
 
+// runnerCapabilitiesHeader carries the capabilities this agent announces on the artifacts
+// request, as a comma-separated list.
+const runnerCapabilitiesHeader = "X-Stackweaver-Runner-Capabilities"
+
+// agentCapabilities is what this agent can do beyond cloning a repository:
+// "playbook-snapshot" means it honours playbook_source and downloads a cached playbook's
+// snapshot from the API.
+var agentCapabilities = []string{"playbook-snapshot"}
+
 // downloadJobArtifacts fetches artifacts from the server
 func (a *AgentRunner) downloadJobArtifacts(jobID string) (*JobArtifacts, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -459,6 +531,10 @@ func (a *AgentRunner) downloadJobArtifacts(jobID string) (*JobArtifacts, error) 
 	}
 
 	req.Header.Set("Authorization", "Bearer "+a.authToken())
+	// Tell the API what this binary can do. Without the announcement the API treats the
+	// caller as a runner that can only clone and sends the clone URL instead of the
+	// playbook-source contract.
+	req.Header.Set(runnerCapabilitiesHeader, strings.Join(agentCapabilities, ", "))
 
 	resp, err := a.client.Do(req) //nolint:gosec // G704: URL is from trusted config, not user input
 	if err != nil {
@@ -468,7 +544,7 @@ func (a *AgentRunner) downloadJobArtifacts(jobID string) (*JobArtifacts, error) 
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to download artifacts (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("downloading artifacts (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	var artifacts JobArtifacts
@@ -515,26 +591,79 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	}
 	defer func() { _ = os.RemoveAll(workDir) }() // Cleanup after execution
 
-	// Clone VCS repository if VCS info is provided
+	// jobCtx ends when the job is cancelled through the API. Preparation and the playbook
+	// run both hang off it, so cancelling a job stops whichever step it is in: a snapshot
+	// download or a Galaxy install as much as the play. Each preparation step also bounds
+	// itself with its own timeout.
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	defer cancelJob()
+	go a.watchJobCancellation(jobCtx, jobID, cancelJob)
+	ctx := jobCtx
+	events := apiEventSink{agent: a, jobID: jobID}
+
+	// Prepare the playbook files: the cached snapshot when the playbook has one,
+	// otherwise a clone of the repository.
 	repoDir := workDir
-	if artifacts.VCS != nil && artifacts.VCS.RepoURL != "" {
+	checkoutDir := filepath.Join(workDir, "repo")
+	switch {
+	case artifacts.PlaybookSource.hasSnapshot():
+		source := artifacts.PlaybookSource
+		logger.Infof("Running the cached playbook snapshot (commit %s)", source.Commit)
+		snapshotPath := filepath.Join(workDir, "snapshot.tar.gz")
+		if err := a.downloadPlaybookSnapshot(ctx, jobID, snapshotPath); err != nil {
+			if jobCtx.Err() != nil {
+				return "canceled", ""
+			}
+			return "failed", "Failed to download playbook snapshot: " + err.Error()
+		}
+		if err := extractSnapshotFile(snapshotPath, checkoutDir); err != nil {
+			return "failed", "Failed to extract playbook snapshot: " + err.Error()
+		}
+		repoDir = checkoutDir
+		emitJobEvent(ctx, events, playbookSourceEvent(playbookSourceMessage(source.Commit, source.CapturedAt)))
+	case artifacts.VCS != nil && artifacts.VCS.RepoURL != "":
 		logger.Infof("Cloning repository %s (branch: %s)", artifacts.VCS.Repository, artifacts.VCS.Branch)
-		cloneDir := workDir + "/repo"
-		if err := a.cloneRepo(artifacts.VCS.RepoURL, artifacts.VCS.Branch, cloneDir); err != nil {
+		if err := a.cloneRepo(artifacts.VCS.RepoURL, artifacts.VCS.Branch, checkoutDir); err != nil {
 			return "failed", "Failed to clone repository: " + err.Error()
 		}
-		repoDir = cloneDir
-		logger.Infof("Repository cloned successfully to %s", cloneDir)
-	} else {
+		repoDir = checkoutDir
+		logger.Infof("Repository cloned successfully to %s", checkoutDir)
+		if artifacts.PlaybookSource.awaitsSnapshot() {
+			emitJobEvent(ctx, events, playbookSourceEvent(playbookSourceMissMessage()))
+		}
+	default:
 		logger.Warnf("No VCS info provided for job - playbook files may not be available")
 	}
 
 	// Write ansible.cfg if provided
+	var galaxyEnv []string
 	if artifacts.AnsibleCfg != "" {
 		cfgPath := workDir + "/ansible.cfg"
 		if err := os.WriteFile(cfgPath, []byte(artifacts.AnsibleCfg), 0o600); err != nil {
 			return "failed", "Failed to write ansible.cfg: " + err.Error()
 		}
+		// ansible-galaxy reads its server list from ansible.cfg, so the Galaxy install
+		// below must see the job's config too: that is how a private hub is reached.
+		galaxyEnv = append(galaxyEnv, "ANSIBLE_CONFIG="+cfgPath)
+	}
+
+	// Install the repository's Galaxy requirements, if it has any, with the helper the
+	// platform runner uses. A failed install is reported in the job output and the
+	// play still runs, as on the platform runner.
+	galaxyCollections, galaxyRoles, galaxyErr := installGalaxyRequirements(ctx, events, galaxyInstallInput{
+		cacheBase:   a.galaxyProjectCache(workDir, artifacts.ProjectID),
+		jobDir:      workDir,
+		playbookDir: repoDir,
+		env:         galaxyEnv,
+	})
+	if galaxyErr != nil {
+		logger.Warnf("Failed to install Galaxy requirements: %v", galaxyErr)
+	}
+	// Staged means the repository has a requirements file and its install succeeded.
+	galaxyStaged := galaxyErr == nil && findGalaxyRequirements(repoDir) != ""
+	// A job cancelled while it was being prepared never reaches the play.
+	if jobCtx.Err() != nil {
+		return "canceled", ""
 	}
 
 	// Write inventory file (use .json so Ansible parses it as JSON and picks up host vars like ansible_password)
@@ -709,33 +838,13 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 
 	logger.Infof("Running: ansible-playbook %v (workdir: %s)", args, ansibleWorkDir)
 
-	// Cancellable context: poll API for job cancellation and cancel to stop the
-	// playbook. The template's job timeout (when set) becomes the deadline.
-	runCtx, cancelRun := context.WithCancel(context.Background())
+	// The play runs under the job context, so a cancellation stops it. The template's
+	// job timeout (when set) becomes its deadline; as before, it covers the play only.
+	runCtx, cancelRun := jobCtx, context.CancelFunc(func() {})
 	if artifacts.JobConfig != nil && artifacts.JobConfig.TimeoutSeconds > 0 {
-		runCtx, cancelRun = context.WithTimeout(context.Background(), time.Duration(artifacts.JobConfig.TimeoutSeconds)*time.Second)
+		runCtx, cancelRun = context.WithTimeout(jobCtx, time.Duration(artifacts.JobConfig.TimeoutSeconds)*time.Second)
 	}
 	defer cancelRun()
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			case <-ticker.C:
-				s, pollErr := a.getJobStatus(runCtx, jobID)
-				if pollErr != nil {
-					continue
-				}
-				if s == "canceled" {
-					logger.Infof("Job %s was canceled, stopping ansible-playbook", jobID)
-					cancelRun()
-					return
-				}
-			}
-		}
-	}()
 
 	// Execute ansible-playbook (context is cancelled when job is canceled via API)
 	// #nosec G204 -- args are constructed from trusted sources
@@ -773,6 +882,21 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	cmd.Env = append(cmd.Env, "ANSIBLE_LOAD_CALLBACK_PLUGINS=true")
 	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING="+ansibleHostKeyCheckingValue()) // AUD-116: operator-overridable
 	cmd.Env = append(cmd.Env, "ANSIBLE_RETRY_FILES_ENABLED=false")
+	// Only when Galaxy staged an install for this job: put it, and the playbook-local
+	// directories, in front of the search paths already in effect. Prepended, not
+	// substituted, so collections an operator installed on the agent host by hand stay
+	// visible. A job with nothing staged leaves both variables alone, because an
+	// environment variable beats ansible.cfg and would override a roles_path or
+	// collections_path the repository configures there.
+	if galaxyStaged {
+		cfgFiles := ansibleCfgCandidates(filepath.Join(workDir, "ansible.cfg"), ansibleWorkDir)
+		cmd.Env = prependAnsiblePath(
+			withConfiguredAnsiblePath(cmd.Env, "ANSIBLE_COLLECTIONS_PATH", ansibleCfgSearchPath(cfgFiles, "collections_path", "collections_paths")),
+			"ANSIBLE_COLLECTIONS_PATH", galaxyCollections, filepath.Join(ansibleWorkDir, "collections"))
+		cmd.Env = prependAnsiblePath(
+			withConfiguredAnsiblePath(cmd.Env, "ANSIBLE_ROLES_PATH", ansibleCfgSearchPath(cfgFiles, "roles_path")),
+			"ANSIBLE_ROLES_PATH", galaxyRoles, filepath.Join(ansibleWorkDir, "roles"))
+	}
 
 	// Capture output
 	var stdout, stderr bytes.Buffer
@@ -799,6 +923,160 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	}
 
 	return "completed", ""
+}
+
+// jobCancelPollInterval is how often a running job asks the API whether it was
+// cancelled. A variable so tests can shorten it.
+var jobCancelPollInterval = 2 * time.Second
+
+// watchJobCancellation polls the job's status until ctx ends and calls cancel when the
+// job has been cancelled through the API. It returns when ctx is done, which the job
+// run guarantees by cancelling it on the way out.
+func (a *AgentRunner) watchJobCancellation(ctx context.Context, jobID string, cancel context.CancelFunc) {
+	ticker := time.NewTicker(jobCancelPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			status, err := a.getJobStatus(ctx, jobID)
+			if err != nil {
+				continue
+			}
+			if status == "canceled" {
+				logger.Infof("Job %s was canceled, stopping it", jobID)
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// galaxyProjectCache is the warm Galaxy cache for a job's project on this host. The
+// project id comes from the API and becomes a directory name, so anything that is not a
+// UUID gets a private cache inside the job's own work directory instead: the install
+// still works, it just is not shared with later jobs.
+func (a *AgentRunner) galaxyProjectCache(workDir, projectID string) string {
+	id, err := uuid.Parse(projectID)
+	if err != nil || a.config.GalaxyCacheDir == "" {
+		return filepath.Join(workDir, "galaxy-cache")
+	}
+	return filepath.Join(a.config.GalaxyCacheDir, id.String())
+}
+
+// ansibleDefaultPaths are Ansible's own defaults for the search paths the agent
+// extends. They are spelled out because setting the variable replaces the default.
+var ansibleDefaultPaths = map[string]string{
+	"ANSIBLE_COLLECTIONS_PATH": "~/.ansible/collections:/usr/share/ansible/collections",
+	"ANSIBLE_ROLES_PATH":       "~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles",
+}
+
+// withConfiguredAnsiblePath returns env with the search-path variable name set to
+// configured, the value the effective ansible.cfg gives it, unless env already sets the
+// variable (the environment wins over the file in Ansible) or the file does not
+// configure it. It lets prependAnsiblePath keep what ansible.cfg asked for.
+func withConfiguredAnsiblePath(env []string, name, configured string) []string {
+	if configured == "" {
+		return env
+	}
+	prefix := name + "="
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, prefix); ok && v != "" {
+			return env
+		}
+	}
+	return append(env, prefix+configured)
+}
+
+// prependAnsiblePath returns env with the Ansible search-path variable name set to dirs
+// followed by what was in effect before: the variable's current value in env, or
+// Ansible's default when it is unset or empty. Empty dirs are skipped.
+func prependAnsiblePath(env []string, name string, dirs ...string) []string {
+	prefix := name + "="
+	current := ""
+	rest := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, prefix); ok {
+			current = v // exec uses the last assignment, so it is the one in effect
+			continue
+		}
+		rest = append(rest, kv)
+	}
+	if current == "" {
+		current = ansibleDefaultPaths[name]
+	}
+
+	parts := make([]string, 0, len(dirs)+1)
+	for _, dir := range dirs {
+		if dir != "" {
+			parts = append(parts, dir)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return append(rest, prefix+strings.Join(parts, string(os.PathListSeparator)))
+}
+
+// maxPlaybookSnapshotBytes caps a snapshot download. A snapshot is at most a whole
+// repository; anything near this size is a mistake or an attack on the host's disk.
+const maxPlaybookSnapshotBytes = 1 << 30
+
+// downloadPlaybookSnapshot streams the job's cached playbook snapshot from the API to
+// dest. An agent reaches nothing but the API, so this is its only route to the object.
+func (a *AgentRunner) downloadPlaybookSnapshot(ctx context.Context, jobID, dest string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.config.ServerURL+"/api/v2/runner/jobs/"+jobID+"/playbook-snapshot", nil)
+	if err != nil {
+		return fmt.Errorf("building snapshot request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+a.authToken())
+
+	// A dedicated client with no overall timeout: the control-plane client's 30 seconds
+	// cover the whole body read and would cut a large snapshot short. The context above
+	// bounds the download instead. The transport is shared so connections are reused.
+	client := &http.Client{Transport: a.client.Transport}
+	resp, err := client.Do(req) //nolint:gosec // G704: URL is the operator-configured server endpoint, not user-controlled
+	if err != nil {
+		return fmt.Errorf("requesting snapshot: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("server answered %d: %s", resp.StatusCode, strings.TrimSpace(string(detail)))
+	}
+
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // G304: dest is inside the job's own work directory
+	if err != nil {
+		return fmt.Errorf("creating snapshot file: %w", err)
+	}
+	// One byte past the cap, so a body that is exactly at the cap is told apart from
+	// one that was cut off by it.
+	written, err := io.Copy(out, io.LimitReader(resp.Body, maxPlaybookSnapshotBytes+1))
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("writing snapshot file: %w", err)
+	}
+	if written > maxPlaybookSnapshotBytes {
+		return fmt.Errorf("snapshot is larger than the %d byte limit", int64(maxPlaybookSnapshotBytes))
+	}
+	return nil
+}
+
+// extractSnapshotFile unpacks a downloaded snapshot tarball into targetDir.
+func extractSnapshotFile(path, targetDir string) error {
+	f, err := os.Open(path) //nolint:gosec // G304: path is inside the job's own work directory
+	if err != nil {
+		return fmt.Errorf("opening snapshot file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	return extractTarGzStream(f, targetDir)
 }
 
 // cloneRepo clones a git repository to the target directory
@@ -887,6 +1165,83 @@ func (a *AgentRunner) sendJobOutput(jobID, output, stream string) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	return nil
+}
+
+// maxJobEventBody is what one request to the events endpoint may carry: the API caps
+// the route's body at 1 MiB, and a little room is left for the envelope.
+const maxJobEventBody = 1<<20 - 4096
+
+// encodeJobEvent renders ev as the events endpoint's request body. Output too large for
+// the endpoint is shortened from the front, because a request over the cap is rejected
+// whole and the event, with the reason an install failed, would be lost. The field
+// budget is halved until the encoded body fits, since JSON escaping can inflate it.
+func encodeJobEvent(ev jobEvent) ([]byte, error) {
+	for budget := maxJobEventBody / 2; ; budget /= 2 {
+		body, err := json.Marshal(map[string]any{
+			"event":  ev.Event,
+			"task":   ev.Task,
+			"stdout": keepOutputTail(ev.Stdout, budget),
+			"stderr": keepOutputTail(ev.Stderr, budget),
+			"failed": ev.Failed,
+		})
+		if err != nil || len(body) <= maxJobEventBody || budget == 0 {
+			return body, err
+		}
+	}
+}
+
+// keepOutputTail returns s unchanged when it fits in limit bytes. Otherwise it returns
+// the end of s, cut at a character boundary, behind a line saying how much was dropped:
+// the end of a tool's output is where it says what went wrong.
+func keepOutputTail(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	start := len(s) - limit
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return fmt.Sprintf("[... %d bytes of earlier output omitted ...]\n", start) + s[start:]
+}
+
+// apiEventSink is the agent's jobEventSink. An agent has no database, so it records a
+// job event by posting it to the control plane, which stores it with the job's next
+// counter. One synchronous call per event keeps the events in order with each other.
+type apiEventSink struct {
+	agent *AgentRunner
+	jobID string
+}
+
+// Emit posts ev to the job's events endpoint. A response other than 2xx is logged and
+// not returned: like the platform runner on a failed event insert, the job carries on.
+// An error is returned only when the request could not be made at all.
+func (s apiEventSink) Emit(ctx context.Context, ev jobEvent) error {
+	body, err := encodeJobEvent(ev)
+	if err != nil {
+		return fmt.Errorf("encoding %s job event: %w", ev.Event, err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.agent.config.ServerURL+"/api/v2/runner/jobs/"+s.jobID+"/events", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("building %s job event request: %w", ev.Event, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+s.agent.authToken())
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.agent.client.Do(req) //nolint:gosec // G704: URL is the operator-configured server endpoint, not user-controlled
+	if err != nil {
+		return fmt.Errorf("posting %s job event: %w", ev.Event, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		logger.Warnf("Server rejected %s job event for job %s (status %d): %s", ev.Event, s.jobID, resp.StatusCode, strings.TrimSpace(string(detail)))
+	}
 	return nil
 }
 
