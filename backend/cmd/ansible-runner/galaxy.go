@@ -118,19 +118,22 @@ func findGalaxyRequirements(playbookDir string) string {
 // published back to the per-project cache via a temp-dir + atomic rename so future
 // jobs can reuse it.
 //
-// It returns the collections/roles directories this job should use. When no
-// requirements file is present it returns the warm per-project cache paths.
+// It returns the staged collections and roles directories when the repository's
+// requirements installed, and empty strings otherwise: a repository without a
+// requirements file stages nothing (and that is not an error), and a failed install
+// returns the error. A non-empty collections directory is therefore how a caller knows
+// there is a staged install to put on the job's search paths.
 func installGalaxyRequirements(ctx context.Context, sink jobEventSink, in galaxyInstallInput) (collectionsDir, rolesDir string, err error) {
-	canonicalCollections := filepath.Join(in.cacheBase, "collections")
-	canonicalRoles := filepath.Join(in.cacheBase, "roles")
-
 	foundPath := findGalaxyRequirements(in.playbookDir)
 	if foundPath == "" {
-		// No requirements file found; reuse the warm per-project cache if present.
-		return canonicalCollections, canonicalRoles, nil
+		return "", "", nil
 	}
 
 	logger.Infof("Found Galaxy requirements at: %s", foundPath)
+
+	// The warm per-project cache this install is seeded from and published back to.
+	canonicalCollections := filepath.Join(in.cacheBase, "collections")
+	canonicalRoles := filepath.Join(in.cacheBase, "roles")
 
 	// Stage the install inside the per-job workspace, seeded from the warm cache.
 	// The job runs against this isolated copy, so a concurrent cache publish can

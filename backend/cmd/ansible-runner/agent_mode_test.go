@@ -466,95 +466,6 @@ func TestRunAnsiblePlaybook_SnapshotFailuresFailTheJob(t *testing.T) {
 	}
 }
 
-// envValue returns the value exec would use for key (the last assignment wins) and how
-// many assignments of key the environment holds.
-func envValue(env []string, key string) (value string, count int) {
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, key+"="); ok {
-			value = v
-			count++
-		}
-	}
-	return value, count
-}
-
-func TestPrependAnsiblePath(t *testing.T) {
-	const (
-		staged = "/tmp/ansible-job-1/galaxy/collections"
-		local  = "/tmp/ansible-job-1/repo/collections"
-	)
-	tests := []struct {
-		name string
-		env  []string
-		key  string
-		dirs []string
-		want string
-	}{
-		{
-			name: "collections path set on the host is kept after the job's dirs",
-			env:  []string{"PATH=/usr/bin", "ANSIBLE_COLLECTIONS_PATH=/opt/site/collections:/srv/more"},
-			key:  "ANSIBLE_COLLECTIONS_PATH",
-			dirs: []string{staged, local},
-			want: staged + ":" + local + ":/opt/site/collections:/srv/more",
-		},
-		{
-			name: "unset collections path falls back to Ansible's defaults",
-			env:  []string{"PATH=/usr/bin"},
-			key:  "ANSIBLE_COLLECTIONS_PATH",
-			dirs: []string{staged, local},
-			want: staged + ":" + local + ":~/.ansible/collections:/usr/share/ansible/collections",
-		},
-		{
-			name: "empty collections path counts as unset",
-			env:  []string{"ANSIBLE_COLLECTIONS_PATH="},
-			key:  "ANSIBLE_COLLECTIONS_PATH",
-			dirs: []string{staged},
-			want: staged + ":~/.ansible/collections:/usr/share/ansible/collections",
-		},
-		{
-			name: "roles path set on the host is kept after the job's dirs",
-			env:  []string{"ANSIBLE_ROLES_PATH=/opt/site/roles"},
-			key:  "ANSIBLE_ROLES_PATH",
-			dirs: []string{"/job/galaxy/roles", "/job/repo/roles"},
-			want: "/job/galaxy/roles:/job/repo/roles:/opt/site/roles",
-		},
-		{
-			name: "unset roles path falls back to Ansible's defaults",
-			env:  nil,
-			key:  "ANSIBLE_ROLES_PATH",
-			dirs: []string{"/job/galaxy/roles", "/job/repo/roles"},
-			want: "/job/galaxy/roles:/job/repo/roles:~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles",
-		},
-		{
-			name: "the last assignment is the one in effect, and empty dirs are skipped",
-			env:  []string{"ANSIBLE_COLLECTIONS_PATH=/first", "HOME=/home/op", "ANSIBLE_COLLECTIONS_PATH=/second"},
-			key:  "ANSIBLE_COLLECTIONS_PATH",
-			dirs: []string{"", local},
-			want: local + ":/second",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := prependAnsiblePath(tt.env, tt.key, tt.dirs...)
-			value, count := envValue(got, tt.key)
-			if value != tt.want {
-				t.Errorf("%s = %q, want %q", tt.key, value, tt.want)
-			}
-			if count != 1 {
-				t.Errorf("%s is assigned %d times in the result, want exactly once", tt.key, count)
-			}
-			for _, kv := range tt.env {
-				if strings.HasPrefix(kv, tt.key+"=") {
-					continue
-				}
-				if !slices.Contains(got, kv) {
-					t.Errorf("unrelated variable %q was dropped", kv)
-				}
-			}
-		})
-	}
-}
-
 func TestLoadAgentConfig_GalaxyCacheDir(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -735,35 +646,6 @@ func TestRunAnsiblePlaybook_GalaxyKeepsPathsFromAnsibleCfg(t *testing.T) {
 	wantCollections := filepath.Join(workDir, "galaxy", "collections") + ":" + filepath.Join(repo, "collections") + ":" + filepath.Join(repo, "vendor", "collections")
 	if got, _ := envValue(env, "ANSIBLE_COLLECTIONS_PATH"); got != wantCollections {
 		t.Errorf("ANSIBLE_COLLECTIONS_PATH = %q, want %q", got, wantCollections)
-	}
-}
-
-func TestAnsibleCfgSearchPath(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, dir, "first/ansible.cfg", "# comment\n[galaxy]\nroles_path = /wrong/section\n\n[defaults]\n; another comment\nroles_path = vendor/roles:~/shared:/abs/roles\ncollections_paths: legacy/collections\n")
-	writeFile(t, dir, "second/ansible.cfg", "[defaults]\nroles_path = /from/second\n")
-	first := filepath.Join(dir, "first", "ansible.cfg")
-	second := filepath.Join(dir, "second", "ansible.cfg")
-	missing := filepath.Join(dir, "missing", "ansible.cfg")
-
-	tests := []struct {
-		name       string
-		candidates []string
-		keys       []string
-		want       string
-	}{
-		{"relative entries resolve against the file, home and absolute ones are kept", []string{first}, []string{"roles_path"}, filepath.Join(dir, "first", "vendor", "roles") + ":~/shared:/abs/roles"},
-		{"the deprecated alias is honoured", []string{first}, []string{"collections_path", "collections_paths"}, filepath.Join(dir, "first", "legacy", "collections")},
-		{"only the first existing file counts, as in Ansible", []string{missing, second, first}, []string{"roles_path"}, "/from/second"},
-		{"a key the file does not set", []string{second}, []string{"collections_path", "collections_paths"}, ""},
-		{"no file at all", []string{missing}, []string{"roles_path"}, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := ansibleCfgSearchPath(tt.candidates, tt.keys...); got != tt.want {
-				t.Errorf("ansibleCfgSearchPath() = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }
 

@@ -659,8 +659,9 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	if galaxyErr != nil {
 		logger.Warnf("Failed to install Galaxy requirements: %v", galaxyErr)
 	}
-	// Staged means the repository has a requirements file and its install succeeded.
-	galaxyStaged := galaxyErr == nil && findGalaxyRequirements(repoDir) != ""
+	// Staged means the repository has a requirements file and its install succeeded: the
+	// helper returns directories only then.
+	galaxyStaged := galaxyCollections != ""
 	// A job cancelled while it was being prepared never reaches the play.
 	if jobCtx.Err() != nil {
 		return "canceled", ""
@@ -883,19 +884,10 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING="+ansibleHostKeyCheckingValue()) // AUD-116: operator-overridable
 	cmd.Env = append(cmd.Env, "ANSIBLE_RETRY_FILES_ENABLED=false")
 	// Only when Galaxy staged an install for this job: put it, and the playbook-local
-	// directories, in front of the search paths already in effect. Prepended, not
-	// substituted, so collections an operator installed on the agent host by hand stay
-	// visible. A job with nothing staged leaves both variables alone, because an
-	// environment variable beats ansible.cfg and would override a roles_path or
-	// collections_path the repository configures there.
+	// directories, in front of the search paths already in effect. A job with nothing
+	// staged leaves both variables alone, so ansible.cfg stays in charge of them.
 	if galaxyStaged {
-		cfgFiles := ansibleCfgCandidates(filepath.Join(workDir, "ansible.cfg"), ansibleWorkDir)
-		cmd.Env = prependAnsiblePath(
-			withConfiguredAnsiblePath(cmd.Env, "ANSIBLE_COLLECTIONS_PATH", ansibleCfgSearchPath(cfgFiles, "collections_path", "collections_paths")),
-			"ANSIBLE_COLLECTIONS_PATH", galaxyCollections, filepath.Join(ansibleWorkDir, "collections"))
-		cmd.Env = prependAnsiblePath(
-			withConfiguredAnsiblePath(cmd.Env, "ANSIBLE_ROLES_PATH", ansibleCfgSearchPath(cfgFiles, "roles_path")),
-			"ANSIBLE_ROLES_PATH", galaxyRoles, filepath.Join(ansibleWorkDir, "roles"))
+		cmd.Env = withJobSearchPaths(cmd.Env, ansibleWorkDir, galaxyCollections, galaxyRoles)
 	}
 
 	// Capture output
@@ -963,60 +955,6 @@ func (a *AgentRunner) galaxyProjectCache(workDir, projectID string) string {
 		return filepath.Join(workDir, "galaxy-cache")
 	}
 	return filepath.Join(a.config.GalaxyCacheDir, id.String())
-}
-
-// ansibleDefaultPaths are Ansible's own defaults for the search paths the agent
-// extends. They are spelled out because setting the variable replaces the default.
-var ansibleDefaultPaths = map[string]string{
-	"ANSIBLE_COLLECTIONS_PATH": "~/.ansible/collections:/usr/share/ansible/collections",
-	"ANSIBLE_ROLES_PATH":       "~/.ansible/roles:/usr/share/ansible/roles:/etc/ansible/roles",
-}
-
-// withConfiguredAnsiblePath returns env with the search-path variable name set to
-// configured, the value the effective ansible.cfg gives it, unless env already sets the
-// variable (the environment wins over the file in Ansible) or the file does not
-// configure it. It lets prependAnsiblePath keep what ansible.cfg asked for.
-func withConfiguredAnsiblePath(env []string, name, configured string) []string {
-	if configured == "" {
-		return env
-	}
-	prefix := name + "="
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, prefix); ok && v != "" {
-			return env
-		}
-	}
-	return append(env, prefix+configured)
-}
-
-// prependAnsiblePath returns env with the Ansible search-path variable name set to dirs
-// followed by what was in effect before: the variable's current value in env, or
-// Ansible's default when it is unset or empty. Empty dirs are skipped.
-func prependAnsiblePath(env []string, name string, dirs ...string) []string {
-	prefix := name + "="
-	current := ""
-	rest := make([]string, 0, len(env)+1)
-	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, prefix); ok {
-			current = v // exec uses the last assignment, so it is the one in effect
-			continue
-		}
-		rest = append(rest, kv)
-	}
-	if current == "" {
-		current = ansibleDefaultPaths[name]
-	}
-
-	parts := make([]string, 0, len(dirs)+1)
-	for _, dir := range dirs {
-		if dir != "" {
-			parts = append(parts, dir)
-		}
-	}
-	if current != "" {
-		parts = append(parts, current)
-	}
-	return append(rest, prefix+strings.Join(parts, string(os.PathListSeparator)))
 }
 
 // maxPlaybookSnapshotBytes caps a snapshot download. A snapshot is at most a whole

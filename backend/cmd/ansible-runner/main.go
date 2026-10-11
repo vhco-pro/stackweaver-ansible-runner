@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1179,6 +1180,9 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		// Log warning but don't fail the job
 		logger.Warnf("Failed to install Galaxy requirements: %v", err)
 	}
+	// Staged means the repository has a requirements file and its install succeeded: the
+	// helper returns directories only then.
+	galaxyStaged := galaxyCollections != ""
 
 	// Get the machine credential early so we can inject a password into the
 	// inventory if needed. The job's set holds at most one credential of that
@@ -1295,21 +1299,6 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 		envVars["ANSIBLE_SSH_ARGS"] = "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPersist=60s"
 	}
 
-	// Point collection/role lookups at this job's installed Galaxy cache plus the
-	// playbook-local directories.
-	playbookCollections := filepath.Join(workDir, "collections")
-	playbookRoles := filepath.Join(workDir, "roles")
-	if galaxyCollections != "" {
-		envVars["ANSIBLE_COLLECTIONS_PATH"] = galaxyCollections + ":" + playbookCollections
-	} else {
-		envVars["ANSIBLE_COLLECTIONS_PATH"] = playbookCollections
-	}
-	if galaxyRoles != "" {
-		envVars["ANSIBLE_ROLES_PATH"] = galaxyRoles + ":" + playbookRoles
-	} else {
-		envVars["ANSIBLE_ROLES_PATH"] = playbookRoles
-	}
-
 	// Prepare ansible.cfg from stored configuration (project > org priority)
 	if err := r.prepareAnsibleConfig(ctx, workDir, job); err != nil {
 		// Log warning but don't fail - ansible will use defaults
@@ -1318,7 +1307,37 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 
 	// Execute ansible-playbook from the directory containing the playbook
 	// This ensures Ansible can find relative paths to roles, group_vars, etc.
-	return r.runAnsiblePlaybook(ctx, job, workDir, args, envVars)
+	// The environment is assembled last, after ansible.cfg is in place, because the
+	// search paths of a job with a staged Galaxy install keep what that file configures.
+	env := playbookEnv(os.Environ(), envVars, workDir, galaxyStaged, galaxyCollections, galaxyRoles)
+	return r.runAnsiblePlaybook(ctx, job, workDir, args, env)
+}
+
+// playbookEnv is the environment a platform-runner job runs ansible-playbook with: the
+// runner's own environment, the output and host-key settings every job gets, then the
+// job's variables (credentials, plus ANSIBLE_HOME, HOME and the ssh settings executeJob
+// points at the per-job workspace), which win over an inherited value because exec
+// uses the last assignment.
+//
+// The collection and role search paths are set only when Galaxy staged an install for
+// the job, and then by the function the self-hosted agent uses, so both runners resolve
+// collections and roles the same way. A job with nothing staged runs with the two
+// variables exactly as the runner's environment and ansible.cfg define them.
+func playbookEnv(base []string, jobVars map[string]string, workDir string, galaxyStaged bool, galaxyCollections, galaxyRoles string) []string {
+	env := append(slices.Clone(base),
+		// JSONL callback for streaming output (events as they happen)
+		"ANSIBLE_STDOUT_CALLBACK=ansible.posix.jsonl",
+		"ANSIBLE_LOAD_CALLBACK_PLUGINS=true",
+		"ANSIBLE_HOST_KEY_CHECKING="+ansibleHostKeyCheckingValue(), // AUD-116: operator-overridable
+		"ANSIBLE_RETRY_FILES_ENABLED=false",
+	)
+	for k, v := range jobVars {
+		env = append(env, k+"="+v)
+	}
+	if galaxyStaged {
+		env = withJobSearchPaths(env, workDir, galaxyCollections, galaxyRoles)
+	}
+	return env
 }
 
 func (r *AnsibleRunner) preparePlaybook(ctx context.Context, jobDir string, playbook *models.AnsiblePlaybook, cloneURL, branch string) (string, error) {
@@ -1795,7 +1814,7 @@ func (r *AnsibleRunner) buildAnsibleArgs(job *models.AnsibleJob, playbook *model
 	return args, workingDir
 }
 
-func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.AnsibleJob, workDir string, args []string, envVars map[string]string) error {
+func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.AnsibleJob, workDir string, args []string, env []string) error {
 	// AUD-118: per-job cancellable context so a mid-run API cancel actually stops the playbook.
 	// The parent ctx is the long-lived worker context (shutdown-scoped only), so previously a
 	// cancel was checked once before execution and never honored during the run - the playbook ran
@@ -1852,24 +1871,10 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 
 	cmd := exec.CommandContext(ctx, ansibleBin, args...) //nolint:gosec // intentional: executing ansible command
 	cmd.Dir = workDir
-
-	// Set up environment
-	cmd.Env = os.Environ()
-
-	// Use JSONL callback for streaming output (events as they happen)
-	cmd.Env = append(cmd.Env, "ANSIBLE_STDOUT_CALLBACK=ansible.posix.jsonl")
-	cmd.Env = append(cmd.Env, "ANSIBLE_LOAD_CALLBACK_PLUGINS=true")
-	cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING="+ansibleHostKeyCheckingValue()) // AUD-116: operator-overridable
-	cmd.Env = append(cmd.Env, "ANSIBLE_RETRY_FILES_ENABLED=false")
-
-	// ANSIBLE_HOME, ANSIBLE_SSH_CONTROL_PATH_DIR and the collection/role paths are
-	// supplied via envVars (set in executeJob) so they reference the per-job
-	// workspace under the read-only root filesystem.
-
-	// Add credential and runtime environment variables
-	for k, v := range envVars {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	// The whole environment comes from executeJob (see playbookEnv), so everything in it
+	// that names a path references the per-job workspace under the read-only root
+	// filesystem.
+	cmd.Env = env
 
 	// Create pipes for stdout/stderr
 	stdout, err := cmd.StdoutPipe()

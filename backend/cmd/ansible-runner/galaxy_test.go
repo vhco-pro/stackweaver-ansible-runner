@@ -143,6 +143,11 @@ func TestInstallGalaxyRequirements_SearchOrder(t *testing.T) {
 	}
 }
 
+// A repository without a requirements file stages nothing, and the helper says so with
+// empty directories. This test asserted the project's warm cache paths before: with one
+// search path rule for both runners, nothing reads the warm cache for a job that declared
+// no requirements, so the helper reports what it staged and nothing else. Empty is also
+// how both runners tell that there is nothing to put on the search path.
 func TestInstallGalaxyRequirements_NoFile(t *testing.T) {
 	stub := newGalaxyStub(t)
 	sink := &recordingSink{}
@@ -153,11 +158,11 @@ func TestInstallGalaxyRequirements_NoFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("installGalaxyRequirements() error = %v", err)
 	}
-	if want := filepath.Join(cacheBase, "collections"); collections != want {
-		t.Errorf("collections dir = %q, want the warm cache %q", collections, want)
+	if collections != "" {
+		t.Errorf("collections dir = %q, want empty: nothing was staged", collections)
 	}
-	if want := filepath.Join(cacheBase, "roles"); roles != want {
-		t.Errorf("roles dir = %q, want the warm cache %q", roles, want)
+	if roles != "" {
+		t.Errorf("roles dir = %q, want empty: nothing was staged", roles)
 	}
 	if len(sink.events) != 0 {
 		t.Errorf("events = %v, want none without a requirements file", sink.names())
