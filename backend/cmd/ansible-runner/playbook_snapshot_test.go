@@ -105,3 +105,49 @@ func TestBuildPlaybookSnapshot_RoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// Galaxy requirements are looked up in three places (findGalaxyRequirements). A lean snapshot
+// must carry all three, or a cached run skips an install a fresh run performs.
+func TestResolveSnapshotPaths_CarriesEveryGalaxyRequirementsLocation(t *testing.T) {
+	repo := t.TempDir()
+	writeFile(t, repo, "site.yml", "- hosts: all\n  roles:\n    - web\n")
+	writeFile(t, repo, "roles/web/tasks/main.yml", "- debug: msg=web\n")
+	writeFile(t, repo, "roles/db/tasks/main.yml", "- debug: msg=db\n") // unused role
+	writeFile(t, repo, "requirements.yml", "collections: []\n")
+	writeFile(t, repo, "collections/requirements.yml", "collections: []\n")
+	writeFile(t, repo, "roles/requirements.yml", "roles: []\n")
+	writeFile(t, repo, "playbooks/deploy.yml", "- hosts: all\n  roles:\n    - web\n")
+	writeFile(t, repo, "playbooks/roles/requirements.yml", "roles: []\n")
+
+	paths, whole := resolvePlaybookSnapshotPaths(repo, "site.yml")
+	if whole {
+		t.Fatalf("expected lean capture, got whole-repo fallback")
+	}
+	got := map[string]bool{}
+	for _, p := range paths {
+		got[p] = true
+	}
+	for _, want := range []string{"requirements.yml", "collections", "roles/requirements.yml"} {
+		if !got[want] {
+			t.Errorf("expected %q in snapshot paths, got %v", want, paths)
+		}
+	}
+	// Carrying the requirements file must not pull in the whole roles directory.
+	if got["roles"] || got["roles/db"] {
+		t.Errorf("roles/requirements.yml must not widen the snapshot to unused roles: %v", paths)
+	}
+
+	nested, whole := resolvePlaybookSnapshotPaths(repo, "playbooks/deploy.yml")
+	if whole {
+		t.Fatalf("expected lean capture for the nested playbook, got whole-repo fallback")
+	}
+	found := false
+	for _, p := range nested {
+		if p == "playbooks/roles/requirements.yml" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected playbooks/roles/requirements.yml next to the playbook, got %v", nested)
+	}
+}

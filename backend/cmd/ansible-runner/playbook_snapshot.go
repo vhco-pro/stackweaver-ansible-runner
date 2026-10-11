@@ -113,10 +113,13 @@ func resolvePlaybookSnapshotPaths(repoDir, playbookPath string) (paths []string,
 	resolveRoleDirs(repoDir, playbookPath, roleNames, add)
 
 	// Conventional Ansible content, at the repo root and adjacent to the playbook.
+	// roles/requirements.yml is listed as a file: it is one of the three places
+	// findGalaxyRequirements looks, and the roles directory itself is never captured whole
+	// (only the roles the playbook references are).
 	conv := []string{
 		"group_vars", "host_vars", "files", "templates", "vars",
 		"library", "module_utils", "filter_plugins", "requirements.yml",
-		"ansible.cfg", "collections",
+		"ansible.cfg", "collections", "roles/requirements.yml",
 	}
 	pbDir := path.Dir(strings.TrimPrefix(filepath.ToSlash(playbookPath), "/"))
 	for _, c := range conv {
