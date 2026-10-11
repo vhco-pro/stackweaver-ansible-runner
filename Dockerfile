@@ -64,14 +64,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # Copy the pre-built venv from the python-deps stage
 COPY --from=python-deps /opt/ansible-deps/.venv /opt/ansible-deps/.venv
 
-# Make the venv active so ansible-galaxy and all ansible commands are found
+# Make the venv active so every ansible command is found. The collections a job loads are
+# the ones the ansible package in this venv bundles (site-packages/ansible_collections), so
+# the ansible version in pyproject.toml and uv.lock decides the collection set.
 ENV VIRTUAL_ENV=/opt/ansible-deps/.venv
 ENV PATH="/opt/ansible-deps/.venv/bin:$PATH"
-
-# Install Ansible Galaxy collections from pinned requirements
-WORKDIR /opt/ansible-deps
-COPY runner-images/ansible/requirements.yml ./
-RUN ansible-galaxy collection install -r requirements.yml
 
 # Copy the Go binary from the builder stage
 COPY --from=builder /app/ansible-runner /usr/local/bin/ansible-runner

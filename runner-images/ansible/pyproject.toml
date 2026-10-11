@@ -5,11 +5,12 @@ requires-python = ">=3.12"
 description = "Python dependencies for the Stackweaver Ansible runner image"
 
 dependencies = [
-    # Floor at 14.2 (bundles azure.azcollection 3.20.0, which adds the AZURE_TENANT_ID
-    # fallback + caller subscription_id merge for workload identity - see
-    # ansible-collections/azure#2274) and NO upper cap, so Renovate tracks the latest ansible.
-    # The bundled collection is what loads at runtime; the galaxy install in requirements.yml
-    # does not reliably override it, so the ansible package version is the real lever.
+    # The collections bundled with the ansible package are the ones every job loads: the image
+    # installs no collection of its own, so their versions are whatever this ansible release
+    # ships, and the version locked in uv.lock is the one lever for the image's collection set.
+    # Floor at 14.2 because it bundles azure.azcollection 3.20.0, which adds the AZURE_TENANT_ID
+    # fallback + caller subscription_id merge for workload identity
+    # (ansible-collections/azure#2274). NO upper cap, so Renovate tracks the latest ansible.
     "ansible>=14.2",
     "ansible-lint>=25.0",
     "jmespath>=1.0",
