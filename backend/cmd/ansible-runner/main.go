@@ -946,20 +946,14 @@ func (r *AnsibleRunner) buildConstructedInventory(ctx context.Context, inventory
 	}
 
 	tail.WriteString("Rebuilding constructed inventory from its input inventories\n$ ansible-inventory " + strings.Join(args, " ") + "\n\n")
-	cmd := exec.CommandContext(ctx, "ansible-inventory", args...) //nolint:gosec // intentional: executing ansible command
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	// Stream diagnostics into the live tail while the build runs.
-	cmd.Stderr = io.MultiWriter(&stderr, tail)
-	if err := cmd.Run(); err != nil {
-		res.Stderr = stderr.String()
-		return res, fmt.Errorf("ansible-inventory failed: %w\nstderr: %s", err, stderr.String())
-	}
-	res.Stderr = stderr.String()
-
-	var inventoryOutput map[string]interface{}
-	if err := json.Unmarshal(stdout.Bytes(), &inventoryOutput); err != nil {
-		return res, fmt.Errorf("failed to parse ansible-inventory output: %w", err)
+	// Diagnostics stream into the live tail while the build runs. The shared environment makes
+	// the engine fail when it cannot parse any one source: left at its default it skips an input
+	// it cannot read, or a constructed.yml the plugin rejects, and prints the rest, and the prune
+	// below would then remove every derived row the skipped source accounted for (#886).
+	inventoryOutput, stderr, err := ansible.RunAnsibleInventory(ctx, args, ansible.InventoryCommandEnv(os.Environ(), nil), tail)
+	res.Stderr = stderr
+	if err != nil {
+		return res, err
 	}
 
 	hostsDiscovered, err := ansible.ProcessInventoryOutputWithOptions(r.inventoryRepo, inventory.ID, inventoryOutput, ansible.SyncOptions{
