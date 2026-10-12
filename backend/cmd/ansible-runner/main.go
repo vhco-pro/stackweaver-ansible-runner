@@ -1001,7 +1001,10 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	if cloneURL != "" {
 		repoDir, err = r.cloneVCSRepoWithURL(ctx, syncDir, cloneURL, branch)
 	} else {
-		repoDir, err = r.cloneVCSRepoGeneric(ctx, syncDir, inventory.VCSConnectionID, inventory.VCSRepository, inventory.VCSBranch)
+		var repoURL string
+		if repoURL, err = r.inventoryCloneURL(ctx, inventory); err == nil {
+			repoDir, err = r.cloneVCSRepoWithURL(ctx, syncDir, repoURL, inventory.VCSBranch)
+		}
 	}
 	if err != nil {
 		return res, fmt.Errorf("failed to clone repository: %w", err)
@@ -1396,21 +1399,49 @@ func (r *AnsibleRunner) preparePlaybook(ctx context.Context, jobDir string, play
 }
 
 func (r *AnsibleRunner) cloneVCSRepo(ctx context.Context, targetDir string, playbook *models.AnsiblePlaybook) (string, error) {
-	return r.cloneVCSRepoGeneric(ctx, targetDir, playbook.VCSConnectionID, playbook.VCSRepository, playbook.VCSBranch)
+	repoURL, err := r.playbookCloneURL(ctx, playbook)
+	if err != nil {
+		return "", err
+	}
+	return r.cloneVCSRepoWithURL(ctx, targetDir, repoURL, playbook.VCSBranch)
 }
 
-func (r *AnsibleRunner) cloneVCSRepoGeneric(ctx context.Context, targetDir string, vcsConnectionID *uuid.UUID, repository, branch string) (string, error) {
-	if vcsConnectionID == nil {
-		return "", fmt.Errorf("VCS connection ID is required")
+// playbookCloneURL resolves the token-embedded clone URL of a playbook from the database, for
+// the case where the API did not send one. The connection is loaded within the playbook's
+// organization: a playbook row that names another organization's connection finds none, and the
+// sync or the job fails without a token being read.
+func (r *AnsibleRunner) playbookCloneURL(ctx context.Context, playbook *models.AnsiblePlaybook) (string, error) {
+	if playbook.VCSConnectionID == nil {
+		return "", errors.New("VCS connection ID is required")
 	}
-	if repository == "" {
-		return "", fmt.Errorf("VCS repository is required")
-	}
-
-	// Get VCS connection
-	vcsConn, err := r.vcsConnectionRepo.GetByID(*vcsConnectionID)
+	scope := r.vcsConnectionRepo.OrganizationScope().WithContext(ctx)
+	vcsConn, err := ansible.PlaybookVCSConnection(scope, playbook.ProjectID, *playbook.VCSConnectionID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get VCS connection: %w", err)
+		return "", fmt.Errorf("getting the playbook's VCS connection: %w", err)
+	}
+	return r.connectionCloneURL(ctx, vcsConn, playbook.VCSRepository)
+}
+
+// inventoryCloneURL is playbookCloneURL for a VCS inventory: the connection is loaded within the
+// inventory's organization, and an inventory row that names another organization's connection
+// fails its sync without a token being read.
+func (r *AnsibleRunner) inventoryCloneURL(ctx context.Context, inventory *models.AnsibleInventory) (string, error) {
+	if inventory.VCSConnectionID == nil {
+		return "", errors.New("VCS connection ID is required")
+	}
+	scope := r.vcsConnectionRepo.OrganizationScope().WithContext(ctx)
+	vcsConn, err := ansible.InventoryVCSConnection(scope, inventory.OrganizationID, *inventory.VCSConnectionID)
+	if err != nil {
+		return "", fmt.Errorf("getting the inventory's VCS connection: %w", err)
+	}
+	return r.connectionCloneURL(ctx, vcsConn, inventory.VCSRepository)
+}
+
+// connectionCloneURL builds a clone URL for the repository with a fresh token of the connection.
+// The caller has already established that the connection may be used for what is being cloned.
+func (r *AnsibleRunner) connectionCloneURL(ctx context.Context, vcsConn *models.VCSConnection, repository string) (string, error) {
+	if repository == "" {
+		return "", errors.New("VCS repository is required")
 	}
 
 	// Use provider registry to get a fresh token and build the clone URL
@@ -1431,9 +1462,7 @@ func (r *AnsibleRunner) cloneVCSRepoGeneric(ctx context.Context, targetDir strin
 		return "", fmt.Errorf("access token for %s VCS connection %s is expired and could not be refreshed; configure the %s OAuth credentials on this runner so it can refresh tokens", vcsConn.Provider, vcsConn.ID, vcsConn.Provider)
 	}
 
-	repoURL := provider.BuildCloneURL(vcsConn, token, repository)
-
-	return r.cloneVCSRepoWithURL(ctx, targetDir, repoURL, branch)
+	return provider.BuildCloneURL(vcsConn, token, repository), nil
 }
 
 // cloneVCSRepoWithURL clones using a pre-built, token-embedded clone URL. This is
