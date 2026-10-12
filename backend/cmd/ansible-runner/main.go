@@ -1182,9 +1182,9 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	// inventory if needed. The job's set holds at most one credential of that
 	// type, so the first match is the one.
 	var cred *models.AnsibleCredential
-	jobCredIDs, err := r.jobRepo.ListCredentialIDs(job.ID)
+	jobCredIDs, err := ansible.JobCredentialIDs(ctx, r.jobRepo, job.ID)
 	if err != nil {
-		return fmt.Errorf("failed to list credentials for job %s: %w", job.ID, err)
+		return fmt.Errorf("reading the job's credentials: %w", err)
 	}
 	for _, id := range jobCredIDs {
 		candidate, credErr := r.credentialService.GetDecryptedCredential(id)
@@ -1558,9 +1558,14 @@ func (r *AnsibleRunner) prepareCredentials(ctx context.Context, jobDir string, j
 	// (rather than the template's live set) is what makes a run reproducible:
 	// editing the template afterwards cannot change what an in-flight or
 	// relaunched job authenticates with.
-	credIDs, err := r.jobRepo.ListCredentialIDs(job.ID)
+	//
+	// JobCredentialIDs is the point-of-use check on that set: a job whose stored set names a
+	// credential outside the job's organization gets none of them, and fails here, before
+	// anything is decrypted. The self-hosted path makes the same call in the API
+	// (RunnerAgentHandler.GetJobArtifacts).
+	credIDs, err := ansible.JobCredentialIDs(ctx, r.jobRepo, job.ID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list credentials for job %s: %w", job.ID, err)
+		return nil, fmt.Errorf("reading the job's credentials: %w", err)
 	}
 
 	vaultCount := 0
