@@ -28,11 +28,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/michielvha/stackweaver/core/dbtest"
 	"github.com/michielvha/stackweaver/core/models"
 	"github.com/michielvha/stackweaver/core/repository"
 	"github.com/michielvha/stackweaver/core/services/ansible"
 	"github.com/michielvha/stackweaver/core/services/vcs"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -58,7 +58,7 @@ func setupCloneScope(t *testing.T) *cloneScopeFixture {
 	if dbURL == "" {
 		t.Skip("TEST_DATABASE_URL not set - skipping integration test")
 	}
-	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	db, err := dbtest.Open(t, dbURL, &gorm.Config{})
 	if err != nil {
 		t.Fatalf("connecting to the test database: %v", err)
 	}
