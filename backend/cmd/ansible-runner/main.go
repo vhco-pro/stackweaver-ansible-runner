@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1687,12 +1688,13 @@ func (r *AnsibleRunner) applyCredential(prep *preparedCredentials, cred *models.
 
 	case models.CredentialTypeGCP:
 		if cred.GCPServiceAccount != "" {
-			gcpCredsFile := filepath.Join(jobDir, "gcp_credentials.json")
-			if err := os.WriteFile(gcpCredsFile, []byte(cred.GCPServiceAccount), 0o600); err != nil {
-				return fmt.Errorf("failed to write GCP credentials: %w", err)
+			// The key goes into the job directory, which is removed when the job ends. The
+			// variables are the shared helper's, the same ones a self-hosted runner sets.
+			gcpEnv, err := ansible.GCPCredentialEnv(jobDir, cred.GCPServiceAccount)
+			if err != nil {
+				return err
 			}
-			envVars["GOOGLE_APPLICATION_CREDENTIALS"] = gcpCredsFile
-			envVars["GCP_AUTH_KIND"] = "serviceaccount"
+			maps.Copy(envVars, gcpEnv)
 		}
 
 	case models.CredentialTypeVMware:

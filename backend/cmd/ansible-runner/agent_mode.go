@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/michielvha/logger"
 	"github.com/michielvha/stackweaver/core/security/gitargs"
+	"github.com/michielvha/stackweaver/core/services/ansible"
 )
 
 // errJobClaimLost is returned by notifyJobStart when the server responds 409 -
@@ -393,8 +394,8 @@ type JobArtifacts struct {
 	Credential       *CredentialData        `json:"credential,omitempty"`
 	// Vaults carries every attached vault credential (multi-vault support).
 	Vaults []VaultData `json:"vaults,omitempty"`
-	// GCPServiceAccount is a decrypted service-account JSON to write to a file
-	// and expose via GOOGLE_APPLICATION_CREDENTIALS.
+	// GCPServiceAccount is a decrypted service-account JSON. The agent writes it to a file
+	// in the job's work directory and sets the variables ansible.GCPCredentialEnv returns.
 	GCPServiceAccount string         `json:"gcp_service_account,omitempty"`
 	JobConfig         *JobConfigData `json:"job_config,omitempty"`
 	// VCS is set only when this run has to clone: a fresh playbook, or a cached one
@@ -867,14 +868,17 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	if unlabeledVaultFile != "" {
 		cmd.Env = append(cmd.Env, "ANSIBLE_VAULT_PASSWORD_FILE="+unlabeledVaultFile)
 	}
-	// GCP service-account credentials are file-based.
+	// GCP service-account credentials are file-based: the key goes into the work directory,
+	// which is removed when the job ends, and the variables are the shared helper's, the same
+	// ones the platform runner sets. A key that cannot be written fails the job, because a play
+	// without it would run its Google tasks as whatever identity the runner's machine has.
 	if artifacts.GCPServiceAccount != "" {
-		gcpFile := filepath.Join(workDir, "gcp_credentials.json")
-		if werr := os.WriteFile(gcpFile, []byte(artifacts.GCPServiceAccount), 0o600); werr == nil {
-			cmd.Env = append(cmd.Env, "GOOGLE_APPLICATION_CREDENTIALS="+gcpFile)
-			cmd.Env = append(cmd.Env, "GCP_AUTH_KIND=serviceaccount")
-		} else {
-			logger.Warnf("Failed to write GCP credentials file: %v", werr)
+		gcpEnv, err := ansible.GCPCredentialEnv(workDir, artifacts.GCPServiceAccount)
+		if err != nil {
+			return "failed", "Failed to write GCP credentials: " + err.Error()
+		}
+		for k, v := range gcpEnv {
+			cmd.Env = append(cmd.Env, k+"="+v)
 		}
 	}
 	// Use JSONL callback for structured output (events as they happen)
