@@ -22,6 +22,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -233,6 +234,91 @@ INVENTORY
 	}
 }
 
+// seedDerivedHost adds a host to the constructed inventory the way an earlier build left it: a
+// row of that inventory with no dynamic source behind it.
+func (f *constructedFixture) seedDerivedHost(t *testing.T, name string) *models.AnsibleInventoryHost {
+	t.Helper()
+	host := &models.AnsibleInventoryHost{InventoryID: f.constructed.ID, Name: name, Enabled: true}
+	if err := f.runner.inventoryRepo.CreateHost(host); err != nil {
+		t.Fatalf("seeding host %s: %v", name, err)
+	}
+	return host
+}
+
+// A build that no longer derives a host or a group removes both (#909). The defect this was
+// written against: processSyncJob loaded the inventory with its hosts and groups, ran the build,
+// which deleted the rows the output no longer names, and then saved the struct it had loaded
+// before the build. GORM's Save upserts the loaded associations with it, so every row the build
+// had just deleted was written back; only the memberships, which are not on that struct, stayed
+// gone. A constructed inventory kept every host and group it had ever derived.
+func TestConstructedBuild_RowsNoLongerDerivedAreRemoved(t *testing.T) {
+	f := setupConstructedFixture(t)
+	// A second host an earlier build derived, which no input has any more.
+	staleHost := f.seedDerivedHost(t, "constructed-gone-"+uuid.NewString()[:8])
+	fakeAnsibleInventory(t, `#!/bin/sh
+cat <<'INVENTORY'
+`+f.inputsOnlyOutput()+`
+INVENTORY
+`)
+
+	f.rebuild(t)
+
+	if n := f.count(t, "ansible_inventory_groups", f.derivedGroup.ID); n != 0 {
+		t.Errorf("the group the rules no longer derive: %d rows, want 0", n)
+	}
+	if n := f.count(t, "ansible_inventory_hosts", staleHost.ID); n != 0 {
+		t.Errorf("the host no input has any more: %d rows, want 0", n)
+	}
+	if n := f.count(t, "ansible_inventory_hosts", f.derivedHost.ID); n != 1 {
+		t.Errorf("the host the input still has: %d rows, want 1", n)
+	}
+	if inventory := f.storedInventory(t); inventory.LastSyncStatus != "successful" {
+		t.Errorf("inventory last_sync_status = %q (%s), want %q", inventory.LastSyncStatus, inventory.LastSyncError, "successful")
+	}
+}
+
+// A constructed inventory is derived-only: its hosts and groups come from its build alone, as in
+// AWX (owner decision 2026-10-16, #909). This test used to record, without endorsing it, that a
+// group a person added by hand was removed by the next rebuild, because nothing on a row says
+// whether a build derived it or a person added it (both have no source_id) and PruneUnseen
+// removes every row the output does not name. The decision settles it the other way round from
+// marking rows: a person cannot add one, so every row of a constructed inventory is the build's
+// and the build may replace them all.
+//
+// Two halves. The inventory service, which every API route goes through, refuses the hand-made
+// group with ErrConstructedInventory (the full list of refused writes is in
+// core/services/ansible/inventory_derived_only_test.go). A group added before the rule existed,
+// seeded here through the repository as such a row is stored, is removed by the next rebuild like
+// any row the build no longer derives. That second half is the accepted consequence of the
+// decision for inventories that already carry hand-made rows.
+func TestConstructedBuild_IsDerivedOnly(t *testing.T) {
+	f := setupConstructedFixture(t)
+
+	_, err := f.runner.inventoryService.CreateGroup(f.constructed.ID, "handmade-"+uuid.NewString()[:8], "added by a person", nil, nil)
+	if !errors.Is(err, ansible.ErrConstructedInventory) {
+		t.Fatalf("creating a group by hand in a constructed inventory: %v, want ErrConstructedInventory", err)
+	}
+
+	leftOver := &models.AnsibleInventoryGroup{InventoryID: f.constructed.ID, Name: "handmade-" + uuid.NewString()[:8], Description: "added by a person before the rule"}
+	if err := f.runner.inventoryRepo.CreateGroup(leftOver); err != nil {
+		t.Fatalf("seeding a group left over from before the rule: %v", err)
+	}
+	fakeAnsibleInventory(t, `#!/bin/sh
+cat <<'INVENTORY'
+`+f.inputsOnlyOutput()+`
+INVENTORY
+`)
+
+	f.rebuild(t)
+
+	if n := f.count(t, "ansible_inventory_groups", leftOver.ID); n != 0 {
+		t.Errorf("the group left over from before the rule: %d rows, want 0 (a rebuild replaces the whole set)", n)
+	}
+	if n := f.count(t, "ansible_inventory_hosts", f.derivedHost.ID); n != 1 {
+		t.Errorf("the host the input still has: %d rows, want 1", n)
+	}
+}
+
 func TestConstructedBuild_SuccessfulBuildStillReconciles(t *testing.T) {
 	f := setupConstructedFixture(t)
 	// Every source parsed, and the rules no longer place the host in a group: the same output as
@@ -245,11 +331,14 @@ INVENTORY
 
 	f.rebuild(t)
 
-	// Asserted on the membership and not on the group row: processSyncJob saves the inventory it
-	// loaded before the build, hosts and groups included, which writes a pruned group back as an
-	// empty one. That is a separate defect from the one this file is about.
+	// This used to be asserted on the membership alone, with a note that the group row came back
+	// empty because processSyncJob saved the inventory it had loaded before the build. That was
+	// #909; the outcome is now recorded on the status columns only, so the group row is gone too.
 	if n := f.memberships(t); n != 0 {
 		t.Errorf("the host's membership of the derived group: %d rows, want 0 (a build replaces the materialized set)", n)
+	}
+	if n := f.count(t, "ansible_inventory_groups", f.derivedGroup.ID); n != 0 {
+		t.Errorf("the derived group: %d rows, want 0 (the rules no longer derive it)", n)
 	}
 	if n := f.count(t, "ansible_inventory_hosts", f.derivedHost.ID); n != 1 {
 		t.Errorf("the derived host: %d rows, want 1 (the input still has it)", n)

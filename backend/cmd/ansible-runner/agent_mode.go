@@ -853,8 +853,10 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 	cmd := exec.CommandContext(runCtx, "ansible-playbook", args...)
 	cmd.Dir = ansibleWorkDir
 
-	// Set environment for ansible-playbook
-	cmd.Env = os.Environ()
+	// Set environment for ansible-playbook. It starts from what ansible.InheritedEnv admits of
+	// the agent's environment, never the whole of it: that holds the agent's runner token, and
+	// the play runs code its author controls.
+	cmd.Env = ansible.InheritedEnv()
 	cmd.Env = append(cmd.Env, "ANSIBLE_CONFIG="+workDir+"/ansible.cfg")
 	// Use credential username so Ansible does not fall back to process user (e.g. iac in Docker)
 	if artifacts.Credential != nil && artifacts.Credential.Username != "" {

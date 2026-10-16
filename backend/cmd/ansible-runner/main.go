@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +30,7 @@ import (
 	"github.com/michielvha/stackweaver/core/queue"
 	"github.com/michielvha/stackweaver/core/repository"
 	"github.com/michielvha/stackweaver/core/security/archive"
+	"github.com/michielvha/stackweaver/core/security/runenv"
 	"github.com/michielvha/stackweaver/core/services/ansible"
 	"github.com/michielvha/stackweaver/core/services/encryptionkey"
 	"github.com/michielvha/stackweaver/core/services/oidc"
@@ -67,6 +67,19 @@ func upsertEnv(env []string, key, val string) []string {
 		}
 	}
 	return append(env, prefix+val)
+}
+
+// inventorySyncEnv is the environment ansible-inventory parses a repository inventory with: what
+// ansible.InheritedEnv admits of the runner's environment (never the whole of it, which holds the
+// platform's secrets), Ansible's home isolated under the per-sync workspace, so it works under a
+// read-only root filesystem (it eagerly creates ~/.ansible/tmp on import), and the Azure
+// subscription when one was resolved.
+func inventorySyncEnv(syncDir, azureSubscription string) []string {
+	env := append(ansible.InheritedEnv(), "ANSIBLE_HOME="+filepath.Join(syncDir, ".ansible"))
+	if azureSubscription != "" {
+		env = upsertEnv(env, "AZURE_SUBSCRIPTION_ID", azureSubscription)
+	}
+	return env
 }
 
 // lookupOrgAzureSubscriptionID returns the subscription_id from the organization's
@@ -215,6 +228,13 @@ func main() {
 	// Initialize logger first (reads LOG_LEVEL from environment)
 	logLevel := os.Getenv("LOG_LEVEL")
 	logger.Init(logLevel)
+
+	// Runs execute as this process's user; without this they could read the runner's secrets
+	// (or an agent's token) from its /proc environ (#936). Both the queue and the agent path
+	// pass through here.
+	if err := runenv.DenySameUserInspection(); err != nil {
+		logger.Fatalf("Refusing to start: %v", err)
+	}
 
 	// Azure Workload Identity compatibility shim: the AKS webhook injects AZURE_TENANT_ID, and the
 	// image-bundled azure.azcollection >= 3.20.0 reads it natively (ansible-collections/azure#2274)
@@ -653,14 +673,14 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) err
 			result, err = r.syncInventory(ctx, inventory, inventoryMsg.CloneURL, inventoryMsg.Branch)
 		}
 
-		// Update sync status
-		now := time.Now()
-		inventory.LastSyncAt = &now
+		// Record the outcome on the inventory's status columns only. The struct loaded above
+		// carries the hosts and groups as they were before the run; saving it would insert again
+		// every row the run just removed (#909), so it is never written back.
+		outcome := repository.InventorySyncOutcome{FinishedAt: time.Now(), Log: result.Stderr} // stderr is kept on failure too
 
 		if err != nil {
-			inventory.LastSyncStatus = "failed"
-			inventory.LastSyncError = err.Error()
-			inventory.LastSyncLog = result.Stderr // preserve stderr even on failure
+			outcome.Status = "failed"
+			outcome.Error = err.Error()
 			logger.Infof("Inventory sync %s failed: %v", inventory.ID.String(), err)
 			if syncRun != nil {
 				if finishErr := r.syncRepo.Finish(syncRun.ID, models.InventorySyncStatusFailed, vcsSyncRunLog(inventory, result), err.Error(), 0, 0); finishErr != nil {
@@ -668,10 +688,8 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) err
 				}
 			}
 		} else {
-			inventory.LastSyncStatus = "successful"
-			inventory.LastSyncError = ""
-			inventory.LastSyncHostsDiscovered = result.HostsDiscovered
-			inventory.LastSyncLog = result.Stderr
+			outcome.Status = "successful"
+			outcome.HostsDiscovered = &result.HostsDiscovered
 			logger.Infof("Inventory sync %s completed successfully (hosts: %d)", inventory.ID.String(), result.HostsDiscovered)
 			if result.HostsDiscovered == 0 {
 				logger.Warnf("Inventory sync %s: 0 hosts discovered, check plugin configuration and authentication", inventory.ID.String())
@@ -683,8 +701,8 @@ func (r *AnsibleRunner) processSyncJob(ctx context.Context, syncData []byte) err
 			}
 		}
 
-		if updateErr := r.inventoryRepo.Update(inventory); updateErr != nil {
-			logger.Warnf("Failed to update inventory sync status: %v", updateErr)
+		if recordErr := r.inventoryRepo.RecordSyncOutcome(inventory.ID, outcome); recordErr != nil {
+			logger.Warnf("Failed to update inventory sync status: %v", recordErr)
 		}
 
 		return nil
@@ -951,7 +969,7 @@ func (r *AnsibleRunner) buildConstructedInventory(ctx context.Context, inventory
 	// the engine fail when it cannot parse any one source: left at its default it skips an input
 	// it cannot read, or a constructed.yml the plugin rejects, and prints the rest, and the prune
 	// below would then remove every derived row the skipped source accounted for (#886).
-	inventoryOutput, stderr, err := ansible.RunAnsibleInventory(ctx, args, ansible.InventoryCommandEnv(os.Environ(), nil), tail)
+	inventoryOutput, stderr, err := ansible.RunAnsibleInventory(ctx, args, ansible.InventoryCommandEnv(ansible.InheritedEnv(), nil), tail)
 	res.Stderr = stderr
 	if err != nil {
 		return res, err
@@ -1023,11 +1041,6 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	// webhook's projected token for Workload Identity (read natively by azure.azcollection >= 3.17.0)
 	// - decide how the azure_rm plugin authenticates. We never rewrite the user's azure_rm.yml.
 	cmdArgs := []string{"-i", inventoryFilePath, "--list"}
-	cmdEnv := os.Environ()
-	// Isolate Ansible's home under the per-sync workspace so ansible-inventory
-	// works under a read-only root filesystem (it eagerly creates ~/.ansible/tmp
-	// on import).
-	cmdEnv = append(cmdEnv, "ANSIBLE_HOME="+filepath.Join(syncDir, ".ansible"))
 
 	// Azure Workload Identity needs the subscription in AZURE_SUBSCRIPTION_ID (the azure_rm OIDC
 	// path doesn't read the inventory file's subscription_id there). Resolution order:
@@ -1040,12 +1053,9 @@ func (r *AnsibleRunner) syncInventory(ctx context.Context, inventory *models.Ans
 	if sub == "" {
 		sub = r.lookupOrgAzureSubscriptionID(inventory.OrganizationID)
 	}
-	if sub != "" {
-		cmdEnv = upsertEnv(cmdEnv, "AZURE_SUBSCRIPTION_ID", sub)
-	}
 
 	cmd := exec.CommandContext(ctx, "ansible-inventory", cmdArgs...) //nolint:gosec // intentional: executing ansible command
-	cmd.Env = cmdEnv
+	cmd.Env = inventorySyncEnv(syncDir, sub)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -1274,8 +1284,8 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	// read-only root filesystem, so the default HOME (/home/stackweaver) is not writable
 	// and ssh fails with "Could not create directory '/home/stackweaver/.ssh'
 	// (Read-only file system)". Point HOME at a writable per-job dir under /tmp.
-	// cmd.Env appends these after os.Environ(), and os/exec uses the last value
-	// for a duplicate key, so this overrides the inherited HOME.
+	// playbookEnv appends these after the inherited environment, and os/exec uses the
+	// last value for a duplicate key, so this overrides the inherited HOME.
 	sshHome := filepath.Join("/tmp", "ansible-home", job.ID.String())
 	if err := os.MkdirAll(sshHome, 0o700); err != nil {
 		return fmt.Errorf("failed to create ssh home directory: %w", err)
@@ -1307,12 +1317,13 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 	// This ensures Ansible can find relative paths to roles, group_vars, etc.
 	// The environment is assembled last, after ansible.cfg is in place, because the
 	// search paths of a job with a staged Galaxy install keep what that file configures.
-	env := playbookEnv(os.Environ(), envVars, workDir, galaxyStaged, galaxyCollections, galaxyRoles)
+	env := playbookEnv(envVars, workDir, galaxyStaged, galaxyCollections, galaxyRoles)
 	return r.runAnsiblePlaybook(ctx, job, workDir, args, env)
 }
 
-// playbookEnv is the environment a platform-runner job runs ansible-playbook with: the
-// runner's own environment, the output and host-key settings every job gets, then the
+// playbookEnv is the environment a platform-runner job runs ansible-playbook with: what
+// ansible.InheritedEnv admits of the runner's own environment (never the whole of it, which
+// holds the platform's secrets), the output and host-key settings every job gets, then the
 // job's variables (credentials, plus ANSIBLE_HOME, HOME and the ssh settings executeJob
 // points at the per-job workspace), which win over an inherited value because exec
 // uses the last assignment.
@@ -1321,8 +1332,8 @@ func (r *AnsibleRunner) executeJob(ctx context.Context, job *models.AnsibleJob, 
 // the job, and then by the function the self-hosted agent uses, so both runners resolve
 // collections and roles the same way. A job with nothing staged runs with the two
 // variables exactly as the runner's environment and ansible.cfg define them.
-func playbookEnv(base []string, jobVars map[string]string, workDir string, galaxyStaged bool, galaxyCollections, galaxyRoles string) []string {
-	env := append(slices.Clone(base),
+func playbookEnv(jobVars map[string]string, workDir string, galaxyStaged bool, galaxyCollections, galaxyRoles string) []string {
+	env := append(ansible.InheritedEnv(),
 		// JSONL callback for streaming output (events as they happen)
 		"ANSIBLE_STDOUT_CALLBACK=ansible.posix.jsonl",
 		"ANSIBLE_LOAD_CALLBACK_PLUGINS=true",

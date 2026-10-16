@@ -61,7 +61,7 @@ func TestApplyCredential_GCP(t *testing.T) {
 		t.Errorf("job variables = %v, want %v", prep.envVars, want)
 	}
 	// And they reach ansible-playbook: playbookEnv is what executeJob hands the command.
-	env := playbookEnv([]string{"PATH=/usr/bin"}, prep.envVars, jobDir, false, "", "")
+	env := playbookEnv(prep.envVars, jobDir, false, "", "")
 	for name, value := range want {
 		if !slices.Contains(env, name+"="+value) {
 			t.Errorf("ansible-playbook's environment lacks %s=%s", name, value)

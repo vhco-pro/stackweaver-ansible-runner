@@ -222,9 +222,9 @@ func (cp *fakeControlPlane) recorded() []jobEvent {
 }
 
 // jobStubs puts a fake ansible-playbook and git first on PATH. ansible-playbook records
-// its working directory, the playbook it was handed (path and content), its ANSIBLE_*
-// environment, its cloud credential variables and the file the GCP one names; git logs its
-// arguments and "clones" by creating a site.yml in the target.
+// its working directory, the playbook it was handed (path and content), its whole
+// environment, its ANSIBLE_* environment, its cloud credential variables and the file the
+// GCP one names; git logs its arguments and "clones" by creating a site.yml in the target.
 type jobStubs struct {
 	dir string
 }
@@ -235,6 +235,7 @@ for a in "$@"; do playbook="$a"; done
 pwd > "$rec/cwd"
 echo "$playbook" > "$rec/playbook_path"
 cat "$playbook" > "$rec/playbook_content"
+env | sort > "$rec/full_env"
 env | grep '^ANSIBLE_' | sort > "$rec/env"
 env | grep -E '^(AWS|AZURE|GCP|GOOGLE|VMWARE)_' | sort > "$rec/cloud_env"
 if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then cat "$GOOGLE_APPLICATION_CREDENTIALS" > "$rec/gcp_credentials"; fi
