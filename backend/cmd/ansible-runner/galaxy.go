@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/michielvha/logger"
+	"github.com/michielvha/stackweaver/core/services/ansible"
 )
 
 // Playbook preparation shared by the two execution paths of this binary: the platform
@@ -54,9 +55,10 @@ type galaxyInstallInput struct {
 	jobDir string
 	// playbookDir is the root of the prepared playbook repository.
 	playbookDir string
-	// env is extra environment for the ansible-galaxy commands, added to the process
-	// environment. The agent uses it to point ansible-galaxy at the job's ansible.cfg,
-	// which is where a private Galaxy server is configured.
+	// env is extra environment for the ansible-galaxy commands, added to what
+	// ansible.InheritedEnv admits of the runner's environment. The agent uses it to point
+	// ansible-galaxy at the job's ansible.cfg, which is where a private Galaxy server is
+	// configured.
 	env []string
 }
 
@@ -88,9 +90,9 @@ func (in galaxyInstallInput) galaxyCommand(ctx context.Context, args ...string) 
 	cmd := exec.CommandContext(ctx, "ansible-galaxy", args...) //nolint:gosec // intentional: executing ansible command
 	cmd.Dir = in.playbookDir
 	cmd.WaitDelay = galaxyKillGrace
-	if len(in.env) > 0 {
-		cmd.Env = append(os.Environ(), in.env...)
-	}
+	// Always set: a nil Env would hand ansible-galaxy, and the requirements it resolves, the
+	// runner's whole environment.
+	cmd.Env = append(ansible.InheritedEnv(), in.env...)
 	return cmd
 }
 
