@@ -16,7 +16,7 @@ permissions: {}
 jobs:
   analyze:
     if: ${{ github.event.repository.visibility == 'public' }}
-    uses: vhco-pro/.github/.github/workflows/reusable-codeql-go.yml@de04290ceb4232e4ec50b4873712d76b1bf48aa6 # v1.0.0
+    uses: vhco-pro/.github/.github/workflows/reusable-codeql-go.yml@2d2bc074b8c4c6d7648a0221102a88b61c7b70d7 # v1.2.1
     with:
       # Pin the exact Go release rather than "stable": actions/setup-go resolves
       # "stable" from its own versions-manifest, which lags a Go release by days.
