@@ -1716,11 +1716,6 @@ func (r *AnsibleRunner) applyCredential(prep *preparedCredentials, cred *models.
 		if cred.Password != "" {
 			envVars["VMWARE_PASSWORD"] = cred.Password
 		}
-	case models.CredentialTypeSCM:
-		// SCM credentials are used for repository access (Git, etc.)
-		// These are typically handled by the VCS connection, not here
-		// But if needed, we could set GIT_ASKPASS or similar
-		logger.Infof("SCM credential type detected - repository access should be handled via VCS connection")
 	}
 
 	return nil
