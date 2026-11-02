@@ -556,6 +556,10 @@ func (a *AgentRunner) downloadJobArtifacts(jobID string) (*JobArtifacts, error) 
 	return &artifacts, nil
 }
 
+// errJobGone is getJobStatus's answer for a job the API no longer has: deleted with its job
+// template, or by a playbook force delete.
+var errJobGone = errors.New("the job no longer exists")
+
 // getJobStatus fetches the job status from the API for cancellation polling.
 func (a *AgentRunner) getJobStatus(ctx context.Context, jobID string) (string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -570,6 +574,9 @@ func (a *AgentRunner) getJobStatus(ctx context.Context, jobID string) (string, e
 		return "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", errJobGone
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -928,8 +935,10 @@ func (a *AgentRunner) runAnsiblePlaybook(jobID string, artifacts *JobArtifacts) 
 var jobCancelPollInterval = 2 * time.Second
 
 // watchJobCancellation polls the job's status until ctx ends and calls cancel when the
-// job has been cancelled through the API. It returns when ctx is done, which the job
-// run guarantees by cancelling it on the way out.
+// job has been cancelled through the API, or no longer exists (deleted with its job
+// template, or by a playbook force delete). It returns when ctx is done, which the job
+// run guarantees by cancelling it on the way out. The platform runner does the same
+// against the database (watchPlatformJob).
 func (a *AgentRunner) watchJobCancellation(ctx context.Context, jobID string, cancel context.CancelFunc) {
 	ticker := time.NewTicker(jobCancelPollInterval)
 	defer ticker.Stop()
@@ -939,6 +948,11 @@ func (a *AgentRunner) watchJobCancellation(ctx context.Context, jobID string, ca
 			return
 		case <-ticker.C:
 			status, err := a.getJobStatus(ctx, jobID)
+			if errors.Is(err, errJobGone) {
+				logger.Infof("Job %s was deleted, stopping it", jobID)
+				cancel()
+				return
+			}
 			if err != nil {
 				continue
 			}

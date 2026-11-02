@@ -38,6 +38,7 @@ import (
 	"github.com/michielvha/stackweaver/core/storage"
 	vcsGitHub "github.com/michielvha/stackweaver/core/vcs/github"
 	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 )
 
 // parseAzureSubscriptionID extracts the top-level subscription_id from a cloned azure_rm.yml
@@ -562,6 +563,40 @@ func (r *AnsibleRunner) processJob(ctx context.Context, jobData []byte) error {
 	}
 
 	return nil
+}
+
+// platformJobPollInterval is how often a running job asks the database whether it was canceled or
+// deleted. A variable so tests can shorten it.
+var platformJobPollInterval = 2 * time.Second
+
+// watchPlatformJob polls the job until ctx ends and stops the run (cancel) once the job was
+// canceled through the API, or no longer exists: deleted with its job template, or by a playbook
+// force delete. Nobody is waiting for the play then, and its hosts must not keep changing. A
+// lookup that fails for another reason is transient: the run goes on and the next tick asks
+// again. The agent-mode runner does the same through the status endpoint (watchJobCancellation).
+func watchPlatformJob(ctx context.Context, jobID uuid.UUID, lookup func(uuid.UUID) (*models.AnsibleJob, error), cancel context.CancelFunc) {
+	ticker := time.NewTicker(platformJobPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			current, err := lookup(jobID)
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				logger.Infof("Job %s was deleted, stopping ansible-playbook", jobID)
+				cancel()
+				return
+			case err != nil:
+				continue
+			case current.Status == models.AnsibleJobStatusCanceled:
+				logger.Infof("Job %s canceled via API, stopping ansible-playbook", jobID)
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 // vcsSyncRunLog composes the sync-history log of a VCS file inventory sync:
@@ -1396,7 +1431,7 @@ func (r *AnsibleRunner) preparePlaybook(ctx context.Context, jobDir string, play
 	}
 
 	// No VCS connection - check if playbook content is stored in storage
-	storageKey := fmt.Sprintf("playbooks/%s/content.tar.gz", playbook.ID.String())
+	storageKey := models.PlaybookStoragePrefix(playbook.ID) + "content.tar.gz"
 	data, err := r.storageClient.Get(ctx, storageKey)
 	if err != nil {
 		// No stored content, create a simple playbook from path
@@ -1867,26 +1902,7 @@ func (r *AnsibleRunner) runAnsiblePlaybook(ctx context.Context, job *models.Ansi
 		runCtx, cancelTimeout = context.WithTimeout(runCtx, time.Duration(job.TimeoutSeconds)*time.Second)
 		defer cancelTimeout()
 	}
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			case <-ticker.C:
-				current, err := r.jobRepo.GetByID(job.ID)
-				if err != nil {
-					continue
-				}
-				if current.Status == models.AnsibleJobStatusCanceled {
-					logger.Infof("Job %s canceled via API, stopping ansible-playbook", job.ID.String())
-					cancelRun()
-					return
-				}
-			}
-		}
-	}()
+	go watchPlatformJob(runCtx, job.ID, r.jobRepo.GetByID, cancelRun)
 	ctx = runCtx
 
 	// Determine ansible-playbook binary
