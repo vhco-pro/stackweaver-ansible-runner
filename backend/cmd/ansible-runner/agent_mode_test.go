@@ -169,6 +169,7 @@ type fakeControlPlane struct {
 	snapshot       []byte
 	snapshotStatus int    // 0 means 200
 	jobStatus      string // what the status poll reports; "" means running
+	jobGone        bool   // the status poll answers 404, as for a job deleted with its template or playbook
 
 	events                []jobEvent
 	artifactsCapabilities string // X-Stackweaver-Runner-Capabilities of the last artifacts request
@@ -205,6 +206,10 @@ func (cp *fakeControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		cp.events = append(cp.events, jobEvent{Event: body.Event, Task: body.Task, Stdout: body.Stdout, Stderr: body.Stderr, Failed: body.Failed})
 	case strings.HasSuffix(r.URL.Path, "/status"):
+		if cp.jobGone {
+			http.Error(w, `{"errors":[{"status":"404","title":"Not Found"}]}`, http.StatusNotFound)
+			return
+		}
 		status := cp.jobStatus
 		if status == "" {
 			status = "running"
@@ -683,6 +688,40 @@ func TestRunAnsiblePlaybook_CancelledDuringGalaxyInstall(t *testing.T) {
 	}
 	if ran := stubs.read(t, "cwd"); ran != "" {
 		t.Errorf("ansible-playbook ran in %q, want a cancelled job not to reach the play", ran)
+	}
+}
+
+// A job deleted while it runs, with its job template or by a playbook force delete, is stopped
+// like a canceled one: the status poll answers 404, and the agent must not keep running a play
+// nobody can see any more.
+func TestRunAnsiblePlaybook_DeletedJobStops(t *testing.T) {
+	stubs := newJobStubs(t)
+	newGalaxyStub(t).hang(t)
+	old := jobCancelPollInterval
+	jobCancelPollInterval = 50 * time.Millisecond
+	t.Cleanup(func() { jobCancelPollInterval = old })
+
+	capturedAt := time.Now().UTC()
+	cp := &fakeControlPlane{
+		jobGone: true,
+		artifacts: map[string]any{
+			"playbook_path":   "site.yml",
+			"playbook_source": map[string]any{"mode": "cached", "commit": "abc1234", "captured_at": capturedAt},
+		},
+		snapshot: testSnapshot(t, map[string]string{"site.yml": "- hosts: all\n", "requirements.yml": "---\ncollections: []\n"}),
+	}
+
+	start := time.Now()
+	_, status, errMsg := runJob(t, cp)
+
+	if status != "canceled" {
+		t.Errorf("status = %q (%s), want canceled", status, errMsg)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Errorf("the deleted job held the agent for %s, want it stopped promptly", elapsed)
+	}
+	if ran := stubs.read(t, "cwd"); ran != "" {
+		t.Errorf("ansible-playbook ran in %q, want a deleted job not to reach the play", ran)
 	}
 }
 
