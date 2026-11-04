@@ -53,10 +53,11 @@ RUN uv export --frozen --group all --no-dev --no-emit-project --no-hashes \
 # ── Runtime stage ────────────────────────────────────────────────────
 FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
-# System packages required by Ansible modules / connections (upgrade first to pull security patches)
+# System packages required by Ansible modules / connections (upgrade first to pull security patches);
+# iptables and nftables are for the launcher's one-shot jobs-network firewall writer (#933, D5)
 # Remove pip/ensurepip from stdlib - uv handles package management, pip is a vulnerability surface
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-        openssh-client git sshpass ca-certificates \
+        openssh-client git sshpass ca-certificates iptables nftables \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /usr/local/lib/python3.14/ensurepip /usr/local/lib/python3.14/site-packages/pip* \
     && ln -sf /usr/local/bin/python3 /usr/bin/python3
@@ -80,6 +81,9 @@ COPY --from=builder /app/ansible-runner /usr/local/bin/ansible-runner
 # Create non-root user with UID 1001 to match the OpenTofu runner (shared volume). The UID, not
 # the name, is what matters there - it stayed 1001 across the iac -> stackweaver rename.
 RUN useradd -m -u 1001 stackweaver
+# A launcher's node-local, read-only cache copy (RUNNER_CACHE_DIR): owned by the image's user, so a
+# named volume mounted here starts out writable by an in-process launcher too.
+RUN mkdir -p /var/cache/stackweaver-launcher && chown stackweaver:stackweaver /var/cache/stackweaver-launcher
 USER stackweaver
 
 # Working directories
