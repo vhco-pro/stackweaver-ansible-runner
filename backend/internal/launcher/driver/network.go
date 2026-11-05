@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MetadataCIDRs are the cloud metadata ranges no job on a platform-identity pool may reach (D5):
@@ -585,6 +586,32 @@ func NFTablesScript(pol NetworkPolicy, subnets, gateways []string, podman bool) 
 	return b.String(), nil
 }
 
+// labelRole marks the driver's one-shot helper containers (a firewall writer), which are not jobs.
+const labelRole = "sh.stackweaver.role"
+
+// roleFirewall is the firewall writer's role.
+const roleFirewall = "firewall"
+
+// staleOneShotAge is how long a helper container may sit unstarted or ended before the next one
+// removes it: well past a create-to-remove cycle, so another launcher's writer is never touched.
+const staleOneShotAge = 10 * time.Minute
+
+// removeStaleOneShots removes helper containers carrying every label in selector that are not
+// running and were created more than olderThan ago: what a launcher that stopped between creating
+// and removing one left behind. Failures are ignored; the next writer tries again.
+func removeStaleOneShots(ctx context.Context, e *engine, selector map[string]string, olderThan time.Duration) {
+	found, err := e.list(ctx, selector)
+	if err != nil {
+		return
+	}
+	for _, c := range found {
+		if c.State == "running" || c.State == "restarting" || time.Since(time.Unix(c.Created, 0)) < olderThan {
+			continue
+		}
+		_ = e.remove(ctx, c.ID)
+	}
+}
+
 // runFirewall runs script in a one-shot container on the host network with NET_ADMIN: the only
 // privilege the driver uses, for rules, never for a job.
 func (d *Container) runFirewall(ctx context.Context, image, script string) error {
@@ -592,12 +619,14 @@ func (d *Container) runFirewall(ctx context.Context, image, script string) error
 		image = d.PlatformImage
 	}
 	e := d.engine()
+	// A writer whose launcher stopped before removing it stays behind as a created container.
+	removeStaleOneShots(ctx, e, map[string]string{LabelManaged: "true", labelRole: roleFirewall}, staleOneShotAge)
 	id, err := e.create(ctx, "", containerConfig{
 		Image:      image,
 		Entrypoint: []string{"/bin/sh", "-c"},
 		Cmd:        []string{script},
 		User:       "0",
-		Labels:     map[string]string{LabelManaged: "true", "sh.stackweaver.role": "firewall"},
+		Labels:     map[string]string{LabelManaged: "true", labelRole: roleFirewall},
 		HostConfig: hostConfigFirewall(),
 	})
 	if err != nil {

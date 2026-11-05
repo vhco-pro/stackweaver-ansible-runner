@@ -513,7 +513,7 @@ func (d *Container) List(ctx context.Context, selector map[string]string) ([]Pla
 	}
 	out := make([]Placement, 0, len(found))
 	for _, c := range found {
-		if c.Labels["sh.stackweaver.role"] != "" {
+		if c.Labels[labelRole] != "" {
 			continue // a firewall writer or executor copy, not a job
 		}
 		out = append(out, Placement{ID: c.ID, Labels: c.Labels, Ended: c.State != "running" && c.State != "created" && c.State != "restarting"})

@@ -332,7 +332,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return failed(fmt.Sprintf("Exit code %d: %s", exitErr.ExitCode(), stderr.String()))
+			return failed(exitFailure(exitErr.ExitCode(), stderr.String()))
 		}
 		return failed(err.Error())
 	}
@@ -564,4 +564,14 @@ func (w *streamWriter) send(ctx context.Context, line string) {
 	if err := w.client.Output(ctx, w.jobID, runnercontract.JobOutputRequest{Output: line, Stream: w.stream}); err != nil {
 		logger.Debugf("Failed to stream output of job %s: %v", w.jobID, err)
 	}
+}
+
+// exitFailure is the failure of an ansible-playbook that exited non-zero: its exit code, then what
+// it wrote to stderr when it wrote anything.
+func exitFailure(code int, stderr string) string {
+	msg := fmt.Sprintf("Exit code %d", code)
+	if s := strings.TrimSpace(stderr); s != "" {
+		msg += ": " + s
+	}
+	return msg
 }

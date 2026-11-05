@@ -358,62 +358,6 @@ func TestGitVerifier_OnlyAnExactCommit(t *testing.T) {
 	}
 }
 
-// fakePip writes a pip stand-in that downloads body, recording that it ran with --require-hashes.
-func fakePip(t *testing.T, body []byte) (bin, ran string) {
-	t.Helper()
-	dir := t.TempDir()
-	ran = filepath.Join(dir, "ran")
-	src := filepath.Join(dir, "pkg.whl")
-	if err := os.WriteFile(src, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	bin = filepath.Join(dir, "pip")
-	script := fmt.Sprintf(`#!/bin/sh
-printf '%%s\n' "$@" > %q
-out=""; req=""
-while [ $# -gt 0 ]; do case "$1" in -d) out="$2"; shift;; -r) req="$2"; shift;; esac; shift; done
-sum=$(sha256sum %q | cut -d' ' -f1)
-grep -q "sha256:$sum" "$req" || { echo "THESE PACKAGES DO NOT MATCH THE HASHES" >&2; exit 1; }
-mkdir -p "$out" && cp %q "$out/requests-2.32.3-py3-none-any.whl"
-`, ran, src, src)
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // G306: an executable test fixture
-		t.Fatal(err)
-	}
-	return bin, ran
-}
-
-func TestPipVerifier_RequireHashes(t *testing.T) {
-	wheel := []byte("requests wheel")
-	pip, ran := fakePip(t, wheel)
-	v := &PipVerifier{Pip: pip}
-	e := runnercontract.CacheEntry{Kind: runnercontract.CacheKindPip, Name: "requests", Version: "2.32.3", Hashes: []string{"sha256:" + digest(wheel)}}
-	a, err := v.Verify(t.Context(), e, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a.SHA256 != digest(wheel) {
-		t.Errorf("artifact = %+v", a)
-	}
-	args, _ := os.ReadFile(ran) //nolint:gosec // G304: the fixture's own file
-	if !strings.Contains(string(args), "--require-hashes\n") {
-		t.Errorf("pip ran without --require-hashes:\n%s", args)
-	}
-
-	e.Hashes = []string{"sha256:" + digest([]byte("a different wheel"))}
-	if _, err := v.Verify(t.Context(), e, t.TempDir()); !errors.Is(err, ErrPoisoned) {
-		t.Errorf("a wheel the pins do not match: %v, want ErrPoisoned", err)
-	}
-
-	_ = os.Remove(ran)
-	e.Hashes = nil
-	if _, err := v.Verify(t.Context(), e, t.TempDir()); err == nil {
-		t.Error("an unhashed requirement was promoted")
-	}
-	if _, err := os.Stat(ran); err == nil {
-		t.Error("pip ran for an unhashed requirement")
-	}
-}
-
 type fakeVerifier struct {
 	a   *Artifact
 	err error

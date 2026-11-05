@@ -375,6 +375,8 @@ type listed struct {
 	ID     string `json:"Id"`
 	Labels map[string]string
 	State  string
+	// Created is the container's creation time in Unix seconds.
+	Created int64
 }
 
 func (e *engine) list(ctx context.Context, labels map[string]string) ([]listed, error) {
