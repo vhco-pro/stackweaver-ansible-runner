@@ -114,7 +114,7 @@ func (l *Launcher) defaultVerifiers(m *runnercontract.Mirror) map[runnercontract
 		runnercontract.CacheKindCollection: &cache.CollectionVerifier{Servers: servers, HTTP: client},
 		runnercontract.CacheKindRole:       &cache.RoleVerifier{Servers: servers, HTTP: client},
 		runnercontract.CacheKindGit:        &cache.GitVerifier{},
-		runnercontract.CacheKindPip:        &cache.PipVerifier{IndexURL: m.PipIndexURL, TrustHost: m.PipTrustedHost},
+		runnercontract.CacheKindPip:        &cache.PipVerifier{IndexURL: m.PipIndexURL, TrustHost: m.PipTrustedHost, HTTP: client},
 	}
 }
 
