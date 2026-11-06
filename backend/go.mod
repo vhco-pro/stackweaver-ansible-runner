@@ -11,13 +11,13 @@ require (
 	github.com/hashicorp/go-tfe v1.112.0
 	github.com/hashicorp/hcl/v2 v2.25.0
 	github.com/michielvha/logger v0.0.5
-	github.com/michielvha/stackweaver/core v0.609.17
+	github.com/michielvha/stackweaver/core v0.609.27
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/zclconf/go-cty v1.19.0
 	github.com/zitadel/oidc/v3 v3.51.16
 	github.com/zitadel/zitadel-go/v3 v3.30.0
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.58.1-0.20261009181718-2f1f834330b2
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/sys v0.49.0
@@ -110,7 +110,7 @@ require (
 	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
 	golang.org/x/mod v0.42.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
