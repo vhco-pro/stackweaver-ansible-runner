@@ -15,8 +15,12 @@ import (
 	"time"
 )
 
+// stamp tells one build of the probe from another (-ldflags -X main.stamp=...): which job image an
+// injected executor was copied from.
+var stamp string
+
 func main() {
-	out := map[string]any{"args": os.Args[1:], "uid": os.Getuid()}
+	out := map[string]any{"args": os.Args[1:], "uid": os.Getuid(), "stamp": stamp}
 	if status, err := os.ReadFile("/proc/self/status"); err == nil {
 		for _, line := range strings.Split(string(status), "\n") {
 			for _, k := range []string{"CapEff", "NoNewPrivs", "Seccomp"} {

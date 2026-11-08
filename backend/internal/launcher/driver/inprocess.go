@@ -39,18 +39,19 @@ type Invocation struct {
 // ends.
 type ExecutorFunc func(ctx context.Context, inv Invocation) int
 
-// ErrImageRefused is returned by the in-process driver for a job whose resolved image is not the
-// platform image (AC30): the job would run on the launcher host's own toolchain, not the image it
-// asked for.
-var ErrImageRefused = errors.New("the in-process driver runs the platform image only")
+// ErrImageRefused is returned by the in-process driver for a job whose resolved image is not its
+// engine's job image (AC30): the job would run on the launcher host's own toolchain, not the image
+// it asked for.
+var ErrImageRefused = errors.New("the in-process driver runs each engine's job image only")
 
 // InProcess runs the executor in the launcher's own process (D4): no isolation beyond the
 // executor's allowlisted environment and the non-dumpable launcher, so it is for customer pools
 // that choose it and dev slots, never a hosted launcher under hosted.strict.
 type InProcess struct {
-	// PlatformImage is the image this launcher's toolchain is: a job resolved to it, or to no image,
-	// runs here; any other is refused.
-	PlatformImage string
+	// JobImages maps each engine to the job image this launcher's toolchain stands for: a job
+	// resolved to its own engine's job image, or to no image, runs here; any other is refused
+	// (one-launcher spec, A3).
+	JobImages map[string]string
 	// Executors maps an engine ("tofu", "ansible") to the executor that runs its jobs.
 	Executors map[string]ExecutorFunc
 
@@ -76,8 +77,8 @@ func (d *InProcess) Ping(context.Context) error { return nil }
 
 // Place starts the executor for req's engine on a goroutine.
 func (d *InProcess) Place(ctx context.Context, req Request) (Placement, error) {
-	if req.Image != "" && req.Image != d.PlatformImage {
-		return Placement{}, fmt.Errorf("%w: the job resolved the image %s, and this pool's launcher runs %s; use a container or Kubernetes pool for a custom run image", ErrImageRefused, req.Image, d.platformImageName())
+	if req.Image != "" && req.Image != d.JobImages[req.Kind] {
+		return Placement{}, fmt.Errorf("%w: the job resolved the image %s, and this pool's launcher runs %s; use a container or Kubernetes pool for a custom run image", ErrImageRefused, req.Image, d.jobImageName(req.Kind))
 	}
 	run := d.Executors[req.Kind]
 	if run == nil {
@@ -113,11 +114,11 @@ func (d *InProcess) Place(ctx context.Context, req Request) (Placement, error) {
 	return p, nil
 }
 
-func (d *InProcess) platformImageName() string {
-	if d.PlatformImage == "" {
-		return "the platform image"
+func (d *InProcess) jobImageName(kind string) string {
+	if d.JobImages[kind] == "" {
+		return "the " + kind + " job image"
 	}
-	return d.PlatformImage
+	return d.JobImages[kind]
 }
 
 func (d *InProcess) job(p Placement) (*inprocessJob, error) {

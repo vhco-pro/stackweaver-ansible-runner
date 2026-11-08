@@ -5,8 +5,10 @@
 package driver
 
 import (
+	"context"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -18,7 +20,7 @@ import (
 func TestContainerTellsTheJobItsImageDigestAndNode(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 
 	res, _, exit := runProbe(t, d, Request{JobID: "digest-" + sfx, Attempt: 1, Kind: "tofu", Labels: map[string]string{LabelJob: "digest-" + sfx}})
 	if exit.Code != 0 {
@@ -32,7 +34,7 @@ func TestContainerTellsTheJobItsImageDigestAndNode(t *testing.T) {
 	if !names["STACKWEAVER_IMAGE_DIGEST"] || !names["STACKWEAVER_NODE_NAME"] {
 		t.Errorf("job environment %v lacks STACKWEAVER_IMAGE_DIGEST or STACKWEAVER_NODE_NAME", res.Env)
 	}
-	if digest, err := d.engine().imageDigest(t.Context(), d.PlatformImage); err != nil || !strings.HasPrefix(digest, "sha256:") {
+	if digest, err := d.engine().imageDigest(t.Context(), d.JobImages["tofu"]); err != nil || !strings.HasPrefix(digest, "sha256:") {
 		t.Errorf("image digest = %q, %v; want a sha256 digest", digest, err)
 	}
 }
@@ -46,7 +48,7 @@ func TestContainerJobCarriesNoComposeIdentity(t *testing.T) {
 	project := "swtestcompose" + sfx
 	d := newTestDriver(t, "sw-probe-compose-"+sfx+":1")
 	e := d.engine()
-	buildLabelledProbeImage(t, e, d.PlatformImage, "1001:1001", map[string]string{
+	buildLabelledProbeImage(t, e, d.JobImages["tofu"], "1001:1001", map[string]string{
 		LabelManaged:                 "true",
 		"com.docker.compose.project": project,
 		"com.docker.compose.service": "launcher",
@@ -84,6 +86,88 @@ func TestContainerJobCarriesNoComposeIdentity(t *testing.T) {
 			if c.ID == p.ID {
 				t.Errorf("a Compose lookup by %s finds the job container", filter)
 			}
+		}
+	}
+}
+
+// newEngineDriver is a container driver whose two engines have their own job images, each the
+// probe on Alpine stamped with its engine, so a test can tell which image a job's executor came
+// from. The driver's own ExecutorPath leads nowhere: the executor's command comes with each
+// request, as the launcher sends it per engine (one-launcher spec, A3).
+func newEngineDriver(t *testing.T, sfx string) *Container {
+	t.Helper()
+	d := &Container{Socket: testSocket(t), ExecutorPath: "/not-the-executor", JobImages: map[string]string{
+		"tofu":    "sw-probe-tofu-" + sfx + ":1",
+		"ansible": "sw-probe-ansible-" + sfx + ":1",
+	}}
+	for engine, image := range d.JobImages {
+		buildStampedProbeImage(t, d.engine(), "alpine:3.22", image, "1001:1001", engine, map[string]string{LabelManaged: "true"})
+	}
+	return d
+}
+
+// A job that names no run image runs in its engine's job image, started with the command the
+// launcher sends for that engine (one-launcher spec, A3, AC2).
+func TestContainerRunsEachEngineInItsJobImage(t *testing.T) {
+	sfx := uuid.NewString()[:8]
+	d := newEngineDriver(t, sfx)
+	for _, engine := range []string{"tofu", "ansible"} {
+		job := engine + "-" + sfx
+		res, p, exit := runProbe(t, d, Request{JobID: job, Attempt: 1, Kind: engine, Command: []string{"/probe", "executor"}, Labels: map[string]string{LabelJob: job}})
+		if exit.Code != 0 {
+			t.Fatalf("%s job exit = %+v", engine, exit)
+		}
+		if res.Stamp != engine {
+			t.Errorf("the %s job ran in the image stamped %q, want its own job image", engine, res.Stamp)
+		}
+		var st struct {
+			Config struct{ Image string }
+		}
+		if err := d.engine().do(t.Context(), http.MethodGet, "/containers/"+p.ID+"/json", nil, nil, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Config.Image != d.JobImages[engine] {
+			t.Errorf("the %s job's container runs %s, want %s", engine, st.Config.Image, d.JobImages[engine])
+		}
+		if !slices.Equal(res.Args, []string{"executor"}) {
+			t.Errorf("the %s job ran with %v, want the executor subcommand", engine, res.Args)
+		}
+	}
+}
+
+// A custom run image of either engine gets the executor injected from that engine's job image and
+// runs to completion as /stackweaver/stackweaver-executor, with the invocation the executor works
+// its engine out from (one-launcher spec, A1, A3, AC6, AC7).
+func TestContainerInjectsTheEnginesExecutorIntoACustomImage(t *testing.T) {
+	sfx := uuid.NewString()[:8]
+	d := newEngineDriver(t, sfx)
+	custom := "sw-probe-runimage-" + sfx + ":1"
+	buildStampedProbeImage(t, d.engine(), "scratch", custom, "1001:1001", "run-image", map[string]string{LabelManaged: "true"})
+	for _, tc := range []struct{ engine, runType string }{{"tofu", "plan"}, {"ansible", ""}} {
+		job := "inj-" + tc.engine + "-" + sfx
+		env := []string{"STACKWEAVER_JOB_ID=" + job}
+		if tc.runType != "" {
+			env = append(env, "STACKWEAVER_JOB_RUN_TYPE="+tc.runType)
+		}
+		res, p, exit := runProbe(t, d, Request{JobID: job, Attempt: 1, Kind: tc.engine, RunType: tc.runType, Image: custom, Env: env, Command: []string{"/probe", "executor"}, Labels: map[string]string{LabelJob: job}})
+		t.Cleanup(func() { _ = d.removeContainer(context.Background(), p.ID, p.Labels) })
+		if exit.Code != 0 {
+			t.Fatalf("the %s run image's job exit = %+v", tc.engine, exit)
+		}
+		if res.Stamp != tc.engine {
+			t.Errorf("the %s run image's executor came from the image stamped %q, want the %s job image", tc.engine, res.Stamp, tc.engine)
+		}
+		var st struct {
+			Config struct{ Entrypoint []string }
+		}
+		if err := d.engine().do(t.Context(), http.MethodGet, "/containers/"+p.ID+"/json", nil, nil, &st); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{ExecutorMountPath + "/stackweaver-executor"}; !slices.Equal(st.Config.Entrypoint, want) || !slices.Equal(res.Args, []string{"executor"}) {
+			t.Errorf("the %s job ran %v %v, want the injected executor %v with executor", tc.engine, st.Config.Entrypoint, res.Args, want)
+		}
+		if got := slices.Contains(res.Env, "STACKWEAVER_JOB_RUN_TYPE"); got != (tc.runType != "") {
+			t.Errorf("the %s job's invocation carries a run type: %v, want %v", tc.engine, got, tc.runType != "")
 		}
 	}
 }

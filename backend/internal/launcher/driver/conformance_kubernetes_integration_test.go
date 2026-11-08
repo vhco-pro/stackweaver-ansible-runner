@@ -83,7 +83,7 @@ func TestConformance_Kubernetes(t *testing.T) {
 	ns := conformanceNamespace(t, kctx)
 	token := kubectlOut(t, kctx, "-n", ns, "create", "token", conformanceSA, "--duration=1h")
 	client.Token = func() (string, error) { return token, nil }
-	d := &Kubernetes{Client: client, Namespace: ns, PlatformImage: tag, ExecutorPath: "/usr/local/bin/runner", PollInterval: 500 * time.Millisecond}
+	d := &Kubernetes{Client: client, Namespace: ns, JobImages: sameJobImage(tag), ExecutorPath: "/usr/local/bin/stackweaver-launcher", PollInterval: 500 * time.Millisecond}
 	if err := d.Ping(t.Context()); err != nil {
 		t.Fatalf("the launcher Role does not let the driver list the job namespace's pods: %v", err)
 	}

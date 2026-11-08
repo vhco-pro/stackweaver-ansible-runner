@@ -13,8 +13,9 @@ func envOf(m map[string]string) func(string) string { return func(k string) stri
 // The node-local cache is on by default, under the user's cache directory, bounded by
 // cache.local_size_limit; RUNNER_CACHE_DIR=off switches it off (#933, D7, decision 19).
 func TestConfigFromEnvCache(t *testing.T) {
+	stubToolchains(t, "tofu")
 	base := map[string]string{EnvServer: "http://api", EnvToken: "swa-x"}
-	cfg, err := ConfigFromEnv(Binary{Engine: "tofu"}, envOf(base))
+	cfg, err := ConfigFromEnv(bothExecutors(), envOf(base))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +27,7 @@ func TestConfigFromEnvCache(t *testing.T) {
 	for k, v := range base {
 		set[k] = v
 	}
-	cfg, err = ConfigFromEnv(Binary{Engine: "tofu"}, envOf(set))
+	cfg, err = ConfigFromEnv(bothExecutors(), envOf(set))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,12 +36,12 @@ func TestConfigFromEnvCache(t *testing.T) {
 	}
 
 	set[EnvCacheDir] = "off"
-	if cfg, _ = ConfigFromEnv(Binary{Engine: "tofu"}, envOf(set)); cfg.CacheDir != "" {
+	if cfg, _ = ConfigFromEnv(bothExecutors(), envOf(set)); cfg.CacheDir != "" {
 		t.Errorf("RUNNER_CACHE_DIR=off left %q", cfg.CacheDir)
 	}
 	set[EnvCacheDir] = "/x"
 	set[EnvCacheLimit] = "lots"
-	if _, err := ConfigFromEnv(Binary{Engine: "tofu"}, envOf(set)); err == nil {
+	if _, err := ConfigFromEnv(bothExecutors(), envOf(set)); err == nil {
 		t.Error("an unreadable size limit was accepted")
 	}
 }

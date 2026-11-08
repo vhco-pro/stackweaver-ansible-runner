@@ -47,7 +47,8 @@ func TestSingleRunsOneJobThenDeregisters(t *testing.T) {
 
 // --single on the command line or RUNNER_SINGLE in the environment.
 func TestSingleFromArgsOrEnv(t *testing.T) {
-	b := Binary{Engine: "tofu"}
+	stubToolchains(t, "tofu")
+	b := bothExecutors()
 	env := map[string]string{EnvServer: "https://api.test", EnvToken: "swa-agent", EnvPoolID: "pool-1"}
 	getenv := func(k string) string { return env[k] }
 	if cfg, err := ConfigFromEnv(b, getenv); err != nil || cfg.Single {

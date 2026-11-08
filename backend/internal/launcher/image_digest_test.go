@@ -5,6 +5,7 @@ package launcher
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/michielvha/stackweaver/backend/internal/launcher/driver"
 	"github.com/michielvha/stackweaver/core/runnercontract"
@@ -38,4 +39,27 @@ func TestSupervisionReportsTheImageDigestTheDriverLearns(t *testing.T) {
 		p := api.reported["run-digest"]
 		return p != nil && p.ImageDigest == digest
 	})
+}
+
+// A short job ends before the launcher's next status read; its digest is still reported while it
+// runs, because the digest is polled on its own, faster interval, not with the job's status (the
+// custom run image specs saw an empty digest for jobs of a few seconds).
+func TestTheImageDigestOfAShortJobIsReportedWhileItRuns(t *testing.T) {
+	const digest = "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	d := &digestDriver{fakeDriver: newFakeDriver("kubernetes"), digest: digest}
+	cfg := testConfig(api)
+	cfg.StatusInterval = time.Hour
+	l := New(cfg, d)
+	l.goos = "linux"
+	api.offer(runnercontract.PendingJob{JobID: "run-short", JobType: "tofu_run"})
+
+	runLauncher(t, l)
+	eventually(t, "the short job's digest reported while it runs", func() bool {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		p := api.reported["run-short"]
+		return p != nil && p.ImageDigest == digest
+	})
+	d.end("run-short", 0)
 }

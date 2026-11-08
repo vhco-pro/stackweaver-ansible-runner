@@ -128,8 +128,8 @@ func cacheMounted(cfg containerConfig) bool {
 func placeWithCache(t *testing.T, f *cacheEngine, c *CacheMount) containerConfig {
 	t.Helper()
 	e := f.serve(t)
-	d := &Container{Socket: e.socket, PlatformImage: "img", ExecutorPath: "/x"}
-	if _, err := d.Place(t.Context(), Request{JobID: "j", Attempt: 1, Cache: c}); err != nil {
+	d := &Container{Socket: e.socket, JobImages: sameJobImage("img"), ExecutorPath: "/x"}
+	if _, err := d.Place(t.Context(), Request{JobID: "j", Attempt: 1, Kind: "tofu", Cache: c}); err != nil {
 		t.Fatalf("Place: %v", err)
 	}
 	return f.last(t)

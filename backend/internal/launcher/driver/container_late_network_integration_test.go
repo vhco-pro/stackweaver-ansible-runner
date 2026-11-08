@@ -81,7 +81,7 @@ func lateNetwork(t *testing.T, backend firewallBackend) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-late-"+sfx+":1")
 	e := d.engine()
-	buildProbeImage(t, e, d.PlatformImage, "1001:1001")
+	buildProbeImage(t, e, d.JobImages["tofu"], "1001:1001")
 	tools := "sw-tools-" + sfx + ":1"
 	buildToolsImage(t, e, tools)
 	removeNet := func(name string) { _ = e.do(context.Background(), http.MethodDelete, "/networks/"+name, nil, nil, nil) }

@@ -48,7 +48,7 @@ func TestLimitsReport(t *testing.T) {
 // AC22).
 func TestContainerJobEnv(t *testing.T) {
 	req := Request{Env: []string{"A=1"}, Resources: Resources{CPULimit: "1"}}
-	env := (&Container{}).jobEnv(req, []string{"cpu=1"})
+	env := (&Container{}).jobEnv(req, []string{"cpu=1"}, nil)
 	if !slices.Contains(env, "STACKWEAVER_NETWORK_GUARD=1") {
 		t.Errorf("platform network: env %v lacks the network guard", env)
 	}
@@ -60,7 +60,7 @@ func TestContainerJobEnv(t *testing.T) {
 	if !slices.Contains(env, "A=1") || !slices.Contains(env, "STACKWEAVER_PLACED=1") {
 		t.Errorf("env %v lost the request's or the placement's variables", env)
 	}
-	hostEnv := (&Container{HostIdentity: true}).jobEnv(Request{}, nil)
+	hostEnv := (&Container{HostIdentity: true}).jobEnv(Request{}, nil, nil)
 	if slices.Contains(hostEnv, "STACKWEAVER_NETWORK_GUARD=1") {
 		t.Errorf("host-identity: env %v still carries the network guard", hostEnv)
 	}

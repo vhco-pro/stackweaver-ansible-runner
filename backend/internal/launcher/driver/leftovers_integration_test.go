@@ -286,7 +286,7 @@ func TestSweepRemovesWhatAnEndedRunLeftAndKeepsALiveRunsOwn(t *testing.T) {
 	sfx := strconv.FormatInt(time.Now().UnixNano(), 36)
 	d := newTestDriver(t, "sw-probe-sweep-"+sfx+":1")
 	e := d.engine()
-	buildLabelledProbeImage(t, e, d.PlatformImage, "1001:1001", map[string]string{LabelManaged: "true", labelTestRun: ended})
+	buildLabelledProbeImage(t, e, d.JobImages["tofu"], "1001:1001", map[string]string{LabelManaged: "true", labelTestRun: ended})
 
 	net := "sw-test-sweep-" + sfx
 	if err := e.createNetwork(t.Context(), net, map[string]string{LabelManaged: "true", labelTestRun: ended}, nil); err != nil {
@@ -300,7 +300,7 @@ func TestSweepRemovesWhatAnEndedRunLeftAndKeepsALiveRunsOwn(t *testing.T) {
 	t.Cleanup(func() { _ = e.removeVolume(context.Background(), vol) })
 	place := func(job, mark string) Placement {
 		t.Helper()
-		p, err := d.Place(t.Context(), Request{JobID: job + "-" + sfx, Attempt: 1, Env: []string{"PROBE_EXIT=1"}, Labels: map[string]string{labelTestRun: mark}})
+		p, err := d.Place(t.Context(), Request{JobID: job + "-" + sfx, Attempt: 1, Kind: "tofu", Env: []string{"PROBE_EXIT=1"}, Labels: map[string]string{labelTestRun: mark}})
 		if err != nil {
 			t.Fatalf("Place: %v", err)
 		}
@@ -316,7 +316,7 @@ func TestSweepRemovesWhatAnEndedRunLeftAndKeepsALiveRunsOwn(t *testing.T) {
 	// A live run's container that uses the ended run's image, volume and network: on Podman a forced
 	// removal of any of them removes the containers using it.
 	kept, err := e.create(t.Context(), "sw-test-kept-"+sfx, containerConfig{
-		Image: d.PlatformImage, Entrypoint: []string{"/probe"}, Labels: map[string]string{LabelManaged: "true", labelTestRun: live},
+		Image: d.JobImages["tofu"], Entrypoint: []string{"/probe"}, Labels: map[string]string{LabelManaged: "true", labelTestRun: live},
 		HostConfig: hostConfig{NetworkMode: net, Mounts: []mountSpec{{Type: "volume", Source: vol, Target: "/v"}}},
 	})
 	if err != nil {
@@ -339,7 +339,7 @@ func TestSweepRemovesWhatAnEndedRunLeftAndKeepsALiveRunsOwn(t *testing.T) {
 	if err := e.do(t.Context(), http.MethodGet, "/volumes/"+vol, nil, nil, nil); err != nil {
 		t.Errorf("the sweep removed a volume a live run's container uses: %v", err)
 	}
-	if !e.imageExists(t.Context(), d.PlatformImage) {
+	if !e.imageExists(t.Context(), d.JobImages["tofu"]) {
 		t.Errorf("the sweep removed an image a live run's container uses")
 	}
 
@@ -356,7 +356,7 @@ func TestSweepRemovesWhatAnEndedRunLeftAndKeepsALiveRunsOwn(t *testing.T) {
 	if err := e.do(t.Context(), http.MethodGet, "/volumes/"+vol, nil, nil, nil); !isNotFound(err) {
 		t.Errorf("an ended run's volume survived the sweep: %v", err)
 	}
-	if e.imageExists(t.Context(), d.PlatformImage) {
+	if e.imageExists(t.Context(), d.JobImages["tofu"]) {
 		t.Errorf("an ended run's image survived the sweep")
 	}
 }
@@ -371,7 +371,7 @@ func TestSweepRemovesAnEndedRunsJobsNetworkAndItsFirewall(t *testing.T) {
 	sfx := strconv.FormatInt(time.Now().UnixNano(), 36)
 	d := newTestDriver(t, "sw-probe-sweepnet-"+sfx+":1")
 	e := d.engine()
-	buildProbeImage(t, e, d.PlatformImage, "1001:1001")
+	buildProbeImage(t, e, d.JobImages["tofu"], "1001:1001")
 	endedTools, liveTools := "sw-tools-swept-"+sfx+":1", "sw-tools-kept-"+sfx+":1"
 	buildMarkedToolsImage(t, e, endedTools, ended)
 	buildToolsImage(t, e, liveTools)

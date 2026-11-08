@@ -432,8 +432,30 @@ func (e *engine) imageExists(ctx context.Context, ref string) bool {
 	return e.do(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, nil, io.Discard) == nil
 }
 
-// pull fetches an image; the engine streams progress, which is read to the end.
-func (e *engine) pull(ctx context.Context, ref string, auth *RegistryAuth) error {
+// errPullStalled is a pull that made no progress for its stall timeout: a registry that accepts
+// connections and never answers.
+var errPullStalled = errors.New("the pull made no progress")
+
+// pullBounded fetches an image, giving up with errPullStalled once the engine has sent nothing for
+// stall (zero waits as long as ctx allows). The bound is on progress, not on the whole pull, so a
+// large image on a slow link still arrives.
+func (e *engine) pullBounded(ctx context.Context, ref string, auth *RegistryAuth, stall time.Duration) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var watchdog *time.Timer
+	if stall > 0 {
+		watchdog = time.AfterFunc(stall, func() { cancel(fmt.Errorf("%w for %s", errPullStalled, stall)) })
+		defer watchdog.Stop()
+	}
+	err := e.doPull(ctx, ref, auth, watchdog, stall)
+	if cause := context.Cause(ctx); err != nil && errors.Is(cause, errPullStalled) {
+		return fmt.Errorf("pulling %s: %w", ref, cause)
+	}
+	return err
+}
+
+// doPull is one pull request, resetting watchdog to stall on every byte of progress.
+func (e *engine) doPull(ctx context.Context, ref string, auth *RegistryAuth, watchdog *time.Timer, stall time.Duration) error {
 	name, tag := splitImageRef(ref)
 	q := url.Values{"fromImage": {name}, "tag": {tag}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://engine/"+engineAPIVersion+"/images/create?"+q.Encode(), nil)
@@ -456,8 +478,12 @@ func (e *engine) pull(ctx context.Context, ref string, auth *RegistryAuth) error
 		return fmt.Errorf("pulling %s on %s: %w", ref, e.socket, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	var body io.Reader = resp.Body
+	if watchdog != nil {
+		body = &progressReader{r: resp.Body, progress: func() { watchdog.Reset(stall) }}
+	}
 	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		data, _ := io.ReadAll(io.LimitReader(body, 4096))
 		var msg struct {
 			Message string `json:"message"`
 		}
@@ -468,7 +494,56 @@ func (e *engine) pull(ctx context.Context, ref string, auth *RegistryAuth) error
 		return &APIError{Code: resp.StatusCode, Message: msg.Message}
 	}
 	// The engine answers 200 and reports a failed pull inside the progress stream.
-	return streamError(resp.Body)
+	return streamError(body)
+}
+
+// progressReader calls progress on every read that returns data.
+type progressReader struct {
+	r        io.Reader
+	progress func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.progress()
+	}
+	return n, err
+}
+
+// isTransportPullError reports whether a failed pull never reached an answering registry: a dial,
+// DNS or timeout failure, a stalled pull, or a registry 5xx (one-launcher spec, OD27). The engine
+// reports a pull's failure as its own error code or inside a 200 progress stream, and a registry
+// refusal (401, 403, 404) often arrives as an engine 500, so the cause is read from the text; a
+// refusal, or anything not positively identified as transport, is not one.
+func isTransportPullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errPullStalled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ae *APIError
+	if errors.As(err, &ae) && (ae.Code == http.StatusUnauthorized || ae.Code == http.StatusForbidden || ae.Code == http.StatusNotFound) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, refusal := range []string{"unauthorized", "authentication required", "no basic auth", "denied", "forbidden", "manifest unknown", "not found", "does not exist", "toomanyrequests", "invalid reference"} {
+		if strings.Contains(text, refusal) {
+			return false
+		}
+	}
+	for _, transport := range []string{
+		"connection refused", "no such host", "server misbehaving", "i/o timeout", "timeout awaiting", "handshake timeout",
+		"deadline exceeded", "connection reset", "network is unreachable", "no route to host", "eof",
+		"unexpected http status: 5", "status: 500", "status: 502", "status: 503", "status: 504",
+		"bad gateway", "service unavailable", "gateway timeout",
+	} {
+		if strings.Contains(text, transport) {
+			return true
+		}
+	}
+	return false
 }
 
 // splitImageRef splits a reference into the repository and the tag or digest the engine's create

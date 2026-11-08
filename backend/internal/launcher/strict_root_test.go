@@ -14,7 +14,7 @@ import (
 func TestStrictRefusesAllowRoot(t *testing.T) {
 	env := map[string]string{EnvDriver: "container", EnvAllowRoot: "true"}
 	getenv := func(k string) string { return env[k] }
-	_, err := DriverFromEnv(t.Context(), Binary{Engine: "tofu"}, Config{Image: "platform:1", Strict: true}, getenv)
+	_, err := DriverFromEnv(t.Context(), bothExecutors(), Config{Engines: []string{"tofu", "ansible"}, JobImages: map[string]string{"tofu": "platform:1", "ansible": "platform:1"}, Strict: true}, getenv)
 	if err == nil || !strings.Contains(err.Error(), "hosted.strict") {
 		t.Errorf("DriverFromEnv = %v, want RUNNER_ALLOW_ROOT refused under hosted.strict", err)
 	}
@@ -25,7 +25,7 @@ func TestStrictRefusesAllowRoot(t *testing.T) {
 func TestContainerDriverFollowsTheNetworkMode(t *testing.T) {
 	getenv := func(k string) string { return map[string]string{EnvDriver: "container"}[k] }
 	for mode, want := range map[string]bool{NetworkPlatform: false, NetworkHostIdentity: true} {
-		d, err := DriverFromEnv(t.Context(), Binary{Engine: "tofu"}, Config{Image: "platform:1", NetworkMode: mode}, getenv)
+		d, err := DriverFromEnv(t.Context(), bothExecutors(), Config{Engines: []string{"tofu", "ansible"}, JobImages: map[string]string{"tofu": "platform:1", "ansible": "platform:1"}, NetworkMode: mode}, getenv)
 		if err != nil {
 			t.Fatalf("%s: %v", mode, err)
 		}

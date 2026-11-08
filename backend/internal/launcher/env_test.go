@@ -65,3 +65,18 @@ func TestExecutorEnvCarriesThePassthroughList(t *testing.T) {
 		t.Error("a variable the list does not name reached the executor")
 	}
 }
+
+// A placed executor runs in its engine's job image, whose own PATH finds that engine's tools: the
+// launcher's PATH is the launcher's image's, and an OpenTofu launcher's would hide Ansible from an
+// Ansible job it places in the Ansible job image (one-launcher spec, A3).
+func TestExecutorEnvLeavesPathToTheJobImage(t *testing.T) {
+	env := ExecutorEnv([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/bin", "TZ=UTC"}, ExecutorInvocation{ServerURL: "https://api", JobID: "job-1"})
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PATH=") {
+			t.Errorf("the placed executor is handed the launcher's %s", kv)
+		}
+	}
+	if !slices.Contains(env, "TZ=UTC") {
+		t.Errorf("executor env = %v, want the rest of the base list kept", env)
+	}
+}

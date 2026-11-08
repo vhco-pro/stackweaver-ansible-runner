@@ -78,7 +78,7 @@ func newRecordingDriver(t *testing.T) (*recordingKube, *Kubernetes) {
 	t.Cleanup(srv.Close)
 	return r, &Kubernetes{
 		Client:    &k8s.Client{Server: srv.URL, HTTP: srv.Client(), Token: func() (string, error) { return "t", nil }},
-		Namespace: "jobs", PlatformImage: "runner:1", ExecutorPath: "/usr/local/bin/runner", PollInterval: 10 * time.Millisecond,
+		Namespace: "jobs", JobImages: sameJobImage("runner:1"), ExecutorPath: "/usr/local/bin/runner", PollInterval: 10 * time.Millisecond,
 	}
 }
 
@@ -229,7 +229,10 @@ func TestKubernetesExitOfReadsInitContainersAndUnreportedFailures(t *testing.T) 
 		reason string
 	}{
 		{"init refused", pod(k8s.PodStatus{Phase: "Pending", InitContainerStatuses: []k8s.ContainerStatus{{Name: "inject-executor", State: k8s.ContainerState{Waiting: &k8s.WaitingContainer{Reason: "CreateContainerConfigError", Message: "container has runAsNonRoot and image has non-numeric user (stackweaver), cannot verify user is non-root"}}}}}, false, now), true, "inject-executor"},
-		{"init image missing", pod(k8s.PodStatus{Phase: "Pending", InitContainerStatuses: []k8s.ContainerStatus{{Name: "inject-executor", State: k8s.ContainerState{Waiting: &k8s.WaitingContainer{Reason: "ImagePullBackOff", Message: "back-off pulling"}}}}}, false, now), true, "ImagePullBackOff"},
+		// A pull error ends the job only past the placement timeout (one-launcher spec, OD21): under
+		// always-pull a brief registry outage must not fail it. TestKubernetesPullErrorsWaitForThePlacementTimeout
+		// covers both sides; here the pod is past the timeout.
+		{"init image missing", pod(k8s.PodStatus{Phase: "Pending", InitContainerStatuses: []k8s.ContainerStatus{{Name: "inject-executor", State: k8s.ContainerState{Waiting: &k8s.WaitingContainer{Reason: "ImagePullBackOff", Message: "back-off pulling"}}}}}, false, now.Add(-DefaultPlacementTimeout-time.Minute)), true, "ImagePullBackOff"},
 		{"init failed", pod(k8s.PodStatus{Phase: "Failed", InitContainerStatuses: []k8s.ContainerStatus{{Name: "inject-executor", State: k8s.ContainerState{Terminated: &k8s.TerminatedState{ExitCode: 1, Reason: "Error", Message: "cp: can't create"}}}}}, false, now), true, "exit code 1"},
 		{"init starting", pod(k8s.PodStatus{Phase: "Pending", InitContainerStatuses: []k8s.ContainerStatus{{Name: "inject-executor", State: k8s.ContainerState{Waiting: &k8s.WaitingContainer{Reason: "PodInitializing"}}}}}, false, now), false, ""},
 		{"init done, executor running", pod(k8s.PodStatus{Phase: "Running", InitContainerStatuses: []k8s.ContainerStatus{{Name: "inject-executor", State: k8s.ContainerState{Terminated: &k8s.TerminatedState{ExitCode: 0, Reason: "Completed"}}}}, ContainerStatuses: []k8s.ContainerStatus{{Name: "executor", State: k8s.ContainerState{Running: &struct{}{}}}}}, false, now), false, ""},
@@ -239,7 +242,7 @@ func TestKubernetesExitOfReadsInitContainersAndUnreportedFailures(t *testing.T) 
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			exit, done := exitOf(c.pod)
+			exit, done := exitOf(c.pod, DefaultPlacementTimeout)
 			if done != c.done {
 				t.Fatalf("done = %t (%+v), want %t", done, exit, c.done)
 			}

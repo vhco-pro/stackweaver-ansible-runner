@@ -46,7 +46,9 @@ type fakeAPI struct {
 	drain        bool     // the heartbeat answers Drain, as after POST /runners/:id/actions/drain
 	reapRunners  []string // the heartbeat names these lost runners of the pool for reaping
 	heartbeats   int
-	srv          *httptest.Server
+	// onStart runs when a job is claimed (POST /start), before the claim is answered.
+	onStart func(job string)
+	srv     *httptest.Server
 }
 
 func newFakeAPI(t *testing.T, caps ...string) *fakeAPI {
@@ -146,6 +148,9 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(map[string]string{"status": "ok"})
 	case strings.HasSuffix(path, "/start"):
 		f.started = append(f.started, jobOf(path))
+		if f.onStart != nil {
+			f.onStart(jobOf(path))
+		}
 		var req runnercontract.JobStartRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if f.placements == nil {
@@ -241,9 +246,13 @@ func (d *fakeDriver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{SupportsReattach: d.reattach}
 }
 func (d *fakeDriver) Ping(context.Context) error { return d.pingErr }
-func (d *fakeDriver) Place(_ context.Context, req driver.Request) (driver.Placement, error) {
+func (d *fakeDriver) Place(ctx context.Context, req driver.Request) (driver.Placement, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// An engine or a cluster refuses a request whose context is done.
+	if err := ctx.Err(); err != nil {
+		return driver.Placement{}, err
+	}
 	if d.placeErr != nil {
 		return driver.Placement{}, d.placeErr
 	}
@@ -336,7 +345,7 @@ func (d *fakeDriver) placements() []driver.Request {
 func testConfig(f *fakeAPI) Config {
 	return Config{
 		ServerURL: f.srv.URL, RegistrationToken: "swa-agent", PoolID: "pool-1", Name: "launcher-test",
-		Engines: []string{"tofu", "ansible"}, Capacity: 2, Image: "platform:1",
+		Engines: []string{"tofu", "ansible"}, Capacity: 2, JobImages: map[string]string{"tofu": "platform:1", "ansible": "platform:1"},
 		HeartbeatWait: time.Second, IdleBeat: 20 * time.Millisecond, StatusInterval: 20 * time.Millisecond,
 		DrainGrace: 5 * time.Second, KillGrace: 100 * time.Millisecond,
 	}

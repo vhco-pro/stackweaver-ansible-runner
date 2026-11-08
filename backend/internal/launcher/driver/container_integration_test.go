@@ -19,6 +19,7 @@ package driver
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -64,9 +65,16 @@ func buildLabelledProbeImage(t *testing.T, e *engine, tag, user string, labels m
 // buildProbeImageFrom builds an image holding the static probe at /probe on base.
 func buildProbeImageFrom(t *testing.T, e *engine, base, tag, user string, labels map[string]string) {
 	t.Helper()
+	buildStampedProbeImage(t, e, base, tag, user, "", labels)
+}
+
+// buildStampedProbeImage builds the probe image with the probe reporting stamp, which tells the
+// images a test builds apart.
+func buildStampedProbeImage(t *testing.T, e *engine, base, tag, user, stamp string, labels map[string]string) {
+	t.Helper()
 	labels = withTestRun(labels)
 	bin := filepath.Join(t.TempDir(), "probe")
-	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, "./testdata/probe") //nolint:gosec // G204: the test builds its own fixture
+	build := exec.CommandContext(t.Context(), "go", "build", "-ldflags", "-X main.stamp="+stamp, "-o", bin, "./testdata/probe") //nolint:gosec // G204: the test builds its own fixture
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building the probe: %v: %s", err, out)
@@ -105,6 +113,7 @@ type probeResult struct {
 	CacheDir      string          `json:"cache_dir"`
 	CacheFiles    []string        `json:"cache_files"`
 	CacheWritable bool            `json:"cache_writable"`
+	Stamp         string          `json:"stamp"`
 }
 
 // buildToolsImage builds an image with a shell, busybox nc, iptables and nft: the firewall writer's
@@ -153,6 +162,8 @@ func hostListener(t *testing.T) string {
 func runProbe(t *testing.T, d *Container, req Request) (probeResult, Placement, Exit) {
 	t.Helper()
 	req.Labels = withTestRun(req.Labels)
+	// A job's engine picks its job image; these probes stand in for an OpenTofu job's executor.
+	req.Kind = cmp.Or(req.Kind, "tofu")
 	p, err := d.Place(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Place: %v", err)
@@ -180,7 +191,7 @@ func runProbe(t *testing.T, d *Container, req Request) (probeResult, Placement, 
 
 func newTestDriver(t *testing.T, image string) *Container {
 	t.Helper()
-	return &Container{Socket: testSocket(t), PlatformImage: image, ExecutorPath: "/probe"}
+	return &Container{Socket: testSocket(t), JobImages: sameJobImage(image), ExecutorPath: "/probe"}
 }
 
 // A job container is non-root, has every capability dropped, no-new-privileges and the default
@@ -189,7 +200,7 @@ func newTestDriver(t *testing.T, image string) *Container {
 func TestContainerHardening(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 
 	res, p, exit := runProbe(t, d, Request{JobID: "hard-" + sfx, Attempt: 1, Kind: "tofu", Env: []string{"STACKWEAVER_JOB_TOKEN=swj-x"}, Labels: map[string]string{LabelJob: "hard-" + sfx}})
 	if exit.Code != 0 {
@@ -229,8 +240,8 @@ func TestContainerHardening(t *testing.T) {
 func TestContainerRefusesARootImage(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-root-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "")
-	p, err := d.Place(t.Context(), Request{JobID: "root-" + sfx, Attempt: 1, Labels: withTestRun(nil)})
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "")
+	p, err := d.Place(t.Context(), Request{JobID: "root-" + sfx, Attempt: 1, Kind: "tofu", Labels: withTestRun(nil)})
 	if err == nil {
 		t.Cleanup(func() { _ = d.engine().remove(context.Background(), p.ID) })
 	}
@@ -243,7 +254,7 @@ func TestContainerRefusesARootImage(t *testing.T) {
 func TestContainerLimits(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-lim-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 	_, p, _ := runProbe(t, d, Request{JobID: "lim-" + sfx, Attempt: 1, Resources: Resources{CPULimit: "500m", MemoryLimit: "256Mi"}, Labels: map[string]string{}})
 	if strings.Join(p.Applied, ",") != "cpu=500m,memory=256Mi" {
 		t.Errorf("applied = %v", p.Applied)
@@ -289,17 +300,17 @@ func TestContainerInjectsTheExecutorIntoACustomImage(t *testing.T) {
 func TestContainerReattach(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-re-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 	runner := "runner-" + sfx
 	labels := func(job string) map[string]string {
 		return withTestRun(map[string]string{LabelRunner: runner, LabelJob: job})
 	}
-	long, err := d.Place(t.Context(), Request{JobID: "a-" + sfx, Attempt: 1, Env: []string{"PROBE_SLEEP=120s"}, Labels: labels("a-" + sfx)})
+	long, err := d.Place(t.Context(), Request{JobID: "a-" + sfx, Attempt: 1, Kind: "tofu", Env: []string{"PROBE_SLEEP=120s"}, Labels: labels("a-" + sfx)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.engine().remove(context.Background(), long.ID) })
-	short, err := d.Place(t.Context(), Request{JobID: "b-" + sfx, Attempt: 1, Labels: labels("b-" + sfx)})
+	short, err := d.Place(t.Context(), Request{JobID: "b-" + sfx, Attempt: 1, Kind: "tofu", Labels: labels("b-" + sfx)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +318,7 @@ func TestContainerReattach(t *testing.T) {
 	_, _ = d.Wait(t.Context(), short)
 
 	// A new driver value, as after a launcher restart.
-	restarted := &Container{Socket: d.Socket, PlatformImage: d.PlatformImage, ExecutorPath: d.ExecutorPath}
+	restarted := &Container{Socket: d.Socket, JobImages: d.JobImages, ExecutorPath: d.ExecutorPath}
 	found, err := restarted.List(t.Context(), map[string]string{LabelManaged: "true", LabelRunner: runner})
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +360,7 @@ func TestContainerReattach(t *testing.T) {
 func TestContainerKeepsAFailedJobThenReapsIt(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-keep-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 	// The job's pool keeps a failure for keep; the launcher's default would keep it an hour, and the
 	// job's own window wins. The window is measured from the container's end, so the checks below
 	// read that time from the engine rather than assume how long the steps before them took: on a
@@ -416,7 +427,7 @@ func TestContainerKeepsAFailedJobThenReapsIt(t *testing.T) {
 func TestContainerReapTouchesOnlyItsOwnRunner(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-reap-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 	mine, theirs := "reap-mine-"+sfx, "reap-theirs-"+sfx
 	// Both failures are ended and past any window: a sweep that matched them would remove them.
 	_, own, _ := runProbe(t, d, Request{JobID: "own-" + sfx, Attempt: 1, KeepFailedFor: time.Millisecond, Env: []string{"PROBE_EXIT=1"}, Labels: map[string]string{LabelRunner: mine}})
@@ -535,7 +546,7 @@ func dockerForwardAllowanceRemoval(subnet string) string {
 func networkIsolation(t *testing.T, backend firewallBackend) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-net-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 	tools := "sw-tools-" + sfx + ":1"
 	e := d.engine()
 	buildToolsImage(t, e, tools)
