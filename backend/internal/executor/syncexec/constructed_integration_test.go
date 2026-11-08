@@ -115,16 +115,6 @@ func setupConstructedFixture(t *testing.T) *constructedFixture {
 	return f
 }
 
-// fakeAnsibleInventory puts script first on PATH as ansible-inventory for the rest of the test.
-func fakeAnsibleInventory(t *testing.T, script string) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "ansible-inventory"), []byte(script), 0o700); err != nil { //nolint:gosec // an executable is the point
-		t.Fatalf("writing the fake ansible-inventory: %v", err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
 // inputsOnlyOutput is what the engine prints when it parsed the input and skipped constructed.yml:
 // the input's host, ungrouped, and no derived group.
 func (f *constructedFixture) inputsOnlyOutput() string {
@@ -144,13 +134,20 @@ func (f *constructedFixture) rebuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("requesting the rebuild: %v", err)
 	}
-	rt := ansible.NewWorkItemRuntime(f.db, f.export, nil)
+	executeWorkItem(t, ansible.NewWorkItemRuntime(f.db, f.export, nil), item)
+}
+
+// executeWorkItem runs a claimed work item end to end: the API side starts it and builds its
+// artifacts, the sync executor runs them against a stand-in for the runner routes, and the API side
+// persists the output and the completion.
+func executeWorkItem(t *testing.T, rt *ansible.WorkItemRuntime, item *models.WorkItem) {
+	t.Helper()
 	if err := rt.Started(item); err != nil {
-		t.Fatalf("starting the rebuild: %v", err)
+		t.Fatalf("starting work item %s: %v", item.ID, err)
 	}
 	cmd, err := rt.Command(item)
 	if err != nil {
-		t.Fatalf("building the rebuild's command: %v", err)
+		t.Fatalf("building the command of work item %s: %v", item.ID, err)
 	}
 	arts := runnercontract.WorkItemArtifacts{ContractVersion: runnercontract.Version, JobID: item.ID, Kind: item.Kind, Inventory: cmd}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +171,7 @@ func (f *constructedFixture) rebuild(t *testing.T) {
 				status = models.WorkItemStatusCompleted
 			}
 			if _, err := rt.Finished(item, status, req.ErrorMessage, req.WorkResult); err != nil {
-				t.Errorf("finishing the rebuild: %v", err)
+				t.Errorf("finishing work item %s: %v", item.ID, err)
 			}
 			_, _ = w.Write([]byte(`{"status":"completed"}`))
 		default:
