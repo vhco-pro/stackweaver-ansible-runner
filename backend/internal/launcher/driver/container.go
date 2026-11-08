@@ -3,6 +3,7 @@
 package driver
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -26,11 +27,21 @@ const ExecutorMountPath = "/stackweaver"
 type Container struct {
 	// Socket is the engine's unix socket.
 	Socket string
-	// PlatformImage is the image the launcher's executor comes from; a job naming no image runs it.
-	PlatformImage string
-	// ExecutorPath is the executor binary inside the platform image; the driver runs
-	// `<ExecutorPath> executor` there and injects a copy of it into any other image.
+	// JobImages maps each engine ("tofu", "ansible") to its job image (one-launcher spec, A3): a
+	// job naming no image runs its engine's, and a custom run image gets the executor copied out
+	// of it.
+	JobImages map[string]string
+	// ExecutorPath is the executor binary inside the job images, for a request that carries no
+	// Command; the driver runs `<ExecutorPath> executor` there and injects a copy of it into any
+	// other image.
 	ExecutorPath string
+	// JobImagePull is when a job's image and the job image its executor is copied from are pulled
+	// (RUNNER_JOB_IMAGE_PULL); the zero value pulls only a missing image. The firewall writer's
+	// image is pulled only when missing, whatever it says (OD28).
+	JobImagePull PullPolicy
+	// PullStallTimeout bounds how long a pull may go without progress from the engine before it is
+	// given up as a registry that cannot be reached; zero means DefaultPullStallTimeout.
+	PullStallTimeout time.Duration
 	// Network is the jobs network (EnsureNetwork); empty means the engine's default bridge.
 	Network string
 	// User is the uid:gid job containers run as when set; otherwise the image's own user, which
@@ -63,18 +74,30 @@ func (d *Container) engine() *engine {
 }
 
 // jobEnv is a job container's environment before the placement's own variables: the request's,
-// the writable temporary home, the limits report, and the network guard, which makes the executor
-// refuse a network where a metadata address is reachable. A host-identity launcher leaves the
-// guard out, because there the node's identity is what jobs are meant to reach (D5).
-func (d *Container) jobEnv(req Request, applied []string) []string {
+// the writable temporary home, the placement's report, and the network guard, which makes the
+// executor refuse a network where a metadata address is reachable. A host-identity launcher leaves
+// the guard out, because there the node's identity is what jobs are meant to reach (D5). The
+// report carries the limits report and the placement's warnings, each a line the executor writes
+// into the job's output before the job starts.
+func (d *Container) jobEnv(req Request, applied, warnings []string) []string {
 	env := append(append([]string{}, req.Env...), "HOME=/tmp", "TMPDIR=/tmp", "STACKWEAVER_PLACED=1")
 	if !d.HostIdentity {
 		env = append(env, "STACKWEAVER_NETWORK_GUARD=1")
 	}
-	if report := LimitsReport(req.Resources, applied); report != "" {
-		env = append(env, EnvLimitsReport+"="+report)
+	lines := appendNonEmpty(nil, LimitsReport(req.Resources, applied))
+	lines = append(lines, warnings...)
+	if len(lines) > 0 {
+		// The executor prefixes the report's first line with "Stackweaver: "; the rest get it here.
+		env = append(env, EnvLimitsReport+"="+strings.Join(lines, "\nStackweaver: "))
 	}
 	return env
+}
+
+func appendNonEmpty(list []string, s string) []string {
+	if s != "" {
+		return append(list, s)
+	}
+	return list
 }
 
 // Name is "container".
@@ -111,14 +134,26 @@ func (d *Container) Place(ctx context.Context, req Request) (Placement, error) {
 		return Placement{}, err
 	}
 	e := d.engine()
-	image := req.Image
-	if image == "" {
-		image = d.PlatformImage
+	jobImage, err := d.jobImage(req.Kind)
+	if err != nil {
+		return Placement{}, err
 	}
-	if !e.imageExists(ctx, image) {
-		if err := e.pull(ctx, image, req.PullAuth); err != nil {
-			return Placement{}, fmt.Errorf("pulling the job image %s: %w", image, err)
+	image := cmp.Or(req.Image, jobImage)
+	// Only an engine's default job image, and below the job image a run image's executor is
+	// copied from, may run from the cache when the registry cannot be reached; a run image or an
+	// execution environment never does (OD27).
+	var warnings []string
+	warning, err := d.ensureImage(ctx, image, d.JobImagePull, req.PullAuth, image == jobImage)
+	if err != nil {
+		return Placement{}, err
+	}
+	warnings = appendNonEmpty(warnings, warning)
+	if image != jobImage {
+		warning, err := d.ensureImage(ctx, jobImage, d.JobImagePull, nil, true)
+		if err != nil {
+			return Placement{}, err
 		}
+		warnings = appendNonEmpty(warnings, warning)
 	}
 	user, err := d.jobUser(ctx, image)
 	if err != nil {
@@ -140,7 +175,7 @@ func (d *Container) Place(ctx context.Context, req Request) (Placement, error) {
 	pids := int64(4096)
 	cfg := containerConfig{
 		Image:  image,
-		Env:    append(d.jobEnv(req, applied), d.placementEnv(ctx, image)...),
+		Env:    append(d.jobEnv(req, applied, warnings), d.placementEnv(ctx, image)...),
 		Labels: labels,
 		User:   user,
 		HostConfig: hostConfig{
@@ -174,20 +209,21 @@ func (d *Container) Place(ctx context.Context, req Request) (Placement, error) {
 			cfg.Env = append(cfg.Env, "STACKWEAVER_CACHE_DIR="+CacheMountPath)
 		}
 	}
-	if image == d.PlatformImage {
-		cfg.Entrypoint = []string{d.ExecutorPath}
-		cfg.Cmd = []string{"executor"}
+	command := d.executorCommand(req)
+	if image == jobImage {
+		cfg.Entrypoint = command[:1]
+		cfg.Cmd = command[1:]
 	} else {
-		// A custom image: the executor comes from the platform image through a per-job volume, and
-		// the entrypoint is always the driver's, never the image's (D4).
-		vol, err := d.injectExecutor(ctx, req)
+		// A custom image: the executor comes from its engine's job image through a per-job volume,
+		// and the entrypoint is always the driver's, never the image's (D4).
+		vol, err := d.injectExecutor(ctx, req, jobImage, command[0])
 		if err != nil {
 			return Placement{}, err
 		}
 		labels[labelExecutorVolume] = vol
 		cfg.HostConfig.Mounts = append(cfg.HostConfig.Mounts, mountSpec{Type: "volume", Source: vol, Target: ExecutorMountPath, ReadOnly: true})
 		cfg.Entrypoint = []string{ExecutorMountPath + "/stackweaver-executor"}
-		cfg.Cmd = []string{"executor"}
+		cfg.Cmd = command[1:]
 	}
 
 	name := containerName(req)
@@ -293,8 +329,62 @@ func firstPositive(ds ...time.Duration) time.Duration {
 // labelExecutorVolume names the per-job volume an injected executor lives in, so Remove deletes it.
 const labelExecutorVolume = "sh.stackweaver.executor-volume"
 
-// injectExecutor copies the executor out of the platform image into a fresh volume.
-func (d *Container) injectExecutor(ctx context.Context, req Request) (string, error) {
+// DefaultPullStallTimeout is how long a pull may go without progress when PullStallTimeout is
+// unset.
+const DefaultPullStallTimeout = 60 * time.Second
+
+// ensureImage makes image present on the engine under policy: always pulls it, never refuses an
+// absent one, and missing (or no policy) pulls only an absent one. With fallback, a pull that
+// could not reach the registry runs the copy the engine already holds and returns a warning for
+// the job (OD21); a refusal never falls back (OD27).
+func (d *Container) ensureImage(ctx context.Context, image string, policy PullPolicy, auth *RegistryAuth, fallback bool) (warning string, err error) {
+	e := d.engine()
+	switch policy {
+	case PullAlways:
+	case PullNever:
+		if !e.imageExists(ctx, image) {
+			return "", fmt.Errorf("the job image %s is not on this engine, and the pull policy is never", image)
+		}
+		return "", nil
+	case PullMissing:
+		if e.imageExists(ctx, image) {
+			return "", nil
+		}
+	default:
+		if e.imageExists(ctx, image) {
+			return "", nil
+		}
+	}
+	err = e.pullBounded(ctx, image, auth, cmp.Or(d.PullStallTimeout, DefaultPullStallTimeout))
+	if err == nil {
+		return "", nil
+	}
+	if fallback && isTransportPullError(err) && e.imageExists(ctx, image) {
+		return fmt.Sprintf("the registry could not be reached to pull %s (%v); the job runs the copy cached on this host", image, err), nil
+	}
+	return "", fmt.Errorf("pulling the job image %s: %w", image, err)
+}
+
+// jobImage is the job image of an engine.
+func (d *Container) jobImage(kind string) (string, error) {
+	image := d.JobImages[kind]
+	if image == "" {
+		return "", fmt.Errorf("this launcher has no job image for the %q engine", kind)
+	}
+	return image, nil
+}
+
+// executorCommand is the executor's command line in a job image: the request's, which the
+// launcher sets per engine, else `<ExecutorPath> executor`.
+func (d *Container) executorCommand(req Request) []string {
+	if len(req.Command) > 0 {
+		return req.Command
+	}
+	return []string{d.ExecutorPath, "executor"}
+}
+
+// injectExecutor copies the executor at path out of the job image source into a fresh volume.
+func (d *Container) injectExecutor(ctx context.Context, req Request, source, path string) (string, error) {
 	e := d.engine()
 	vol := containerName(req) + "-executor"
 	if err := e.createVolume(ctx, vol, map[string]string{LabelManaged: "true", LabelJob: req.JobID}); err != nil {
@@ -303,9 +393,9 @@ func (d *Container) injectExecutor(ctx context.Context, req Request) (string, er
 	// The copy runs as root because a fresh volume belongs to root; it runs no user code and has
 	// no network.
 	id, err := e.create(ctx, containerName(req)+"-inject", containerConfig{
-		Image:      d.PlatformImage,
+		Image:      source,
 		Entrypoint: []string{"/bin/sh", "-c"},
-		Cmd:        []string{fmt.Sprintf("cp %s %s/stackweaver-executor && chmod 0555 %s/stackweaver-executor", d.ExecutorPath, ExecutorMountPath, ExecutorMountPath)},
+		Cmd:        []string{fmt.Sprintf("cp %s %s/stackweaver-executor && chmod 0555 %s/stackweaver-executor", path, ExecutorMountPath, ExecutorMountPath)},
 		User:       "0",
 		Labels:     map[string]string{LabelManaged: "true", LabelJob: req.JobID},
 		HostConfig: hostConfig{

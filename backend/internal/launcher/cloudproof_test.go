@@ -43,8 +43,15 @@ import (
 //	                    for a public image that has no probe at the executor path
 func TestCloudProof(t *testing.T) {
 	launcherEnv := readEnvFile(t, os.Getenv("PROOF_LAUNCHER_ENV"))
+	// The probe image stands in for the OpenTofu job image, whose executor is the probe.
+	if launcherEnv[EnvTofuImage] == "" {
+		launcherEnv[EnvTofuImage] = launcherEnv[EnvImage]
+		delete(launcherEnv, EnvImage)
+	}
+	launcherEnv[EnvEngines] = EngineTofu
 	getenv := func(k string) string { return launcherEnv[k] }
-	b := Binary{Engine: "tofu", ExecutorPath: firstOf(launcherEnv["PROOF_EXECUTOR_PATH"], "/stackweaver-probe")}
+	b := Binary{Executors: map[string]driver.ExecutorFunc{EngineTofu: func(context.Context, driver.Invocation) int { return 1 }}}
+	executorPath := firstOf(launcherEnv["PROOF_EXECUTOR_PATH"], "/stackweaver-probe")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -56,6 +63,12 @@ func TestCloudProof(t *testing.T) {
 	d, err := DriverFromEnv(ctx, b, cfg, getenv)
 	if err != nil {
 		t.Fatalf("building the driver: %v", err)
+	}
+	switch dd := d.(type) {
+	case *driver.Container:
+		dd.ExecutorPath = executorPath
+	case *driver.Kubernetes:
+		dd.ExecutorPath = executorPath
 	}
 	t.Logf("driver=%s network_mode=%s capabilities=%+v", d.Name(), cfg.NetworkMode, d.Capabilities())
 	if path := os.Getenv("PROOF_COMMAND_FILE"); path != "" {

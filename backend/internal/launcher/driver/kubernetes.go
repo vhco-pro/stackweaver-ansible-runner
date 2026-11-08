@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,9 +27,16 @@ import (
 type Kubernetes struct {
 	Client *k8s.Client
 	// Namespace is the job namespace.
-	Namespace     string
-	PlatformImage string
-	ExecutorPath  string
+	Namespace string
+	// JobImages maps each engine to its job image (one-launcher spec, A3): a job naming no image
+	// runs its engine's, and a run image's executor-copy init container runs it.
+	JobImages map[string]string
+	// ExecutorPath is the executor binary inside the job images, for a request that carries no
+	// Command.
+	ExecutorPath string
+	// JobImagePull is the job pod's imagePullPolicy (RUNNER_JOB_IMAGE_PULL); the zero value leaves
+	// the cluster's default.
+	JobImagePull PullPolicy
 	// Template is the pod template an operator may own (a ConfigMap, D11).
 	Template k8s.Template
 	// RuntimeClass is the runtimeClassName every job pod gets unless the request names one.
@@ -38,11 +47,29 @@ type Kubernetes struct {
 	KeepFailedFor time.Duration
 	// PollInterval is how often Wait reads the pod; zero means two seconds.
 	PollInterval time.Duration
+	// PlacementTimeout is how long a job pod may fail to pull an image (ErrImagePull,
+	// ImagePullBackOff) before its job fails; zero means DefaultPlacementTimeout.
+	PlacementTimeout time.Duration
 
 	mu sync.Mutex
 	// killed are the pods Kill deleted: once gone, Wait reports them stopped, not lost.
 	killed map[string]bool
 }
+
+// DefaultPlacementTimeout is how long a job pod may fail to pull an image when PlacementTimeout is
+// unset: long enough to ride out a brief registry outage under always-pull, which the kubelet's
+// back-off retries, short enough that an image that cannot be pulled fails its job (OD21).
+const DefaultPlacementTimeout = 5 * time.Minute
+
+func (d *Kubernetes) placementTimeout() time.Duration {
+	if d.PlacementTimeout > 0 {
+		return d.PlacementTimeout
+	}
+	return DefaultPlacementTimeout
+}
+
+// kubePullPolicy maps a pull policy to the pod's imagePullPolicy; the zero value maps to none.
+var kubePullPolicy = map[PullPolicy]string{PullAlways: "Always", PullMissing: "IfNotPresent", PullNever: "Never"}
 
 // labelKeys maps the driver's placement labels to the pod's.
 var labelKeys = map[string]string{
@@ -116,11 +143,16 @@ func (d *Kubernetes) podRequest(req Request) k8s.PodRequest {
 	if id := req.Identity; id != nil {
 		identity = &k8s.Identity{Mechanism: k8s.Mechanism(id.Mechanism), ServiceAccount: id.ServiceAccount, Annotations: id.Annotations, PerJob: id.PerJob}
 	}
+	executorPath := d.ExecutorPath
+	if len(req.Command) > 0 {
+		executorPath = req.Command[0]
+	}
 	return k8s.PodRequest{
 		Identity:  identity,
 		Namespace: d.Namespace, JobID: req.JobID, Attempt: req.Attempt, Kind: req.Kind, RunType: req.RunType,
-		Image: req.Image, PlatformImage: d.PlatformImage, ExecutorPath: d.ExecutorPath,
-		Env: env, Token: req.Token, Labels: labels,
+		Image: req.Image, PlatformImage: d.JobImages[req.Kind], ExecutorPath: executorPath,
+		ImagePullPolicy: kubePullPolicy[d.JobImagePull],
+		Env:             env, Token: req.Token, Labels: labels,
 		Resources:    k8s.Resources{CPURequest: req.Resources.CPURequest, CPULimit: req.Resources.CPULimit, MemoryRequest: req.Resources.MemoryRequest, MemoryLimit: req.Resources.MemoryLimit},
 		RuntimeClass: runtime, RunAsUser: d.RunAsUser,
 	}
@@ -250,7 +282,8 @@ func (d *Kubernetes) pollInterval() time.Duration {
 // its executor ending (an init container that cannot start or failed, an eviction, a pod a
 // launcher stopped placing and never released) ends with exitCodeUnreported and the reason, so
 // the launcher reports the job failed rather than waiting for its timeout.
-func exitOf(p k8s.Pod) (Exit, bool) {
+func exitOf(p k8s.Pod, pullTimeout time.Duration) (Exit, bool) {
+	pullExpired := podAge(p) > pullTimeout
 	for _, cs := range p.Status.ContainerStatuses {
 		if cs.Name == "executor" && cs.State.Terminated != nil {
 			reason := ""
@@ -259,12 +292,12 @@ func exitOf(p k8s.Pod) (Exit, bool) {
 			}
 			return Exit{Code: cs.State.Terminated.ExitCode, Reason: reason}, true
 		}
-		if cs.Name == "executor" && cs.State.Waiting != nil && isStuck(cs.State.Waiting.Reason) {
+		if cs.Name == "executor" && cs.State.Waiting != nil && isStuck(cs.State.Waiting.Reason, pullExpired) {
 			return Exit{Code: exitCodeUnreported, Reason: cs.State.Waiting.Reason + ": " + cs.State.Waiting.Message}, true
 		}
 	}
 	for _, cs := range p.Status.InitContainerStatuses {
-		if w := cs.State.Waiting; w != nil && isStuck(w.Reason) {
+		if w := cs.State.Waiting; w != nil && isStuck(w.Reason, pullExpired) {
 			return Exit{Code: exitCodeUnreported, Reason: fmt.Sprintf("init container %s: %s: %s", cs.Name, w.Reason, w.Message)}, true
 		}
 		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
@@ -304,13 +337,36 @@ func gatedBy(p k8s.Pod, gate string) bool {
 	return false
 }
 
-// isStuck is a waiting reason a pod does not recover from by itself.
-func isStuck(reason string) bool {
+// isStuck is a waiting reason a pod does not recover from by itself. A failed pull is one only once
+// pullExpired: the kubelet retries it, and a registry that comes back lets the pod start (OD21).
+func isStuck(reason string, pullExpired bool) bool {
 	switch reason {
-	case "ErrImagePull", "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError":
+	case "ErrImagePull", "ImagePullBackOff":
+		return pullExpired
+	case "InvalidImageName", "CreateContainerConfigError", "CreateContainerError":
 		return true
 	}
 	return false
+}
+
+// isPulling reports whether a container of the pod waits on a failed pull.
+func isPulling(p k8s.Pod) bool {
+	for _, cs := range slices.Concat(p.Status.ContainerStatuses, p.Status.InitContainerStatuses) {
+		if w := cs.State.Waiting; w != nil && (w.Reason == "ErrImagePull" || w.Reason == "ImagePullBackOff") {
+			return true
+		}
+	}
+	return false
+}
+
+// podAge is how long ago the pod was created; a pod without a readable creation time counts as
+// old, so a pull error on it ends its job as it always did.
+func podAge(p k8s.Pod) time.Duration {
+	created, err := time.Parse(time.RFC3339, p.CreationTimestamp)
+	if err != nil {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Since(created)
 }
 
 // Wait polls the pod until its executor ends.
@@ -330,7 +386,11 @@ func (d *Kubernetes) Wait(ctx context.Context, p Placement) (Exit, error) {
 			return Exit{}, ErrNotFound
 		}
 		if err == nil {
-			if exit, done := exitOf(pod); done {
+			if exit, done := exitOf(pod, d.placementTimeout()); done {
+				// A pod that never got its image has nothing to inspect, and would keep pulling.
+				if isPulling(pod) {
+					_ = d.Kill(context.WithoutCancel(ctx), p, 0)
+				}
 				return exit, nil
 			}
 		}
@@ -388,7 +448,7 @@ func (d *Kubernetes) Remove(ctx context.Context, p Placement) error {
 		return nil
 	}
 	if err == nil {
-		if exit, done := exitOf(pod); done && !p.Canceled && exit.Code != 0 && keptFor(pod) > 0 {
+		if exit, done := exitOf(pod, d.placementTimeout()); done && !p.Canceled && exit.Code != 0 && keptFor(pod) > 0 {
 			return nil
 		}
 	}
@@ -412,7 +472,7 @@ func (d *Kubernetes) Reap(ctx context.Context, selector map[string]string) error
 		return err
 	}
 	for _, pod := range list.Items {
-		exit, done := exitOf(pod)
+		exit, done := exitOf(pod, d.placementTimeout())
 		if !done {
 			continue
 		}
@@ -474,7 +534,7 @@ func (d *Kubernetes) List(ctx context.Context, selector map[string]string) ([]Pl
 		if job := selector[LabelJob]; job != "" && pod.Annotations[k8s.AnnotationJobID] != job {
 			continue
 		}
-		_, ended := exitOf(pod)
+		_, ended := exitOf(pod, d.placementTimeout())
 		out = append(out, Placement{ID: pod.Name, Node: pod.Spec.NodeName, Labels: placementLabels(pod), Ended: ended})
 	}
 	return out, nil
@@ -488,9 +548,14 @@ func (d *Kubernetes) Logs(ctx context.Context, p Placement) (io.ReadCloser, erro
 // KubernetesOptions configures the Kubernetes driver from the launcher's environment.
 type KubernetesOptions struct {
 	// Namespace is the job namespace; empty uses the launcher's own.
-	Namespace     string
-	PlatformImage string
-	ExecutorPath  string
+	Namespace string
+	// JobImages maps each engine to its job image.
+	JobImages    map[string]string
+	ExecutorPath string
+	// JobImagePull is the job pod's imagePullPolicy.
+	JobImagePull PullPolicy
+	// PlacementTimeout is how long a job pod may fail to pull an image before its job fails.
+	PlacementTimeout time.Duration
 	// TemplateConfigMap names the ConfigMap holding the pod template, if any.
 	TemplateConfigMap string
 	RuntimeClass      string
@@ -522,7 +587,7 @@ func NewKubernetes(ctx context.Context, o KubernetesOptions) (*Kubernetes, error
 		ns = own
 	}
 	d := &Kubernetes{
-		Client: client, Namespace: ns, PlatformImage: o.PlatformImage, ExecutorPath: o.ExecutorPath,
+		Client: client, Namespace: ns, JobImages: o.JobImages, ExecutorPath: o.ExecutorPath, JobImagePull: o.JobImagePull, PlacementTimeout: o.PlacementTimeout,
 		RuntimeClass: o.RuntimeClass, RunAsUser: o.RunAsUser, KeepFailedFor: o.KeepFailedFor,
 	}
 	if o.TemplateConfigMap != "" {

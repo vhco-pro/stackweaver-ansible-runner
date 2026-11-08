@@ -87,6 +87,22 @@ type CacheMount struct {
 	Subpath string
 }
 
+// PullPolicy is when a driver pulls a job image before placing it (one-launcher spec, A3, OD18).
+// The zero value keeps each driver's behaviour before the policy existed: the container driver
+// pulls an image only when it is missing, and the Kubernetes driver leaves the pod's
+// imagePullPolicy to the cluster's default.
+type PullPolicy string
+
+// The pull policies RUNNER_JOB_IMAGE_PULL names.
+const (
+	// PullAlways pulls the job image on every placement, so a moved tag runs its current image.
+	PullAlways PullPolicy = "always"
+	// PullMissing pulls only an image the engine or node does not hold.
+	PullMissing PullPolicy = "missing"
+	// PullNever runs only an image already present and fails the placement otherwise.
+	PullNever PullPolicy = "never"
+)
+
 // RegistryAuth is a run image's registry credential, which the launcher fetched for the pull and
 // which never reaches the job.
 type RegistryAuth struct {

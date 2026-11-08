@@ -72,8 +72,15 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 	defer ticker.Stop()
 	timedOut, deleted := false, false
 	// A driver whose kubelet pulls the image learns its digest once the placement runs: it is
-	// reported once, then left alone.
+	// reported once, then left alone. It is read on its own, shorter interval, so a job of a few
+	// seconds, which ends before the first status read, still reports the image it ran in.
 	digester, digestPending := l.driver.(driver.ImageDigester)
+	var digestTick <-chan time.Time
+	if digestPending {
+		t := time.NewTicker(min(digestPollInterval, l.cfg.statusInterval()))
+		defer t.Stop()
+		digestTick = t.C
+	}
 	for {
 		select {
 		case r := <-exited:
@@ -97,10 +104,11 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 			}
 			timedOut = true
 			_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
-		case <-ticker.C:
-			if digestPending {
-				digestPending = !l.reportImageDigest(ctx, s, digester)
+		case <-digestTick:
+			if digestPending = !l.reportImageDigest(ctx, s, digester); !digestPending {
+				digestTick = nil
 			}
+		case <-ticker.C:
 			status, err := l.client.Status(ctx, s.jobID)
 			var se *StatusError
 			deleted = errors.As(err, &se) && se.Code == http.StatusNotFound
@@ -115,6 +123,9 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 		}
 	}
 }
+
+// digestPollInterval is how often a placement's image digest is read until it is reported.
+const digestPollInterval = 500 * time.Millisecond
 
 // reportImageDigest reports the placement's image digest once the driver knows it, and answers
 // whether there is nothing more to do: reported, or refused by the API (an API from before

@@ -41,8 +41,18 @@ type Config struct {
 	// hands the launcher more.
 	Capacity    int
 	NetworkMode string
-	// Image is the platform image placements default to when the job names no image.
-	Image string
+	// JobImages maps each engine to its job image, which a job that names no run image runs in
+	// (one-launcher spec, A3).
+	JobImages map[string]string
+	// JobImagePull is when the drivers pull a job image (RUNNER_JOB_IMAGE_PULL).
+	JobImagePull driver.PullPolicy
+	// FirewallImage is the image the container driver writes the jobs network's rules from.
+	FirewallImage string
+	// PlacementTimeout is how long a Kubernetes job pod may fail to pull an image before its job
+	// fails (RUNNER_PLACEMENT_TIMEOUT).
+	PlacementTimeout time.Duration
+	// Deprecations are the settings this configuration uses that are going away, logged at start.
+	Deprecations []string
 	// ExecutorCommand is the executor's command inside a job image, per engine.
 	ExecutorCommand map[string][]string
 	Labels          []string
@@ -428,10 +438,18 @@ func (l *Launcher) claim(ctx context.Context, offer runnercontract.PendingJob) b
 		return false
 	}
 	kind := l.engineOf(offer.JobType)
-	image := l.cfg.Image
-	// Every job runs the launcher's image, the platform default, until run images resolve a job's
+	image := l.cfg.JobImages[kind]
+	// Every job runs its engine's job image, the platform default, until run images resolve a job's
 	// own image and level with its offer (D4).
 	report := &runnercontract.Placement{Driver: l.driver.Name(), Image: image, ImageLevel: runnercontract.ImageLevelPlatform}
+	// No new claim once the launcher is told to stop. A claim already sent finishes whatever stop
+	// arrives meanwhile: its answer, then the token, the placement and the supervision, so the
+	// drain waits for the job instead of cancelling it half-placed, which leaves a claimed job with
+	// no placement that the API then declares lost.
+	if ctx.Err() != nil {
+		return false
+	}
+	ctx = context.WithoutCancel(ctx)
 	if err := l.client.Start(ctx, offer.JobID, report); err != nil {
 		if !errors.Is(err, ErrClaimLost) {
 			l.client.logf("Claiming job %s failed: %v", offer.JobID, err)

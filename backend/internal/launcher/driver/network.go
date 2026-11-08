@@ -425,6 +425,11 @@ func FirewallScript(pol NetworkPolicy, subnets, gateways []string) (string, erro
 	}
 	var b strings.Builder
 	b.WriteString("set -e\n")
+	b.WriteString(staleRulesFunctions)
+	// We keep no nftables table on this backend: one on the network's subnet is another network's.
+	for _, s := range r.subnets {
+		fmt.Fprintf(&b, "sw_drop_stale_tables %s ''\n", s)
+	}
 	write := func(tool string, rules, inRules []string, family func(netip.Prefix) bool) {
 		for _, c := range []struct {
 			name, from string
@@ -441,6 +446,7 @@ func FirewallScript(pol NetworkPolicy, subnets, gateways []string) (string, erro
 				if !family(s) {
 					continue
 				}
+				fmt.Fprintf(&b, "sw_drop_stale_jumps %s %s %s %s\n", tool, c.from, s, c.name)
 				fmt.Fprintf(&b, "%s -C %s -s %s -j %s 2>/dev/null || %s -I %s -s %s -j %s\n", tool, c.from, s, c.name, tool, c.from, s, c.name)
 			}
 		}
@@ -580,6 +586,19 @@ func NFTablesScript(pol NetworkPolicy, subnets, gateways []string, podman bool) 
 	var b strings.Builder
 	b.WriteString("set -e\n")
 	b.WriteString("command -v nft >/dev/null 2>&1 || { echo 'the firewall image has no nft, which this engine needs (RUNNER_FIREWALL_IMAGE)' >&2; exit 1; }\n")
+	b.WriteString(staleRulesFunctions)
+	// We keep no iptables chain on this backend: a jump for the network's subnet is another
+	// network's, or this one's from before the engine changed backend. Our own table is replaced
+	// below.
+	for _, s := range r.subnets {
+		tool := "iptables"
+		if s.Addr().Is6() {
+			tool = "ip6tables"
+		}
+		fmt.Fprintf(&b, "sw_drop_stale_jumps %s DOCKER-USER %s ''\n", tool, s)
+		fmt.Fprintf(&b, "sw_drop_stale_jumps %s INPUT %s ''\n", tool, s)
+		fmt.Fprintf(&b, "sw_drop_stale_tables %s %s\n", s, table)
+	}
 	b.WriteString("nft -f - <<'SW_JOBS_RULESET'\n")
 	b.WriteString(rs.String())
 	b.WriteString("SW_JOBS_RULESET\n")
@@ -612,11 +631,91 @@ func removeStaleOneShots(ctx context.Context, e *engine, selector map[string]str
 	}
 }
 
+// staleRulesFunctions are the shell functions with which a jobs network's rules replace what
+// another jobs network left on the same subnet. Rules are keyed on the network's subnet, the engine
+// hands a freed subnet out again, and a launcher that stopped without removing its rules leaves
+// them on the host once its network is gone. Left there, they judge the next network on that
+// subnet: an accept in one nftables table does not undo a reject in another, so a stale chain or
+// table refuses what the new network's own rules allow. A subnet belongs to one live network on an
+// engine, so whatever another jobs network holds on it belongs to one that is gone.
+//
+//   - sw_drop_stale_jumps TOOL FROM SUBNET KEEP removes FROM's jumps from SUBNET to a jobs chain other
+//     than KEEP (an empty KEEP keeps none), and each such chain once nothing jumps to it. It
+//     touches no jump for another subnet and no rule that is not a jump to a jobs chain.
+//   - sw_drop_stale_tables SUBNET KEEP removes, from every jobs table but KEEP, the rules that send
+//     SUBNET's traffic to its chains, and the table once none sends any.
+//
+// Both are idempotent, and a host without the other firewall's tool or chains has nothing to remove.
+// They run before the network's own rules are written. `iptables` and `ip6tables` are the host's
+// variant (iptablesVariantPrelude).
+const staleRulesFunctions = `sw_drop_unused_chain() {
+  "$1" -S 2>/dev/null | while IFS= read -r sw_rule; do case "$sw_rule" in (*" -j $2") exit 1 ;; esac; done || return 0
+  "$1" -F "$2" 2>/dev/null || true
+  "$1" -X "$2" 2>/dev/null || true
+}
+sw_drop_stale_jumps() {
+  sw_rules=$("$1" -S "$2" 2>/dev/null) || return 0
+  for sw_target in $(printf '%s\n' "$sw_rules" | while IFS= read -r sw_rule; do
+    case "$sw_rule" in ("-A $2 -s $3 -j SW-JOBS-"*) ;; (*) continue ;; esac
+    sw_target=${sw_rule#"-A $2 -s $3 -j "}
+    case "$sw_target" in (*" "*|"$4") ;; (*) echo "$sw_target" ;; esac
+  done); do
+    "$1" -D "$2" -s "$3" -j "$sw_target"
+    sw_drop_unused_chain "$1" "$sw_target"
+  done
+}
+sw_drop_stale_rules() {
+  for sw_handle in $(nft -a list chain "$1" "$2" "$3" 2>/dev/null | while IFS= read -r sw_rule; do
+    case "$sw_rule" in (*"saddr $4 "*"jump "*"# handle "*|*"daddr $4 jump jobs_inbound # handle "*) echo "${sw_rule##*# handle }" ;; esac
+  done); do
+    nft delete rule "$1" "$2" "$3" handle "$sw_handle"
+  done
+}
+sw_drop_stale_tables() {
+  command -v nft >/dev/null 2>&1 || return 0
+  for sw_table in $(nft list tables inet 2>/dev/null | while read -r _ _ sw_name; do
+    case "$sw_name" in (sw_jobs_*) [ "$sw_name" = "$2" ] || echo "$sw_name" ;; esac
+  done); do
+    sw_drop_stale_rules inet "$sw_table" forward "$1"
+    sw_drop_stale_rules inet "$sw_table" input "$1"
+    sw_drop_stale_rules bridge "$sw_table" forward "$1"
+    case "$(nft list chain inet "$sw_table" forward 2>/dev/null; nft list chain inet "$sw_table" input 2>/dev/null)" in
+      (*" jump "*) ;;
+      (*) nft delete table inet "$sw_table" 2>/dev/null || true; nft delete table bridge "$sw_table" 2>/dev/null || true ;;
+    esac
+  done
+}
+`
+
+// iptablesVariantPrelude makes a firewall script's `iptables` and `ip6tables` the variant whose
+// tables hold Docker's DOCKER-USER chain. Docker writes its chains with the host's variant
+// (iptables-nft on most current distributions, iptables-legacy on some), and the writer's image
+// carries its own default, which need not match: the launcher image's `iptables` is the legacy
+// variant, the OpenTofu job image's the nftables one. With neither holding the chain the plain
+// names stay, as before.
+const iptablesVariantPrelude = `sw_iptables_variant() {
+  for v in "$1-nft" "$1-legacy"; do
+    if command -v "$v" >/dev/null 2>&1 && "$v" -S DOCKER-USER >/dev/null 2>&1; then echo "$v"; return; fi
+  done
+  echo "$1"
+}
+SW_IPTABLES=$(sw_iptables_variant iptables)
+SW_IP6TABLES=$(sw_iptables_variant ip6tables)
+iptables() { command "$SW_IPTABLES" "$@"; }
+ip6tables() { command "$SW_IP6TABLES" "$@"; }
+`
+
 // runFirewall runs script in a one-shot container on the host network with NET_ADMIN: the only
 // privilege the driver uses, for rules, never for a job.
 func (d *Container) runFirewall(ctx context.Context, image, script string) error {
 	if image == "" {
-		image = d.PlatformImage
+		// Unset, the writer runs in the OpenTofu job image, which carries nft and iptables (OD15).
+		image = d.JobImages["tofu"]
+	}
+	// Pulled only when missing, whatever the job image policy says: in a shipped configuration it
+	// is the launcher's own image, whose tag must not move under the running launcher (OD28).
+	if _, err := d.ensureImage(ctx, image, PullMissing, nil, false); err != nil {
+		return fmt.Errorf("preparing the firewall writer: %w", err)
 	}
 	e := d.engine()
 	// A writer whose launcher stopped before removing it stays behind as a created container.
@@ -624,7 +723,7 @@ func (d *Container) runFirewall(ctx context.Context, image, script string) error
 	id, err := e.create(ctx, "", containerConfig{
 		Image:      image,
 		Entrypoint: []string{"/bin/sh", "-c"},
-		Cmd:        []string{script},
+		Cmd:        []string{iptablesVariantPrelude + script},
 		User:       "0",
 		Labels:     map[string]string{LabelManaged: "true", labelRole: roleFirewall},
 		HostConfig: hostConfigFirewall(),

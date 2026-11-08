@@ -206,20 +206,21 @@ func runPlanAndApply(t *testing.T, d Driver, f *conformanceAPI, server string) c
 }
 
 // buildConformanceImage is an image with a shell, the stand-in tofu where core/tofu looks for the
-// version, and the runner binary built from this tree as the executor.
+// version, and the launcher binary built from this tree as the executor, at the path every job
+// image installs it.
 func buildConformanceImage(t *testing.T, e *engine, tag string) {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "runner")
-	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, "../../../cmd/runner") //nolint:gosec // G204: the test builds the runner of this tree
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", bin, "../../../cmd/launcher") //nolint:gosec // G204: the test builds the launcher of this tree
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("building the runner: %v: %s", err, out)
+		t.Fatalf("building the launcher: %v: %s", err, out)
 	}
 	runner, err := os.ReadFile(bin) //nolint:gosec // G304: the test's own build output
 	if err != nil {
 		t.Fatal(err)
 	}
-	dockerfile := "FROM alpine:3.22\nLABEL " + labelTestRun + "=" + testRun + "\nCOPY runner /usr/local/bin/runner\nCOPY tofu /usr/local/bin/tofu-" + conformanceTofuVersion + "\nUSER 1001:1001\n"
+	dockerfile := "FROM alpine:3.22\nLABEL " + labelTestRun + "=" + testRun + "\nCOPY runner /usr/local/bin/stackweaver-launcher\nCOPY tofu /usr/local/bin/tofu-" + conformanceTofuVersion + "\nUSER 1001:1001\n"
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	for name, content := range map[string][]byte{"Dockerfile": []byte(dockerfile), "runner": runner, "tofu": []byte(conformanceTofu)} {
@@ -296,7 +297,7 @@ func TestConformance_InProcessAndContainerReportTheSame(t *testing.T) {
 	e := newEngine(sock)
 	tag := "sw-conformance-" + sfx + ":1"
 	buildConformanceImage(t, e, tag)
-	ctr := &Container{Socket: sock, PlatformImage: tag, ExecutorPath: "/usr/local/bin/runner", ExtraHosts: []string{"host.docker.internal:host-gateway"}}
+	ctr := &Container{Socket: sock, JobImages: sameJobImage(tag), ExecutorPath: "/usr/local/bin/stackweaver-launcher", ExtraHosts: []string{"host.docker.internal:host-gateway"}}
 	f, port := newConformanceAPI(t)
 	conformanceJobsNetwork(t, ctr, sfx, port)
 	got := runPlanAndApply(t, ctr, f, "http://host.docker.internal:"+port)

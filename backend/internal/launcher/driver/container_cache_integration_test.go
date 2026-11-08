@@ -24,7 +24,7 @@ import (
 func TestContainerCacheMountedReadOnlyFromADirectory(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-cache-"+sfx+":1")
-	buildProbeImage(t, d.engine(), d.PlatformImage, "1001:1001")
+	buildProbeImage(t, d.engine(), d.JobImages["tofu"], "1001:1001")
 
 	root := t.TempDir()
 	org := uuid.NewString()
@@ -61,7 +61,7 @@ func TestContainerCacheMountedReadOnlyFromAVolumeSubpath(t *testing.T) {
 	sfx := uuid.NewString()[:8]
 	d := newTestDriver(t, "sw-probe-cachevol-"+sfx+":1")
 	e := d.engine()
-	buildProbeImage(t, e, d.PlatformImage, "1001:1001")
+	buildProbeImage(t, e, d.JobImages["tofu"], "1001:1001")
 	tools := "sw-tools-cachevol-" + sfx + ":1"
 	buildToolsImage(t, e, tools)
 

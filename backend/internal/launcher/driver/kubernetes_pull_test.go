@@ -3,8 +3,10 @@
 package driver
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
 	k8s "github.com/michielvha/stackweaver/core/runnerdriver/kubernetes"
@@ -169,4 +171,118 @@ func TestKubernetesEnsureNeverTakesAnObjectCreatedAfterItsRead(t *testing.T) {
 	if got["stringData"].(map[string]any)[".dockerconfigjson"] != "flux" || got["metadata"].(map[string]any)["labels"].(map[string]any)[k8s.LabelManagedBy] != nil {
 		t.Fatalf("the launcher took an object Flux created after its read: %v", got)
 	}
+}
+
+// waitingPod is a pod whose named container waits for reason, created at created.
+func waitingPod(init bool, reason, message string, created time.Time) k8s.Pod {
+	st := []k8s.ContainerStatus{{Name: "executor", State: k8s.ContainerState{Waiting: &k8s.WaitingContainer{Reason: reason, Message: message}}}}
+	status := k8s.PodStatus{Phase: "Pending", ContainerStatuses: st}
+	if init {
+		st[0].Name = k8s.InjectExecutorContainer
+		status = k8s.PodStatus{Phase: "Pending", InitContainerStatuses: st}
+	}
+	return pod(status, false, created)
+}
+
+// Under always-pull a few seconds of registry trouble must not fail a job: ErrImagePull and
+// ImagePullBackOff stay non-terminal until the placement timeout, then end the job with the
+// kubelet's reason and message; InvalidImageName and the CreateContainer reasons stay immediate
+// (one-launcher spec, A3, OD21, AC43).
+func TestKubernetesPullErrorsWaitForThePlacementTimeout(t *testing.T) {
+	const timeout = 5 * time.Minute
+	fresh, expired := time.Now(), time.Now().Add(-timeout-time.Minute)
+	msg := `failed to pull image "ghcr.io/vhco-pro/stackweaver-opentofu-runner:latest": dial tcp: i/o timeout`
+	cases := []struct {
+		name   string
+		pod    k8s.Pod
+		done   bool
+		reason []string
+	}{
+		{"pull error, fresh", waitingPod(false, "ErrImagePull", msg, fresh), false, nil},
+		{"pull back-off, fresh", waitingPod(false, "ImagePullBackOff", msg, fresh), false, nil},
+		{"executor copy pull back-off, fresh", waitingPod(true, "ImagePullBackOff", msg, fresh), false, nil},
+		{"pull error, past the timeout", waitingPod(false, "ErrImagePull", msg, expired), true, []string{"ErrImagePull", "stackweaver-opentofu-runner:latest"}},
+		{"pull back-off, past the timeout", waitingPod(false, "ImagePullBackOff", msg, expired), true, []string{"ImagePullBackOff", "i/o timeout"}},
+		{"executor copy pull back-off, past the timeout", waitingPod(true, "ImagePullBackOff", msg, expired), true, []string{k8s.InjectExecutorContainer, "ImagePullBackOff"}},
+		{"invalid image name", waitingPod(false, "InvalidImageName", "couldn't parse image name", fresh), true, []string{"InvalidImageName"}},
+		{"create container config error", waitingPod(false, "CreateContainerConfigError", "secret not found", fresh), true, []string{"CreateContainerConfigError"}},
+		{"create container error", waitingPod(true, "CreateContainerError", "no such file", fresh), true, []string{"CreateContainerError"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			exit, done := exitOf(c.pod, timeout)
+			if done != c.done {
+				t.Fatalf("done = %t (%+v), want %t", done, exit, c.done)
+			}
+			for _, s := range c.reason {
+				if !strings.Contains(exit.Reason, s) {
+					t.Errorf("reason %q does not name %q", exit.Reason, s)
+				}
+			}
+		})
+	}
+}
+
+// A pod stuck pulling past the placement timeout is removed and its job fails naming the image; a
+// pod whose registry recovers before the timeout runs to completion (AC43).
+func TestKubernetesWaitRemovesAPodStuckPulling(t *testing.T) {
+	msg := `failed to pull image "ghcr.io/vhco-pro/stackweaver-ansible-runner:latest": connect: connection refused`
+	setStatus := func(f *fakeKube, path string, created time.Time, status map[string]any) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.objects[path]["metadata"].(map[string]any)["creationTimestamp"] = created.UTC().Format(time.RFC3339)
+		f.objects[path]["status"] = status
+	}
+	pulling := map[string]any{"phase": "Pending", "containerStatuses": []any{map[string]any{
+		"name": "executor", "state": map[string]any{"waiting": map[string]any{"reason": "ImagePullBackOff", "message": msg}},
+	}}}
+
+	t.Run("past the timeout", func(t *testing.T) {
+		f, d := newKubeDriver(t)
+		d.PlacementTimeout = time.Minute
+		p, err := d.Place(t.Context(), kubeRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/v1/namespaces/jobs/pods/" + p.ID
+		setStatus(f, path, time.Now().Add(-2*time.Minute), pulling)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		exit, err := d.Wait(ctx, p)
+		if err != nil || exit.Code != exitCodeUnreported || !strings.Contains(exit.Reason, "stackweaver-ansible-runner:latest") {
+			t.Fatalf("wait = %+v, %v; want an unreported failure naming the image", exit, err)
+		}
+		if f.get(path) != nil {
+			t.Error("the pod stuck pulling was left in place")
+		}
+	})
+	t.Run("the registry recovers", func(t *testing.T) {
+		f, d := newKubeDriver(t)
+		d.PlacementTimeout = time.Hour
+		p, err := d.Place(t.Context(), kubeRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/v1/namespaces/jobs/pods/" + p.ID
+		setStatus(f, path, time.Now(), pulling)
+		done := make(chan Exit, 1)
+		go func() {
+			exit, _ := d.Wait(t.Context(), p)
+			done <- exit
+		}()
+		select {
+		case exit := <-done:
+			t.Fatalf("wait ended on a pull error within the timeout: %+v", exit)
+		case <-time.After(200 * time.Millisecond):
+		}
+		f.finish(p.ID, 0, 0)
+		select {
+		case exit := <-done:
+			if exit.Code != exitCodeCompleted {
+				t.Errorf("exit = %+v, want the job completed", exit)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("wait did not end once the pod completed")
+		}
+	})
 }

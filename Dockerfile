@@ -1,6 +1,7 @@
-# Ansible Runner Dockerfile
+# Ansible job image Dockerfile
 # Sync smoke test 2026-05-25T17:08Z (D-SYNC-PR)
-# This builds the Ansible runner that executes Ansible playbooks
+# This builds the Ansible job image: the image Ansible jobs and syncs execute in, which also
+# starts an in-process launcher for Ansible by default (one-launcher spec, A5, OD4).
 # NOTE: This Dockerfile must be built with context set to the repository root
 # Example: docker build -f runner-images/ansible/Dockerfile -t ansible-runner .
 
@@ -15,7 +16,9 @@ COPY backend/go.mod backend/go.sum ./
 RUN --mount=type=secret,id=netrc,target=/root/.netrc go mod download
 
 COPY backend/ .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o ansible-runner ./cmd/ansible-runner
+# The launcher binary carries every engine's executor; VERSION is the release it reports.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags "-X main.version=${VERSION}" -o stackweaver-launcher ./cmd/launcher
 
 # ── Python deps stage: install via uv into a venv ───────────────────
 FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS python-deps
@@ -71,8 +74,11 @@ COPY --from=python-deps /opt/ansible-deps/.venv /opt/ansible-deps/.venv
 ENV VIRTUAL_ENV=/opt/ansible-deps/.venv
 ENV PATH="/opt/ansible-deps/.venv/bin:$PATH"
 
-# Copy the Go binary from the builder stage
-COPY --from=builder /app/ansible-runner /usr/local/bin/ansible-runner
+# The launcher binary at the constant executor path, and a link at the old path, so an older
+# launcher that runs `/usr/local/bin/ansible-runner executor` in this image still starts its
+# executor.
+COPY --from=builder /app/stackweaver-launcher /usr/local/bin/stackweaver-launcher
+RUN ln -s stackweaver-launcher /usr/local/bin/ansible-runner
 
 # Note: the former oidc-ansible-inventory wrapper is retired - azure.azcollection >= 3.17.0 reads
 # AZURE_FEDERATED_TOKEN_FILE natively, so inventory sync runs plain ansible-inventory for every
@@ -102,4 +108,5 @@ ENV ANSIBLE_HOME=/tmp/.ansible
 # read-only container, so it must live under writable /tmp (per-task namespaced).
 ENV ANSIBLE_REMOTE_TMP=/tmp/.ansible/tmp
 
-CMD ["/usr/local/bin/ansible-runner"]
+# Start an in-process launcher for Ansible
+CMD ["/usr/local/bin/stackweaver-launcher"]

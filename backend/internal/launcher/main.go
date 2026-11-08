@@ -3,6 +3,7 @@
 package launcher
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -24,20 +25,34 @@ import (
 
 // The environment a launcher is configured from (#933, D3, D4, D9, D12).
 const (
-	EnvServer           = "STACKWEAVER_SERVER"
-	EnvToken            = "STACKWEAVER_TOKEN"
-	EnvHosted           = "STACKWEAVER_HOSTED"
-	EnvHostedSecret     = "STACKWEAVER_HOSTED_SECRET"
-	EnvHostedGroup      = "STACKWEAVER_HOSTED_GROUP"
-	EnvHostedStrict     = "STACKWEAVER_HOSTED_STRICT"
-	EnvPoolID           = "RUNNER_AGENT_POOL_ID"
-	EnvName             = "RUNNER_NAME"
-	EnvLabels           = "RUNNER_LABELS"
-	EnvCapacity         = "RUNNER_MAX_CONCURRENT_JOBS"
-	EnvDriver           = "RUNNER_DRIVER"
-	EnvNetworkMode      = "RUNNER_NETWORK_MODE"
-	EnvNetwork          = "RUNNER_NETWORK"
-	EnvImage            = "RUNNER_IMAGE"
+	EnvServer       = "STACKWEAVER_SERVER"
+	EnvToken        = "STACKWEAVER_TOKEN"
+	EnvHosted       = "STACKWEAVER_HOSTED"
+	EnvHostedSecret = "STACKWEAVER_HOSTED_SECRET"
+	EnvHostedGroup  = "STACKWEAVER_HOSTED_GROUP"
+	EnvHostedStrict = "STACKWEAVER_HOSTED_STRICT"
+	EnvPoolID       = "RUNNER_AGENT_POOL_ID"
+	EnvName         = "RUNNER_NAME"
+	EnvLabels       = "RUNNER_LABELS"
+	EnvCapacity     = "RUNNER_MAX_CONCURRENT_JOBS"
+	EnvDriver       = "RUNNER_DRIVER"
+	EnvNetworkMode  = "RUNNER_NETWORK_MODE"
+	EnvNetwork      = "RUNNER_NETWORK"
+	// EnvImage is the one image of a launcher that serves its own image's engine. Deprecated in
+	// favour of the job image variables: alone it keeps its meaning for the compatibility window
+	// (one-launcher spec, A3, OD6).
+	EnvImage = "RUNNER_IMAGE"
+	// EnvTofuImage and EnvAnsibleImage are each engine's job image: a job that names no run image
+	// runs in it, and a custom run image gets the executor from it (A3).
+	EnvTofuImage    = "RUNNER_TOFU_IMAGE"
+	EnvAnsibleImage = "RUNNER_ANSIBLE_IMAGE"
+	// EnvJobImagePull is when job images are pulled: always, missing or never (OD18). Unset, it is
+	// always, or no policy (today's behaviour) for a launcher configured with RUNNER_IMAGE alone
+	// (OD29).
+	EnvJobImagePull = "RUNNER_JOB_IMAGE_PULL"
+	// EnvPlacementTimeout is how long a Kubernetes job pod may fail to pull an image before its
+	// job fails (OD21).
+	EnvPlacementTimeout = "RUNNER_PLACEMENT_TIMEOUT"
 	EnvSocket           = "RUNNER_DOCKER_SOCKET"
 	EnvJobUser          = "RUNNER_JOB_USER"
 	EnvAllowRoot        = "RUNNER_ALLOW_ROOT"
@@ -78,38 +93,41 @@ const (
 // DefaultCacheLimit is cache.local_size_limit when RUNNER_CACHE_LOCAL_SIZE_LIMIT is unset.
 const DefaultCacheLimit int64 = 20 << 30
 
+// The job images a launcher's engines run in when the job image variables are unset: each
+// published job image's latest, pulled on every placement (OD14).
+const (
+	DefaultTofuImage    = "ghcr.io/vhco-pro/stackweaver-opentofu-runner:latest"
+	DefaultAnsibleImage = "ghcr.io/vhco-pro/stackweaver-ansible-runner:latest"
+)
+
+// ExecutorPath is where every job image installs the launcher binary, which a container or
+// Kubernetes driver runs as `<ExecutorPath> executor` (A1, A5).
+const ExecutorPath = "/usr/local/bin/stackweaver-launcher"
+
 // DefaultHealthAddr is where /healthz and /readyz are served when RUNNER_HEALTH_ADDR is unset.
 const DefaultHealthAddr = ":9090"
 
-// Binary is what a runner binary brings to its launcher: its engine, the executor that runs the
-// engine's jobs in the launcher's process, and where that executor is in the platform image.
+// Binary is what the launcher binary brings to its launcher: the executors that run each engine's
+// jobs in the launcher's process.
 type Binary struct {
-	// Engine is "tofu" or "ansible".
-	Engine string
-	// Executor runs one job in this process (the in-process driver).
-	Executor driver.ExecutorFunc
-	// ExecutorPath is this binary inside the platform image, run as `<ExecutorPath> executor` by the
-	// container driver.
-	ExecutorPath string
-	// Version, TofuVersion and AnsibleVersion are reported at registration.
-	Version, TofuVersion, AnsibleVersion string
+	// Executors maps an engine ("tofu", "ansible") to the executor that runs its jobs in this
+	// process (the in-process driver).
+	Executors map[string]driver.ExecutorFunc
+	// Version is reported at registration.
+	Version string
 }
 
 // ConfigFromEnv reads a launcher's configuration through getenv.
 func ConfigFromEnv(b Binary, getenv func(string) string) (Config, error) {
 	cfg := Config{
-		ServerURL:      strings.TrimRight(strings.TrimSpace(getenv(EnvServer)), "/"),
-		Name:           strings.TrimSpace(getenv(EnvName)),
-		Engines:        []string{b.Engine},
-		NetworkMode:    firstOf(getenv(EnvNetworkMode), NetworkPlatform),
-		Image:          strings.TrimSpace(getenv(EnvImage)),
-		AgentVersion:   b.Version,
-		TofuVersion:    b.TofuVersion,
-		AnsibleVersion: b.AnsibleVersion,
-		HealthAddr:     firstOf(getenv(EnvHealthAddr), DefaultHealthAddr),
-		Capacity:       1,
-		DrainGrace:     5 * time.Minute,
-		Single:         truthy(getenv(EnvSingle)),
+		ServerURL:    strings.TrimRight(strings.TrimSpace(getenv(EnvServer)), "/"),
+		Name:         strings.TrimSpace(getenv(EnvName)),
+		NetworkMode:  firstOf(getenv(EnvNetworkMode), NetworkPlatform),
+		AgentVersion: b.Version,
+		HealthAddr:   firstOf(getenv(EnvHealthAddr), DefaultHealthAddr),
+		Capacity:     1,
+		DrainGrace:   5 * time.Minute,
+		Single:       truthy(getenv(EnvSingle)),
 	}
 	if cfg.ServerURL == "" {
 		return cfg, errors.New(EnvServer + " is required")
@@ -132,6 +150,9 @@ func ConfigFromEnv(b Binary, getenv func(string) string) (Config, error) {
 		cfg.DrainGrace = d
 	}
 	if err := cacheFromEnv(&cfg, getenv); err != nil {
+		return cfg, err
+	}
+	if err := jobImagesFromEnv(&cfg, b, getenv); err != nil {
 		return cfg, err
 	}
 	for _, l := range strings.Split(getenv(EnvLabels), ",") {
@@ -157,25 +178,91 @@ func ConfigFromEnv(b Binary, getenv func(string) string) (Config, error) {
 	return cfg, nil
 }
 
+// jobImagesFromEnv reads the engines the launcher serves, each engine's job image, the pull policy
+// and the firewall image (one-launcher spec, A2, A3). RUNNER_IMAGE alone keeps its meaning: the
+// launcher runs in that image, which is its jobs' image too, and serves the engines whose
+// toolchain it finds in its own process, on every driver.
+func jobImagesFromEnv(cfg *Config, b Binary, getenv func(string) string) error {
+	driverName := firstOf(getenv(EnvDriver), driver.NameInProcess)
+	legacy := strings.TrimSpace(getenv(EnvImage))
+	tofu, ansible := strings.TrimSpace(getenv(EnvTofuImage)), strings.TrimSpace(getenv(EnvAnsibleImage))
+	legacyOnly := legacy != "" && tofu == "" && ansible == ""
+	choice, err := chooseEngines(b, driverName, legacyOnly, getenv)
+	if err != nil {
+		return err
+	}
+	cfg.Engines = choice.engines
+	// Only a toolchain that runs in this process is the one its jobs run on.
+	if driverName == driver.NameInProcess {
+		cfg.TofuVersion, cfg.AnsibleVersion = choice.versions[EngineTofu], choice.versions[EngineAnsible]
+	}
+	cfg.ExecutorCommand = executorCommands()
+	cfg.JobImages = map[string]string{
+		EngineTofu:    cmp.Or(tofu, legacy, DefaultTofuImage),
+		EngineAnsible: cmp.Or(ansible, legacy, DefaultAnsibleImage),
+	}
+	switch {
+	case legacy != "" && (tofu != "" || ansible != ""):
+		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf("%s is deprecated and ignored for each engine whose job image is set; set %s and %s instead", EnvImage, EnvTofuImage, EnvAnsibleImage))
+	case legacy != "":
+		cfg.Deprecations = append(cfg.Deprecations, fmt.Sprintf("%s is deprecated; set %s and %s, each engine's job image, instead", EnvImage, EnvTofuImage, EnvAnsibleImage))
+	}
+	switch v := driver.PullPolicy(strings.ToLower(strings.TrimSpace(getenv(EnvJobImagePull)))); v {
+	case "":
+		// The job image variables default to always (OD18). RUNNER_IMAGE alone sets no policy, so an
+		// existing agent works unchanged: the container driver pulls when missing and a Kubernetes
+		// pod keeps the cluster's default (OD29).
+		cfg.JobImagePull = driver.PullAlways
+		if legacyOnly {
+			cfg.JobImagePull = ""
+		}
+	case driver.PullAlways, driver.PullMissing, driver.PullNever:
+		cfg.JobImagePull = v
+	default:
+		return fmt.Errorf("%s=%q is not a pull policy (always, missing, never)", EnvJobImagePull, getenv(EnvJobImagePull))
+	}
+	cfg.FirewallImage = firstOf(getenv(EnvFirewallImage), cfg.JobImages[EngineTofu])
+	cfg.PlacementTimeout = driver.DefaultPlacementTimeout
+	if v := strings.TrimSpace(getenv(EnvPlacementTimeout)); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("%s=%q is not a positive duration", EnvPlacementTimeout, v)
+		}
+		cfg.PlacementTimeout = d
+	}
+	return nil
+}
+
+// executorCommands is the executor's command in each engine's job image: the one binary at its
+// constant path.
+func executorCommands() map[string][]string {
+	return map[string][]string{
+		EngineTofu:    {ExecutorPath, "executor"},
+		EngineAnsible: {ExecutorPath, "executor"},
+	}
+}
+
 // DriverFromEnv builds the driver RUNNER_DRIVER names: inprocess (the default) or container.
 func DriverFromEnv(ctx context.Context, b Binary, cfg Config, getenv func(string) string) (driver.Driver, error) {
 	switch name := firstOf(getenv(EnvDriver), driver.NameInProcess); name {
 	case driver.NameInProcess:
-		return &driver.InProcess{PlatformImage: cfg.Image, Executors: map[string]driver.ExecutorFunc{b.Engine: b.Executor}}, nil
-	case driver.NameContainer:
-		if cfg.Image == "" {
-			return nil, errors.New("the container driver needs " + EnvImage + ", the platform image its executor comes from")
+		executors := map[string]driver.ExecutorFunc{}
+		for _, e := range cfg.Engines {
+			executors[e] = b.Executors[e]
 		}
+		return &driver.InProcess{JobImages: cfg.JobImages, Executors: executors}, nil
+	case driver.NameContainer:
 		if cfg.Strict && truthy(getenv(EnvAllowRoot)) {
 			return nil, errors.New(EnvAllowRoot + " is refused under hosted.strict: a hosted job never runs as root")
 		}
 		d := &driver.Container{
-			Socket:        firstOf(getenv(EnvSocket), "/var/run/docker.sock"),
-			PlatformImage: cfg.Image,
-			ExecutorPath:  b.ExecutorPath,
-			User:          strings.TrimSpace(getenv(EnvJobUser)),
-			AllowRoot:     truthy(getenv(EnvAllowRoot)),
-			Runtime:       strings.TrimSpace(getenv(EnvContainerRuntime)),
+			Socket:       firstOf(getenv(EnvSocket), "/var/run/docker.sock"),
+			JobImages:    cfg.JobImages,
+			JobImagePull: cfg.JobImagePull,
+			ExecutorPath: ExecutorPath,
+			User:         strings.TrimSpace(getenv(EnvJobUser)),
+			AllowRoot:    truthy(getenv(EnvAllowRoot)),
+			Runtime:      strings.TrimSpace(getenv(EnvContainerRuntime)),
 			// Host-identity jobs reach the node's metadata service (D5); hosted.strict refuses the mode.
 			HostIdentity: cfg.NetworkMode == NetworkHostIdentity,
 		}
@@ -192,7 +279,7 @@ func DriverFromEnv(ctx context.Context, b Binary, cfg Config, getenv func(string
 			d.KeepFailedFor = keep
 		}
 		if network := strings.TrimSpace(getenv(EnvNetwork)); network != "" {
-			pol := driver.NetworkPolicy{Name: network, FirewallImage: firstOf(getenv(EnvFirewallImage), cfg.Image), DenyOtherNetworks: true, AllowMetadata: d.HostIdentity}
+			pol := driver.NetworkPolicy{Name: network, FirewallImage: cfg.FirewallImage, DenyOtherNetworks: true, AllowMetadata: d.HostIdentity}
 			for _, c := range strings.Split(getenv(EnvDenyCIDRs), ",") {
 				if c = strings.TrimSpace(c); c != "" {
 					pol.Deny = append(pol.Deny, c)
@@ -213,11 +300,9 @@ func DriverFromEnv(ctx context.Context, b Binary, cfg Config, getenv func(string
 		}
 		return d, nil
 	case driver.NameKubernetes:
-		if cfg.Image == "" {
-			return nil, errors.New("the kubernetes driver needs " + EnvImage + ", the platform image its executor comes from")
-		}
 		o := driver.KubernetesOptions{
-			Namespace: strings.TrimSpace(getenv(EnvJobNamespace)), PlatformImage: cfg.Image, ExecutorPath: b.ExecutorPath,
+			Namespace: strings.TrimSpace(getenv(EnvJobNamespace)), JobImages: cfg.JobImages, ExecutorPath: ExecutorPath, JobImagePull: cfg.JobImagePull,
+			PlacementTimeout:  cfg.PlacementTimeout,
 			TemplateConfigMap: strings.TrimSpace(getenv(EnvPodTemplate)), RuntimeClass: strings.TrimSpace(getenv(EnvRuntimeClass)),
 			HostIdentity:       cfg.NetworkMode == NetworkHostIdentity,
 			LeaveNetworkPolicy: strings.EqualFold(strings.TrimSpace(getenv(EnvManageNetPolicy)), "false"),
@@ -351,6 +436,9 @@ func Main(b Binary) int {
 	if err != nil {
 		logger.Errorf("launcher: %v", err)
 		return 1
+	}
+	for _, w := range cfg.Deprecations {
+		logger.Warnf("launcher: %s", w)
 	}
 	cfg.Single = cfg.Single || SingleFromArgs(os.Args)
 	d, err := DriverFromEnv(ctx, b, cfg, os.Getenv)

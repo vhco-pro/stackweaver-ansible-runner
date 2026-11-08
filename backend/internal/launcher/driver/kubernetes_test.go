@@ -158,7 +158,7 @@ func newKubeDriver(t *testing.T) (*fakeKube, *Kubernetes) {
 	t.Cleanup(srv.Close)
 	return f, &Kubernetes{
 		Client:    &k8s.Client{Server: srv.URL, HTTP: srv.Client(), Token: func() (string, error) { return "t", nil }},
-		Namespace: "jobs", PlatformImage: "runner:1", ExecutorPath: "/usr/local/bin/runner", PollInterval: 10 * time.Millisecond,
+		Namespace: "jobs", JobImages: sameJobImage("runner:1"), ExecutorPath: "/usr/local/bin/runner", PollInterval: 10 * time.Millisecond,
 	}
 }
 
@@ -334,5 +334,89 @@ func TestKubernetesInventoryAndEnsure(t *testing.T) {
 	meta := ours["metadata"].(map[string]any)
 	if meta["labels"].(map[string]any)[k8s.LabelManagedBy] != k8s.ManagedByLauncher || meta["annotations"].(map[string]any)[k8s.AnnotationPoolID] != "pool-1" {
 		t.Errorf("created account = %v", meta)
+	}
+}
+
+// podContainers reads a placed pod's containers (or init containers) from the fake.
+func podContainers(t *testing.T, f *fakeKube, pod, field string) []map[string]any {
+	t.Helper()
+	obj := f.get("/api/v1/namespaces/jobs/pods/" + pod)
+	if obj == nil {
+		t.Fatalf("no pod %s", pod)
+	}
+	list, _ := obj["spec"].(map[string]any)[field].([]any)
+	out := make([]map[string]any, 0, len(list))
+	for _, c := range list {
+		out = append(out, c.(map[string]any))
+	}
+	return out
+}
+
+// Each job runs in its engine's job image, started with the command the launcher sends for that
+// engine, and a run image's executor-copy init container runs that engine's job image (one-launcher
+// spec, A3, AC7).
+func TestKubernetesPlacesEachEngineInItsJobImage(t *testing.T) {
+	f, d := newKubeDriver(t)
+	d.JobImages = map[string]string{"tofu": "ghcr.io/vhco-pro/stackweaver-opentofu-runner:latest", "ansible": "ghcr.io/vhco-pro/stackweaver-ansible-runner:latest"}
+	d.ExecutorPath = "/not-the-executor"
+	command := []string{"/usr/local/bin/stackweaver-launcher", "executor"}
+	for i, tc := range []struct{ kind, runType, image string }{
+		{"tofu", "plan", ""}, {"ansible", "", ""}, {"tofu", "apply", "registry.example.test/acme/tofu-custom:2"}, {"ansible", "", "registry.example.test/acme/ee:3"},
+	} {
+		req := kubeRequest()
+		req.JobID, req.Attempt, req.Kind, req.RunType, req.Image, req.Command = fmt.Sprintf("job-%d", i), 1, tc.kind, tc.runType, tc.image, command
+		p, err := d.Place(t.Context(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		main := podContainers(t, f, p.ID, "containers")[0]
+		inits := podContainers(t, f, p.ID, "initContainers")
+		if tc.image == "" {
+			if main["image"] != d.JobImages[tc.kind] {
+				t.Errorf("the %s job runs %v, want its job image %s", tc.kind, main["image"], d.JobImages[tc.kind])
+			}
+			if got := fmt.Sprint(main["command"]); got != fmt.Sprint(command) {
+				t.Errorf("the %s job's command = %s, want %v", tc.kind, got, command)
+			}
+			if len(inits) != 0 {
+				t.Errorf("the %s job in its own job image has init containers %v", tc.kind, inits)
+			}
+			continue
+		}
+		if main["image"] != tc.image {
+			t.Errorf("the %s run image job runs %v, want %s", tc.kind, main["image"], tc.image)
+		}
+		if len(inits) != 1 || inits[0]["image"] != d.JobImages[tc.kind] {
+			t.Errorf("the %s run image's executor copy = %v, want one from %s", tc.kind, inits, d.JobImages[tc.kind])
+		} else if got := fmt.Sprint(inits[0]["command"]); !strings.Contains(got, command[0]) {
+			t.Errorf("the executor copy runs %s, want it to copy %s", got, command[0])
+		}
+	}
+}
+
+// RUNNER_JOB_IMAGE_PULL becomes the job pod's imagePullPolicy, on the job container and the
+// executor-copy init container; unset leaves the cluster's default (OD18, AC40).
+func TestKubernetesSetsTheImagePullPolicy(t *testing.T) {
+	for pull, want := range map[PullPolicy]string{PullAlways: "Always", PullMissing: "IfNotPresent", PullNever: "Never", "": ""} {
+		f, d := newKubeDriver(t)
+		d.JobImagePull = pull
+		req := kubeRequest()
+		req.Image = "registry.example.test/acme/tofu-custom:2"
+		p, err := d.Place(t.Context(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		main := podContainers(t, f, p.ID, "containers")[0]
+		inits := podContainers(t, f, p.ID, "initContainers")
+		got, _ := main["imagePullPolicy"].(string)
+		if got != want {
+			t.Errorf("%q: job container imagePullPolicy = %q, want %q", pull, got, want)
+		}
+		if len(inits) != 1 {
+			t.Fatalf("%q: init containers = %v", pull, inits)
+		}
+		if got, _ := inits[0]["imagePullPolicy"].(string); got != want {
+			t.Errorf("%q: executor copy imagePullPolicy = %q, want %q", pull, got, want)
+		}
 	}
 }

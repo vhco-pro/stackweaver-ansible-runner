@@ -1,6 +1,6 @@
 // Copyright (c) 2026 VH & Co BV. Licensed under the Business Source License 1.1. See LICENSE for details.
 
-// The runner binary is a launcher (#933, D10, AC57, AC58): it holds no Redis client, consumes no
+// The launcher binary (#933, D10, AC57, AC58): it holds no Redis client, consumes no
 // queue and has no in-binary job path; every job runs through the launcher and an executor.
 
 package main
