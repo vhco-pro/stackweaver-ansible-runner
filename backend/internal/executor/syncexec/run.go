@@ -217,7 +217,7 @@ func runKind(ctx context.Context, c *executor.Client, jobID string, arts *runner
 			credentials = append(credentials, "AZURE_SUBSCRIPTION_ID="+sub)
 		}
 		_, _ = fmt.Fprintf(out, "Parsing %s @ %s\n$ ansible-inventory -i %s --list\n\n", arts.InventoryPath, result.Commit, arts.InventoryPath)
-		return inventory(ctx, []string{"-i", file, "--list"}, ansible.InventoryCommandEnv(env, credentials), out, result)
+		return inventory(ctx, []string{"-i", file, "--list"}, InventoryCommandEnv(env, credentials), out, result)
 	case models.WorkItemConstructedRebuild, models.WorkItemDynamicSourceSync:
 		if arts.Inventory == nil {
 			return errors.New("the work item carries no inventory command")
@@ -227,14 +227,14 @@ func runKind(ctx context.Context, c *executor.Client, jobID string, arts *runner
 			return err
 		}
 		_, _ = fmt.Fprintf(out, "$ ansible-inventory %s\n\n", strings.ReplaceAll(strings.Join(args, " "), secrets.Dir(), "<secrets>"))
-		return inventory(ctx, args, ansible.InventoryCommandEnv(env, credentials), out, result)
+		return inventory(ctx, args, InventoryCommandEnv(env, credentials), out, result)
 	}
 	return fmt.Errorf("work item kind %q is not run by this executor", arts.Kind)
 }
 
 // inventory runs ansible-inventory and records its output and diagnostics in result.
 func inventory(ctx context.Context, args, env []string, out io.Writer, result *runnercontract.WorkResult) error {
-	parsed, stderr, err := ansible.RunAnsibleInventory(ctx, args, env, out)
+	parsed, stderr, err := RunAnsibleInventory(ctx, args, env, out)
 	result.Stderr = stderr
 	if err != nil {
 		return err
