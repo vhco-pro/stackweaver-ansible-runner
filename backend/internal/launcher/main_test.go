@@ -248,3 +248,49 @@ func TestPlacementTimeout(t *testing.T) {
 		t.Errorf("an unreadable placement timeout = %v, want refused naming %s", err, EnvPlacementTimeout)
 	}
 }
+
+// The container driver gets the pull policy and the launcher's registry credential from the
+// launcher's environment, so the always default reaches it (one-launcher spec, A3, OD18) and its
+// job images are pulled with the credential (OD19).
+func TestContainerDriverFromEnvCarriesPullPolicyAndCredential(t *testing.T) {
+	path := writeFile(t, t.TempDir()+"/ghcr.json", `{"auths":{"ghcr.io":{"auth":"`+basicAuth("bot", "s3cret")+`"}}}`)
+	env := map[string]string{EnvDriver: driver.NameContainer, EnvDockerConfig: path}
+	cfg, err := configFrom(t, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := map[string]string{EnvServer: "https://api.test", EnvToken: "swa-agent", EnvPoolID: "pool-1"}
+	maps.Copy(full, env)
+	d, err := DriverFromEnv(t.Context(), bothExecutors(), cfg, envOf(full))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := d.(*driver.Container)
+	if !ok {
+		t.Fatalf("driver = %T, want *driver.Container", d)
+	}
+	if c.JobImagePull != driver.PullAlways {
+		t.Errorf("container pull policy = %q, want the always default", c.JobImagePull)
+	}
+	if a := c.Auth.For(DefaultTofuImage); a == nil || a.Username != "bot" {
+		t.Errorf("container credential for %s = %+v, want bot", DefaultTofuImage, a)
+	}
+}
+
+// A Kubernetes launcher warns at start about an identitytoken entry, which a job pod's pull Secret
+// cannot carry (one-launcher spec, A3); a container launcher sends it to the engine and does not.
+func TestKubernetesWarnsAboutIdentityTokens(t *testing.T) {
+	path := writeFile(t, t.TempDir()+"/token.json", `{"auths":{"registry.example":{"identitytoken":"tok"}}}`)
+	for drv, want := range map[string]bool{driver.NameKubernetes: true, driver.NameContainer: false} {
+		cfg, err := configFrom(t, map[string]string{EnvDriver: drv, EnvDockerConfig: path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := slices.ContainsFunc(cfg.Warnings, func(w string) bool {
+			return strings.Contains(w, "identitytoken") && strings.Contains(w, "registry.example")
+		})
+		if got != want {
+			t.Errorf("%s: identitytoken warning = %v, want %v (%v)", drv, got, want, cfg.Warnings)
+		}
+	}
+}

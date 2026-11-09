@@ -82,7 +82,7 @@ func (d *InProcess) Place(ctx context.Context, req Request) (Placement, error) {
 	}
 	run := d.Executors[req.Kind]
 	if run == nil {
-		return Placement{}, fmt.Errorf("this launcher has no %s executor", req.Kind)
+		return Placement{}, fmt.Errorf("this launcher does not run %s jobs", req.Kind)
 	}
 	if req.Resources.Required {
 		return Placement{}, errors.New("the pool requires enforced limits, which the in-process driver cannot apply")

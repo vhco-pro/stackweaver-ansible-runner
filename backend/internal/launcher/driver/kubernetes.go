@@ -37,6 +37,10 @@ type Kubernetes struct {
 	// JobImagePull is the job pod's imagePullPolicy (RUNNER_JOB_IMAGE_PULL); the zero value leaves
 	// the cluster's default.
 	JobImagePull PullPolicy
+	// Auth is the launcher's own registry credential (RUNNER_DOCKER_CONFIG, the chart's
+	// launcher.jobImages.pullSecrets): a job pod pulls its job image with it through a per-job
+	// Secret keyed by the job image's repository (one-launcher spec, A3, OD26).
+	Auth RegistryCredentials
 	// Template is the pod template an operator may own (a ConfigMap, D11).
 	Template k8s.Template
 	// RuntimeClass is the runtimeClassName every job pod gets unless the request names one.
@@ -187,13 +191,20 @@ func (d *Kubernetes) Place(ctx context.Context, req Request) (Placement, error) 
 		per = &sa
 	}
 	secret := k8s.RenderJobSecret(pr)
-	var pull *k8s.Secret
+	// The per-job pull Secrets, each written once with the pod as its owner.
+	var pulls []k8s.Secret
 	if req.PullSecret != "" {
 		// The pool's long-lived pull Secret, which the launcher or the operator keeps (D8).
 		pr.PullSecrets = append(pr.PullSecrets, req.PullSecret)
 	} else if a := req.PullAuth; a != nil {
-		s := k8s.RenderJobPullSecret(pr, a.Registry, a.Username, a.Password)
-		pull = &s
+		pulls = append(pulls, k8s.RenderJobPullSecret(pr, a.Registry, a.Username, a.Password))
+	}
+	// The launcher's own credential for the job image, which the job container or the executor
+	// copy runs; keyed by the job image's repository, so no run image ever matches it (OD26).
+	if s, ok := d.jobImagePullSecret(pr, d.JobImages[req.Kind]); ok {
+		pulls = append(pulls, s)
+	}
+	for _, s := range pulls {
 		pr.PullSecrets = append(pr.PullSecrets, s.Name)
 	}
 	pod := k8s.RenderPod(pr, d.Template)
@@ -212,16 +223,13 @@ func (d *Kubernetes) Place(ctx context.Context, req Request) (Placement, error) 
 		return Placement{}, fmt.Errorf("creating the job secret: %w", err)
 	}
 	written = append(written, jobObject{k8s.Secrets, secret.Name})
-	if pull != nil {
+	for _, pull := range pulls {
 		k8s.OwnedBy(&pull.ObjectMeta, placed)
 		if err := d.Client.Apply(ctx, k8s.Secrets, d.Namespace, pull.Name, pull, nil); err != nil {
 			undo()
 			return Placement{}, fmt.Errorf("creating the job's pull secret: %w", err)
 		}
-		written = append(written, struct {
-			res  k8s.Resource
-			name string
-		}{k8s.Secrets, pull.Name})
+		written = append(written, jobObject{k8s.Secrets, pull.Name})
 	}
 	if per != nil {
 		k8s.OwnedBy(&per.ObjectMeta, placed)
@@ -236,6 +244,20 @@ func (d *Kubernetes) Place(ctx context.Context, req Request) (Placement, error) 
 		return Placement{}, fmt.Errorf("releasing the job pod for scheduling: %w", err)
 	}
 	return Placement{ID: placed.Name, Node: placed.Spec.NodeName, Labels: placementLabels(placed), Applied: podLimits(req.Resources)}, nil
+}
+
+// jobImagePullSecret is the per-job Secret that carries the launcher's credential for jobImage's
+// registry, when it has one. An identitytoken entry is left out: a dockerconfigjson Secret carries
+// a username and password, and the launcher warns about it at start.
+func (d *Kubernetes) jobImagePullSecret(pr k8s.PodRequest, jobImage string) (k8s.Secret, bool) {
+	if jobImage == "" {
+		return k8s.Secret{}, false
+	}
+	a := d.Auth.For(jobImage)
+	if a == nil || a.Username == "" {
+		return k8s.Secret{}, false
+	}
+	return k8s.RenderJobImagePullSecret(pr, ImageRepository(jobImage), a.Username, a.Password), true
 }
 
 // jobObject is one object Place wrote, which a failed placement deletes.
@@ -315,7 +337,7 @@ func exitOf(p k8s.Pod, pullTimeout time.Duration) (Exit, bool) {
 		// The executor did not end on its own: it never reported.
 		reason := strings.TrimSpace(strings.Trim(p.Status.Reason+": "+p.Status.Message, ": "))
 		if reason == "" {
-			reason = "the pod failed before its executor ended"
+			reason = "the pod failed before its job ended"
 		}
 		return Exit{Code: exitCodeUnreported, Reason: reason}, true
 	}
@@ -554,6 +576,8 @@ type KubernetesOptions struct {
 	ExecutorPath string
 	// JobImagePull is the job pod's imagePullPolicy.
 	JobImagePull PullPolicy
+	// Auth is the launcher's own registry credential, which job pods pull their job image with.
+	Auth RegistryCredentials
 	// PlacementTimeout is how long a job pod may fail to pull an image before its job fails.
 	PlacementTimeout time.Duration
 	// TemplateConfigMap names the ConfigMap holding the pod template, if any.
@@ -587,7 +611,7 @@ func NewKubernetes(ctx context.Context, o KubernetesOptions) (*Kubernetes, error
 		ns = own
 	}
 	d := &Kubernetes{
-		Client: client, Namespace: ns, JobImages: o.JobImages, ExecutorPath: o.ExecutorPath, JobImagePull: o.JobImagePull, PlacementTimeout: o.PlacementTimeout,
+		Client: client, Namespace: ns, JobImages: o.JobImages, ExecutorPath: o.ExecutorPath, JobImagePull: o.JobImagePull, Auth: o.Auth, PlacementTimeout: o.PlacementTimeout,
 		RuntimeClass: o.RuntimeClass, RunAsUser: o.RunAsUser, KeepFailedFor: o.KeepFailedFor,
 	}
 	if o.TemplateConfigMap != "" {

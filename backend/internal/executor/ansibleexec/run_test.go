@@ -391,7 +391,7 @@ func TestExecute_RefusesAnUnknownContractVersion(t *testing.T) {
 	if ran := stubs.read(t, "cwd"); ran != "" {
 		t.Errorf("ansible-playbook ran in %q, want nothing run for an unknown contract", ran)
 	}
-	if !slices.ContainsFunc(cp.outputs, func(o string) bool { return strings.Contains(o, "runner contract") }) {
+	if !slices.ContainsFunc(cp.outputs, func(o string) bool { return strings.Contains(o, "job contract") }) {
 		t.Errorf("outputs = %q, want the refusal written to the job's output (AC72)", cp.outputs)
 	}
 }

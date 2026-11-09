@@ -354,7 +354,7 @@ func TestExecute_RefusesAnUnknownContractVersion(t *testing.T) {
 	}
 	var said bool
 	for _, o := range h.api.outputs {
-		if strings.Contains(o.Output, "runner contract") {
+		if strings.Contains(o.Output, "job contract") {
 			said = true
 		}
 	}

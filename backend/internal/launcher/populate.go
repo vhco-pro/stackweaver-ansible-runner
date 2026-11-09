@@ -22,7 +22,7 @@ import (
 
 // errStrictOffline is hosted.strict refusing a launcher that would promote tofu releases without
 // the transparency log (AC76).
-var errStrictOffline = errors.New("cache.verify_transparency_log=false is refused under hosted.strict")
+var errStrictOffline = errors.New("cache.verify_transparency_log=false is refused under strict hosted isolation (STACKWEAVER_HOSTED_STRICT)")
 
 // promotion is one promotion and the mirror block its sources are fetched from.
 type promotion struct {

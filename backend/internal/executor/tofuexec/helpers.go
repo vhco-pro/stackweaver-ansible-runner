@@ -91,7 +91,7 @@ func RemoveHCLBlock(content, opener string) string {
 						blockEnd++
 					}
 					// Replace block with a comment
-					replacement := "  # Backend removed by StackWeaver agent runner\n  backend \"local\" {}\n"
+					replacement := "  # Backend removed by Stackweaver for this run\n  backend \"local\" {}\n"
 					content = content[:blockStart] + replacement + content[blockEnd:]
 					break
 				}

@@ -103,12 +103,14 @@ const (
 	PullNever PullPolicy = "never"
 )
 
-// RegistryAuth is a run image's registry credential, which the launcher fetched for the pull and
-// which never reaches the job.
+// RegistryAuth is a registry credential a pull is made with, which never reaches the job: a run
+// image's, which the launcher fetched for the pull, or the launcher's own (RegistryCredentials).
 type RegistryAuth struct {
 	Registry string
 	Username string
 	Password string //nolint:gosec // G117: the registry credential the pull needs
+	// IdentityToken is a Docker config identitytoken, which the engine exchanges for a token.
+	IdentityToken string //nolint:gosec // G117: the registry credential the pull needs
 }
 
 // Request is everything a driver needs to place one executor.
