@@ -368,8 +368,17 @@ func TestContainerJobImagePullPolicy(t *testing.T) {
 		if exit.Code != 0 || res.Stamp != "new" {
 			t.Fatalf("always ran %q (exit %+v), want the registry's new image", res.Stamp, exit)
 		}
-		if env := containerEnv(t, e, p.ID); !slices.Contains(env, "STACKWEAVER_IMAGE_DIGEST="+newDigest) {
-			t.Errorf("the placement reports %v, want the new digest %s", env, newDigest)
+		// The digest the engine records for the image it pulled: the pushed digest on Docker; Podman
+		// may record another for the same image, compressing it anew on push.
+		pulled, err := e.imageDigest(t.Context(), repo)
+		if err != nil || pulled == "" {
+			t.Fatalf("the pulled image's digest = %q, %v", pulled, err)
+		}
+		if newDigest != pulled && !strings.Contains(e.socket, "podman") {
+			t.Errorf("the engine recorded %s for the pulled image, want the pushed %s", pulled, newDigest)
+		}
+		if env := containerEnv(t, e, p.ID); !slices.Contains(env, "STACKWEAVER_IMAGE_DIGEST="+pulled) {
+			t.Errorf("the placement reports %v, want the new image's digest %s", env, pulled)
 		}
 	})
 	t.Run("never refuses an absent image, naming it", func(t *testing.T) {
@@ -619,4 +628,98 @@ func TestContainerRefusedPullsNeverFallBack(t *testing.T) {
 			t.Errorf("%s: the refused pull of %s fell back to the cached copy", name, image)
 		}
 	}
+}
+
+// isUnauthorized reports a pull a registry refused for want of a credential.
+func isUnauthorized(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unauthorized") || strings.Contains(msg, "no basic auth") || strings.Contains(msg, "denied")
+}
+
+// The launcher's own registry credential (RUNNER_DOCKER_CONFIG, one-launcher spec, A3, OD19) pulls
+// an engine's job image, the job image a run image's executor is copied from, and the firewall
+// writer's image, each sent as X-Registry-Auth for the matching registry (AC12, AC40); a job's run
+// image on the same registry is never pulled with it.
+func TestContainerPullsJobImagesWithTheLauncherCredential(t *testing.T) {
+	sfx := uuid.NewString()[:8]
+	e := newEngine(testSocket(t))
+	addr := privateRegistry(t, e, "launcher", "job-image-s3cret")
+	cred := &RegistryAuth{Registry: addr, Username: "launcher", Password: "job-image-s3cret"}
+	launcherAuth := RegistryCredentials{addr: *cred}
+
+	jobLocal := "sw-probe-jobimage-" + sfx + ":1"
+	buildStampedProbeImage(t, e, "alpine:3.22", jobLocal, "1001:1001", "job-image", map[string]string{LabelManaged: "true"})
+	jobImage := addr + "/vhco-pro/stackweaver-opentofu-runner-" + sfx + ":latest"
+	pushTo(t, e, jobLocal, jobImage, cred)
+
+	t.Run("without the launcher credential the private job image is refused", func(t *testing.T) {
+		dropLocal(t, e, jobImage)
+		d := &Container{Socket: e.socket, JobImages: sameJobImage(jobImage), ExecutorPath: "/probe", JobImagePull: PullAlways}
+		p, err := d.Place(t.Context(), Request{JobID: "noauth-" + sfx, Attempt: 1, Kind: "tofu", Labels: withTestRun(map[string]string{LabelJob: "noauth-" + sfx})})
+		if err == nil {
+			_ = e.remove(context.Background(), p.ID)
+		}
+		if !isUnauthorized(err) {
+			t.Fatalf("a private job image without a credential = %v, want an unauthorized pull", err)
+		}
+	})
+
+	t.Run("the job image", func(t *testing.T) {
+		dropLocal(t, e, jobImage)
+		d := &Container{Socket: e.socket, JobImages: sameJobImage(jobImage), ExecutorPath: "/probe", JobImagePull: PullAlways, Auth: launcherAuth}
+		res, _, exit := runProbe(t, d, Request{JobID: "jobauth-" + sfx, Attempt: 1, Kind: "tofu", Labels: map[string]string{LabelJob: "jobauth-" + sfx}})
+		if exit.Code != 0 || res.Stamp != "job-image" {
+			t.Fatalf("the job in the private job image = exit %+v stamp %q", exit, res.Stamp)
+		}
+	})
+
+	t.Run("the injection source, beside a run image pulled with its own credential", func(t *testing.T) {
+		runLocal := "sw-probe-runimage-auth-" + sfx + ":1"
+		buildStampedProbeImage(t, e, "scratch", runLocal, "1001:1001", "run-image", map[string]string{LabelManaged: "true"})
+		runImage := addr + "/acme/ee-" + sfx + ":1"
+		pushTo(t, e, runLocal, runImage, cred)
+		dropLocal(t, e, runImage)
+		dropLocal(t, e, jobImage)
+		d := &Container{Socket: e.socket, JobImages: sameJobImage(jobImage), ExecutorPath: "/probe", JobImagePull: PullAlways, Auth: launcherAuth}
+		job := "injauth-" + sfx
+		res, p, exit := runProbe(t, d, Request{JobID: job, Attempt: 1, Kind: "ansible", Image: runImage, PullAuth: cred, Labels: map[string]string{LabelJob: job}})
+		t.Cleanup(func() { _ = d.removeContainer(context.Background(), p.ID, p.Labels) })
+		if exit.Code != 0 || res.Stamp != "job-image" {
+			t.Fatalf("the run image's executor = exit %+v stamp %q, want the private job image's", exit, res.Stamp)
+		}
+	})
+
+	t.Run("a run image is never pulled with the launcher credential", func(t *testing.T) {
+		runLocal := "sw-probe-runimage-noauth-" + sfx + ":1"
+		buildStampedProbeImage(t, e, "scratch", runLocal, "1001:1001", "run-image", map[string]string{LabelManaged: "true"})
+		runImage := addr + "/acme/private-" + sfx + ":1"
+		pushTo(t, e, runLocal, runImage, cred)
+		dropLocal(t, e, runImage)
+		d := &Container{Socket: e.socket, JobImages: sameJobImage(jobImage), ExecutorPath: "/probe", JobImagePull: PullAlways, Auth: launcherAuth}
+		p, err := d.Place(t.Context(), Request{JobID: "runnoauth-" + sfx, Attempt: 1, Kind: "tofu", Image: runImage, Labels: withTestRun(map[string]string{LabelJob: "runnoauth-" + sfx})})
+		if err == nil {
+			_ = d.removeContainer(context.Background(), p.ID, p.Labels)
+		}
+		if !isUnauthorized(err) {
+			t.Fatalf("a run image with no credential of its own = %v, want an unauthorized pull", err)
+		}
+	})
+
+	t.Run("the firewall image", func(t *testing.T) {
+		toolsLocal := "sw-test-tools-auth-" + sfx + ":1"
+		buildToolsImage(t, e, toolsLocal)
+		t.Cleanup(func() {
+			_ = e.do(context.Background(), http.MethodDelete, "/images/"+toolsLocal, url.Values{"force": {"1"}}, nil, nil)
+		})
+		fwImage := addr + "/vhco-pro/stackweaver-launcher-" + sfx + ":latest"
+		pushTo(t, e, toolsLocal, fwImage, cred)
+		dropLocal(t, e, fwImage)
+		d := &Container{Socket: e.socket, JobImages: sameJobImage(jobImage), JobImagePull: PullAlways, Auth: launcherAuth}
+		if err := d.runFirewall(t.Context(), fwImage, "true"); err != nil {
+			t.Fatalf("runFirewall from a private image: %v", err)
+		}
+	})
 }

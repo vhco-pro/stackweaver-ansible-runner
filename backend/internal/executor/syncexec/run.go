@@ -229,7 +229,7 @@ func runKind(ctx context.Context, c *executor.Client, jobID string, arts *runner
 		_, _ = fmt.Fprintf(out, "$ ansible-inventory %s\n\n", strings.ReplaceAll(strings.Join(args, " "), secrets.Dir(), "<secrets>"))
 		return inventory(ctx, args, InventoryCommandEnv(env, credentials), out, result)
 	}
-	return fmt.Errorf("work item kind %q is not run by this executor", arts.Kind)
+	return fmt.Errorf("work item kind %q is not supported", arts.Kind)
 }
 
 // inventory runs ansible-inventory and records its output and diagnostics in result.

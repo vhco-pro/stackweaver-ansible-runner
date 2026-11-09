@@ -487,9 +487,9 @@ func (c *Client) openDownload(ctx context.Context, path string) (*http.Response,
 // ReportRefusal writes why the executor refuses its job into the job's output, so the run or job
 // shows the reason beside its failure (AC72). A refusal over the contract version names the fix.
 func (c *Client) ReportRefusal(ctx context.Context, jobID, stream string, err error) {
-	line := "Stackweaver executor: refusing this job: " + err.Error() + "\n"
+	line := "Stackweaver: refusing this job: " + err.Error() + "\n"
 	if errors.Is(err, runnercontract.ErrUnknownVersion) {
-		line = fmt.Sprintf("Stackweaver executor: refusing this job: %v. The API speaks a runner contract this runner image does not; upgrade the runner image to the API's release.\n", err)
+		line = fmt.Sprintf("Stackweaver: refusing this job: %v. The API speaks a job contract this job image does not; upgrade the job image to the API's release.\n", err)
 	}
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()

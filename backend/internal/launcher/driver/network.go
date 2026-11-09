@@ -714,7 +714,7 @@ func (d *Container) runFirewall(ctx context.Context, image, script string) error
 	}
 	// Pulled only when missing, whatever the job image policy says: in a shipped configuration it
 	// is the launcher's own image, whose tag must not move under the running launcher (OD28).
-	if _, err := d.ensureImage(ctx, image, PullMissing, nil, false); err != nil {
+	if _, err := d.ensureImage(ctx, image, PullMissing, d.Auth.For(image), false); err != nil {
 		return fmt.Errorf("preparing the firewall writer: %w", err)
 	}
 	e := d.engine()

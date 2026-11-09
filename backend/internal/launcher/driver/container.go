@@ -39,6 +39,10 @@ type Container struct {
 	// (RUNNER_JOB_IMAGE_PULL); the zero value pulls only a missing image. The firewall writer's
 	// image is pulled only when missing, whatever it says (OD28).
 	JobImagePull PullPolicy
+	// Auth is the launcher's own registry credential (RUNNER_DOCKER_CONFIG): the job images, the
+	// job image an executor is copied from and the firewall writer's image are pulled with it, and
+	// a job's run image never is (one-launcher spec, A3, OD19).
+	Auth RegistryCredentials
 	// PullStallTimeout bounds how long a pull may go without progress from the engine before it is
 	// given up as a registry that cannot be reached; zero means DefaultPullStallTimeout.
 	PullStallTimeout time.Duration
@@ -142,14 +146,20 @@ func (d *Container) Place(ctx context.Context, req Request) (Placement, error) {
 	// Only an engine's default job image, and below the job image a run image's executor is
 	// copied from, may run from the cache when the registry cannot be reached; a run image or an
 	// execution environment never does (OD27).
+	// The launcher's own credential pulls only the job images; a run image is pulled with its own
+	// credential or none (OD19).
 	var warnings []string
-	warning, err := d.ensureImage(ctx, image, d.JobImagePull, req.PullAuth, image == jobImage)
+	auth := req.PullAuth
+	if image == jobImage && auth == nil {
+		auth = d.Auth.For(image)
+	}
+	warning, err := d.ensureImage(ctx, image, d.JobImagePull, auth, image == jobImage)
 	if err != nil {
 		return Placement{}, err
 	}
 	warnings = appendNonEmpty(warnings, warning)
 	if image != jobImage {
-		warning, err := d.ensureImage(ctx, jobImage, d.JobImagePull, nil, true)
+		warning, err := d.ensureImage(ctx, jobImage, d.JobImagePull, d.Auth.For(jobImage), true)
 		if err != nil {
 			return Placement{}, err
 		}
@@ -388,7 +398,7 @@ func (d *Container) injectExecutor(ctx context.Context, req Request, source, pat
 	e := d.engine()
 	vol := containerName(req) + "-executor"
 	if err := e.createVolume(ctx, vol, map[string]string{LabelManaged: "true", LabelJob: req.JobID}); err != nil {
-		return "", fmt.Errorf("creating the executor volume: %w", err)
+		return "", fmt.Errorf("creating the stackweaver-executor volume: %w", err)
 	}
 	// The copy runs as root because a fresh volume belongs to root; it runs no user code and has
 	// no network.
@@ -407,16 +417,16 @@ func (d *Container) injectExecutor(ctx context.Context, req Request, source, pat
 	})
 	if err != nil {
 		_ = e.removeVolume(ctx, vol)
-		return "", fmt.Errorf("creating the executor copy: %w", err)
+		return "", fmt.Errorf("creating the stackweaver-executor copy: %w", err)
 	}
 	defer func() { _ = e.remove(context.WithoutCancel(ctx), id) }()
 	if err := e.start(ctx, id); err != nil {
 		_ = e.removeVolume(ctx, vol)
-		return "", fmt.Errorf("starting the executor copy: %w", err)
+		return "", fmt.Errorf("starting the stackweaver-executor copy: %w", err)
 	}
 	if code, err := e.wait(ctx, id); err != nil || code != 0 {
 		_ = e.removeVolume(ctx, vol)
-		return "", fmt.Errorf("copying the executor into the job image failed (exit %d): %w", code, err)
+		return "", fmt.Errorf("copying stackweaver-executor into the job image failed (exit %d): %w", code, err)
 	}
 	return vol, nil
 }
@@ -437,7 +447,7 @@ func (d *Container) jobUser(ctx context.Context, image string) (string, error) {
 	}
 	u := strings.TrimSpace(img.Config.User)
 	if (u == "" || u == "0" || u == "root" || strings.HasPrefix(u, "0:") || strings.HasPrefix(u, "root:")) && !d.AllowRoot {
-		return "", fmt.Errorf("the job image %s runs as root; set a non-root USER in the image or allow root on the pool (refused under hosted.strict)", image)
+		return "", fmt.Errorf("the job image %s runs as root; set a non-root USER in the image or allow root on the pool (refused under strict hosted isolation)", image)
 	}
 	return u, nil
 }

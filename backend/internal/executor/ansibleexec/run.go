@@ -209,7 +209,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	// SSH password authentication needs sshpass; Ansible cannot use ansible_password without it.
 	if arts.Credential != nil && arts.Credential.Password != "" && arts.Credential.SSHKey == "" {
 		if _, err := exec.LookPath("sshpass"); err != nil {
-			return failed("SSH password authentication requires sshpass on the runner. Install it (e.g. apt install sshpass or yum install sshpass) and try again.")
+			return failed("SSH password authentication requires sshpass in the job image. Install it (e.g. apt install sshpass or yum install sshpass) and try again.")
 		}
 	}
 

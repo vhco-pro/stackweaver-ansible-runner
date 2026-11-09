@@ -25,7 +25,7 @@ import (
 
 // ErrClaimLost is returned by Start when another runner claimed the job first, or the job can no
 // longer be claimed: the launcher skips it.
-var ErrClaimLost = errors.New("the job was claimed by another runner")
+var ErrClaimLost = errors.New("the job was claimed by another launcher")
 
 // capabilities are what a launcher announces on every request and at registration.
 var capabilities = []string{

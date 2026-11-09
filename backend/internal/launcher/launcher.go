@@ -51,8 +51,14 @@ type Config struct {
 	// PlacementTimeout is how long a Kubernetes job pod may fail to pull an image before its job
 	// fails (RUNNER_PLACEMENT_TIMEOUT).
 	PlacementTimeout time.Duration
+	// JobImageAuth are the launcher's own registry credentials (RUNNER_DOCKER_CONFIG): the drivers
+	// pull job images, the executor's copy source and the firewall image with them, never a run
+	// image.
+	JobImageAuth driver.RegistryCredentials
 	// Deprecations are the settings this configuration uses that are going away, logged at start.
 	Deprecations []string
+	// Warnings are what the configuration asks for that the launcher cannot do, logged at start.
+	Warnings []string
 	// ExecutorCommand is the executor's command inside a job image, per engine.
 	ExecutorCommand map[string][]string
 	Labels          []string
@@ -204,7 +210,7 @@ func (l *Launcher) Run(ctx context.Context) error {
 	l.registered.Store(true)
 	l.lastBeat.Store(time.Now().UnixNano())
 	l.noteAPICapabilities(resp.Capabilities)
-	l.client.logf("Launcher registered as runner %s (driver %s, capacity %d)", resp.RunnerID, l.driver.Name(), l.cfg.Capacity)
+	l.client.logf("Launcher registered with ID %s (driver %s, capacity %d)", resp.RunnerID, l.driver.Name(), l.cfg.Capacity)
 
 	l.reconcile(ctx)
 	go l.reapKept(ctx)
@@ -260,7 +266,7 @@ func (l *Launcher) reapLostPeers(ctx context.Context, r Reaper) {
 		placed, err := l.driver.List(ctx, sel)
 		if err != nil {
 			if ctx.Err() == nil {
-				l.client.logf("Listing the placements of lost runner %s: %v", peer, err)
+				l.client.logf("Listing the placements of lost launcher %s: %v", peer, err)
 			}
 			continue
 		}
@@ -268,13 +274,13 @@ func (l *Launcher) reapLostPeers(ctx context.Context, r Reaper) {
 			if p.Ended || p.Labels[driver.LabelRunner] != peer {
 				continue
 			}
-			l.client.logf("Stopping %s, left running by lost runner %s", p.ID, peer)
+			l.client.logf("Stopping %s, left running by lost launcher %s", p.ID, peer)
 			if err := l.driver.Kill(ctx, p, l.cfg.KillGrace); err != nil && ctx.Err() == nil {
-				l.client.logf("Stopping %s of lost runner %s: %v", p.ID, peer, err)
+				l.client.logf("Stopping %s of lost launcher %s: %v", p.ID, peer, err)
 			}
 		}
 		if err := r.Reap(ctx, sel); err != nil && ctx.Err() == nil {
-			l.client.logf("Sweeping the placements of lost runner %s: %v", peer, err)
+			l.client.logf("Sweeping the placements of lost launcher %s: %v", peer, err)
 		}
 	}
 }
@@ -283,16 +289,16 @@ func (l *Launcher) reapLostPeers(ctx context.Context, r Reaper) {
 // driver nor the host-identity network (AC72, AC22).
 func (l *Launcher) checkConfig() error {
 	if l.cfg.Strict && l.driver.Name() == driver.NameInProcess {
-		return errors.New("hosted.strict forbids the in-process driver: a hosted launcher places every job in a container or pod")
+		return errors.New("strict hosted isolation (STACKWEAVER_HOSTED_STRICT) forbids the in-process driver: a hosted launcher places every job in a container or pod")
 	}
 	if l.cfg.Strict && l.cfg.NetworkMode == NetworkHostIdentity {
-		return errors.New("hosted.strict forbids the host-identity network mode")
+		return errors.New("strict hosted isolation (STACKWEAVER_HOSTED_STRICT) forbids the host-identity network mode")
 	}
 	if err := (cache.PopulatorConfig{Strict: l.cfg.Strict, VerifyTransparencyLog: l.cfg.VerifyTransparencyLog}).Check(); err != nil {
 		return fmt.Errorf("%w: %w", errStrictOffline, err)
 	}
 	if !l.cfg.Hosted && l.cfg.PoolID == "" {
-		return errors.New("a customer launcher needs the pool it serves (RUNNER_AGENT_POOL_ID)")
+		return errors.New("a launcher of an agent pool needs the pool it serves (RUNNER_AGENT_POOL_ID)")
 	}
 	return nil
 }

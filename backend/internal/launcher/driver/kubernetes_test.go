@@ -27,6 +27,8 @@ type fakeKube struct {
 	// another writer would act between a read and the launcher's write.
 	beforePatch func(path string)
 	beforePost  func(path string)
+	// failPatch answers a PATCH with a server error when it returns true.
+	failPatch func(path string) bool
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -44,6 +46,11 @@ func (f *fakeKube) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var obj map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&obj)
 		meta := obj["metadata"].(map[string]any)
+		if f.failPatch != nil && f.failPatch(p) {
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]any{"kind": "Status", "message": "injected failure", "code": http.StatusInternalServerError})
+			return
+		}
 		if f.beforePatch != nil {
 			f.beforePatch(p)
 		}

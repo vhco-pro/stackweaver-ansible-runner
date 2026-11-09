@@ -77,7 +77,7 @@ type PopulatorConfig struct {
 // Check refuses a configuration hosted.strict forbids.
 func (c PopulatorConfig) Check() error {
 	if c.Strict && !c.VerifyTransparencyLog {
-		return errors.New("cache.verify_transparency_log=false is refused under hosted.strict: hosted caches are verified against the transparency log")
+		return errors.New("cache.verify_transparency_log=false is refused under strict hosted isolation (STACKWEAVER_HOSTED_STRICT): hosted caches are verified against the transparency log")
 	}
 	return nil
 }

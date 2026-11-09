@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -67,7 +69,10 @@ const (
 	// same engine or cluster (#933, D2, D5).
 	EnvAllowTCP      = "RUNNER_ALLOW_TCP"
 	EnvFirewallImage = "RUNNER_FIREWALL_IMAGE"
-	EnvHealthAddr    = "RUNNER_HEALTH_ADDR"
+	// EnvDockerConfig names, comma separated, the Docker config files (or directories of them) the
+	// launcher's own registry credentials are read from (one-launcher spec, A3, OD19).
+	EnvDockerConfig = "RUNNER_DOCKER_CONFIG"
+	EnvHealthAddr   = "RUNNER_HEALTH_ADDR"
 	// The Kubernetes driver's settings (#933, D4, D5, D11).
 	EnvJobNamespace      = "RUNNER_JOB_NAMESPACE"
 	EnvPodTemplate       = "RUNNER_POD_TEMPLATE_CONFIGMAP"
@@ -222,6 +227,17 @@ func jobImagesFromEnv(cfg *Config, b Binary, getenv func(string) string) error {
 		return fmt.Errorf("%s=%q is not a pull policy (always, missing, never)", EnvJobImagePull, getenv(EnvJobImagePull))
 	}
 	cfg.FirewallImage = firstOf(getenv(EnvFirewallImage), cfg.JobImages[EngineTofu])
+	if cfg.JobImageAuth, cfg.Warnings, err = registryCredentialsFromEnv(getenv); err != nil {
+		return err
+	}
+	if driverName == driver.NameKubernetes {
+		// A job pod's pull Secret carries a username and password, never an identity token.
+		for _, registry := range slices.Sorted(maps.Keys(cfg.JobImageAuth)) {
+			if a := cfg.JobImageAuth[registry]; a.Username == "" && a.IdentityToken != "" {
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("%s: the identitytoken for %s cannot reach a job pod; give it an auth or username and password entry", EnvDockerConfig, registry))
+			}
+		}
+	}
 	cfg.PlacementTimeout = driver.DefaultPlacementTimeout
 	if v := strings.TrimSpace(getenv(EnvPlacementTimeout)); v != "" {
 		d, err := time.ParseDuration(v)
@@ -253,12 +269,13 @@ func DriverFromEnv(ctx context.Context, b Binary, cfg Config, getenv func(string
 		return &driver.InProcess{JobImages: cfg.JobImages, Executors: executors}, nil
 	case driver.NameContainer:
 		if cfg.Strict && truthy(getenv(EnvAllowRoot)) {
-			return nil, errors.New(EnvAllowRoot + " is refused under hosted.strict: a hosted job never runs as root")
+			return nil, errors.New(EnvAllowRoot + " is refused under strict hosted isolation (STACKWEAVER_HOSTED_STRICT): a hosted job never runs as root")
 		}
 		d := &driver.Container{
 			Socket:       firstOf(getenv(EnvSocket), "/var/run/docker.sock"),
 			JobImages:    cfg.JobImages,
 			JobImagePull: cfg.JobImagePull,
+			Auth:         cfg.JobImageAuth,
 			ExecutorPath: ExecutorPath,
 			User:         strings.TrimSpace(getenv(EnvJobUser)),
 			AllowRoot:    truthy(getenv(EnvAllowRoot)),
@@ -295,13 +312,13 @@ func DriverFromEnv(ctx context.Context, b Binary, cfg Config, getenv func(string
 				return nil, fmt.Errorf("preparing the jobs network: %w", err)
 			}
 			if !programmed {
-				logger.Warnf("The jobs network %s is not firewalled on this engine (rootless): executors refuse to start where a metadata address is reachable", network)
+				logger.Warnf("The jobs network %s is not firewalled on this engine (rootless): jobs refuse to start where a metadata address is reachable", network)
 			}
 		}
 		return d, nil
 	case driver.NameKubernetes:
 		o := driver.KubernetesOptions{
-			Namespace: strings.TrimSpace(getenv(EnvJobNamespace)), JobImages: cfg.JobImages, ExecutorPath: ExecutorPath, JobImagePull: cfg.JobImagePull,
+			Namespace: strings.TrimSpace(getenv(EnvJobNamespace)), JobImages: cfg.JobImages, ExecutorPath: ExecutorPath, JobImagePull: cfg.JobImagePull, Auth: cfg.JobImageAuth,
 			PlacementTimeout:  cfg.PlacementTimeout,
 			TemplateConfigMap: strings.TrimSpace(getenv(EnvPodTemplate)), RuntimeClass: strings.TrimSpace(getenv(EnvRuntimeClass)),
 			HostIdentity:       cfg.NetworkMode == NetworkHostIdentity,
@@ -437,7 +454,7 @@ func Main(b Binary) int {
 		logger.Errorf("launcher: %v", err)
 		return 1
 	}
-	for _, w := range cfg.Deprecations {
+	for _, w := range slices.Concat(cfg.Deprecations, cfg.Warnings) {
 		logger.Warnf("launcher: %s", w)
 	}
 	cfg.Single = cfg.Single || SingleFromArgs(os.Args)

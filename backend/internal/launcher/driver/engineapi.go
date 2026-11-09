@@ -464,10 +464,11 @@ func (e *engine) doPull(ctx context.Context, ref string, auth *RegistryAuth, wat
 	}
 	if auth != nil {
 		header, err := json.Marshal(struct { //nolint:gosec // G117: the registry auth header the engine reads
-			Username      string `json:"username"`
-			Password      string `json:"password"` //nolint:gosec // G117: the engine's registry auth header
+			Username      string `json:"username,omitempty"`
+			Password      string `json:"password,omitempty"` //nolint:gosec // G117: the engine's registry auth header
+			IdentityToken string `json:"identitytoken,omitempty"`
 			ServerAddress string `json:"serveraddress"`
-		}{auth.Username, auth.Password, auth.Registry})
+		}{auth.Username, auth.Password, auth.IdentityToken, auth.Registry})
 		if err != nil {
 			return err
 		}

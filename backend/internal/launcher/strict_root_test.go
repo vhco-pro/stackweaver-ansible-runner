@@ -15,7 +15,7 @@ func TestStrictRefusesAllowRoot(t *testing.T) {
 	env := map[string]string{EnvDriver: "container", EnvAllowRoot: "true"}
 	getenv := func(k string) string { return env[k] }
 	_, err := DriverFromEnv(t.Context(), bothExecutors(), Config{Engines: []string{"tofu", "ansible"}, JobImages: map[string]string{"tofu": "platform:1", "ansible": "platform:1"}, Strict: true}, getenv)
-	if err == nil || !strings.Contains(err.Error(), "hosted.strict") {
+	if err == nil || !strings.Contains(err.Error(), "strict hosted isolation") {
 		t.Errorf("DriverFromEnv = %v, want RUNNER_ALLOW_ROOT refused under hosted.strict", err)
 	}
 }

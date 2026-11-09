@@ -126,8 +126,9 @@ func TestContainerRunsEachEngineInItsJobImage(t *testing.T) {
 		if err := d.engine().do(t.Context(), http.MethodGet, "/containers/"+p.ID+"/json", nil, nil, &st); err != nil {
 			t.Fatal(err)
 		}
-		if st.Config.Image != d.JobImages[engine] {
-			t.Errorf("the %s job's container runs %s, want %s", engine, st.Config.Image, d.JobImages[engine])
+		// Podman records a short name with the registry it resolved it on.
+		if image := strings.TrimPrefix(st.Config.Image, "docker.io/library/"); image != d.JobImages[engine] {
+			t.Errorf("the %s job's container runs %s, want %s", engine, image, d.JobImages[engine])
 		}
 		if !slices.Equal(res.Args, []string{"executor"}) {
 			t.Errorf("the %s job ran with %v, want the executor subcommand", engine, res.Args)

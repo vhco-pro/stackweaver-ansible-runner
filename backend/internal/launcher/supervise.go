@@ -151,7 +151,7 @@ func (l *Launcher) ended(ctx context.Context, s *supervised, exit driver.Exit, e
 		reason = fmt.Sprintf("the launcher lost the job's placement: %v", err)
 	case exit.Code == exitCompleted || exit.Code == exitFailed || exit.Code == exitStopped:
 	default:
-		reason = fmt.Sprintf("the executor ended with exit code %d without reporting", exit.Code)
+		reason = fmt.Sprintf("the job's process ended with exit code %d without reporting", exit.Code)
 		if exit.Reason != "" {
 			reason += " (" + exit.Reason + ")"
 		}
