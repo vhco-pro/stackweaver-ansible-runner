@@ -11,7 +11,7 @@ require (
 	github.com/hashicorp/go-tfe v1.112.0
 	github.com/hashicorp/hcl/v2 v2.25.0
 	github.com/michielvha/logger v0.0.5
-	github.com/michielvha/stackweaver/core v0.614.0
+	github.com/michielvha/stackweaver/core v0.615.2
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/zclconf/go-cty v1.19.0
@@ -26,7 +26,6 @@ require (
 	google.golang.org/grpc v1.84.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/datatypes v1.2.7
-	gorm.io/driver/postgres v1.6.3
 	gorm.io/gorm v1.31.2
 )
 
@@ -116,4 +115,5 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gorm.io/driver/mysql v1.5.6 // indirect
+	gorm.io/driver/postgres v1.6.3 // indirect
 )
