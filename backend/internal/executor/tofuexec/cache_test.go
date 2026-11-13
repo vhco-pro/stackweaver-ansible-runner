@@ -107,6 +107,10 @@ func TestExecute_InstallsTheReleaseFromTheCache(t *testing.T) {
 	if *served != 1 {
 		t.Errorf("the blob route served %d entries, want the release once", *served)
 	}
+	// The log opens with the engine and where it came from (#1069, D1, AC2).
+	if got, want := firstLine(h), "OpenTofu "+version+" from the organization's cache"; got != want {
+		t.Errorf("the run log opens with %q, want %q", got, want)
+	}
 	if h.api.completed.CacheManifest != nil && len(h.api.completed.CacheManifest.Entries) > 0 {
 		t.Errorf("a release taken from the cache was reported: %+v", h.api.completed.CacheManifest)
 	}
@@ -190,6 +194,154 @@ func TestExecute_ReportsADownloadedRelease(t *testing.T) {
 	}
 	if e := m.Entries[0]; e.Kind != runnercontract.CacheKindTofu || e.Version != version || e.Platform != platform() || e.SHA256 != sum(release) {
 		t.Errorf("manifest entry = %+v", e)
+	}
+	// The log opens with the engine and the release base it was downloaded from (#1069, D1, AC2).
+	if got, want := firstLine(h), "OpenTofu "+version+" downloaded from "+rel.URL; got != want {
+		t.Errorf("the run log opens with %q, want %q", got, want)
+	}
+}
+
+// runLog is everything the executor streamed into the run's log, in order.
+func runLog(h *tofuHarness) string {
+	var log strings.Builder
+	for _, o := range h.api.outputs {
+		log.WriteString(o.Output)
+	}
+	return log.String()
+}
+
+// firstLine is the run log's first line.
+func firstLine(h *tofuHarness) string {
+	line, _, _ := strings.Cut(runLog(h), "\n")
+	return line
+}
+
+// An engine the image carries is named as such at the top of the log (#1069, D1, AC2). The stand-in
+// is the host's tofu on PATH reporting the version, which core/tofu treats like a baked binary.
+func TestExecute_ReportsTheEngineFromTheImage(t *testing.T) {
+	h := newTofuHarness(t, "run-engine-image")
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "tofu"), []byte(stubTofu), 0o700); err != nil { //nolint:gosec // G306: the stand-in must be executable
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if res := h.execute(t, "plan-only"); res.Status != "completed" {
+		t.Fatalf("plan-only = %+v", res)
+	}
+	if got, want := firstLine(h), "OpenTofu "+stubTofuVersion+" from the image"; got != want {
+		t.Errorf("the run log opens with %q, want %q", got, want)
+	}
+	if n := strings.Count(runLog(h), "OpenTofu "+stubTofuVersion+" from"); n != 1 {
+		t.Errorf("the engine line appears %d times, want once", n)
+	}
+}
+
+// A release an earlier job of the same launcher downloaded (the in-process driver keeps its home)
+// does not shadow the organization's cache: the cache supplies it, as #933 (D7, AC33) promises, and
+// without a cache entry the log names the earlier download rather than the image (#1069, D1).
+func TestExecute_PrefersTheCacheToAnEarlierDownload(t *testing.T) {
+	release := tofuZip(t)
+	e := entry("run-cache-earlier", runnercontract.CacheKindTofu, "tofu", stubTofuVersion, release)
+	h, served := cacheHarness(t, "run-cache-earlier", map[string][]byte{e.Path: release})
+	h.api.artifacts.Cache = &runnercontract.CacheDescriptor{OrganizationID: "org", Entries: []runnercontract.CacheEntryRef{e}}
+	if res := h.execute(t, "plan-only"); res.Status != "completed" {
+		t.Fatalf("plan-only = %+v", res)
+	}
+	if got, want := firstLine(h), "OpenTofu "+stubTofuVersion+" from the organization's cache"; got != want || *served != 1 {
+		t.Errorf("the run log opens with %q after %d blob fetches, want %q from one", got, *served, want)
+	}
+
+	h2 := newTofuHarness(t, "run-earlier-only")
+	if res := h2.execute(t, "plan-only"); res.Status != "completed" {
+		t.Fatalf("plan-only = %+v", res)
+	}
+	if got, want := firstLine(h2), "OpenTofu "+stubTofuVersion+" from an earlier download on this host"; got != want {
+		t.Errorf("the run log opens with %q, want %q", got, want)
+	}
+}
+
+// A run whose engine is neither in the image nor in the organization's cache and cannot be
+// downloaded fails before init, and its log says which version it could not get, every place it
+// tried in order, the release base and the reason, never fork/exec (#1069, D1, AC1).
+func TestExecute_FailsWithTheResolutionReason(t *testing.T) {
+	const version = "0.0.9-failtest"
+	osName, arch, _ := strings.Cut(platform(), "_")
+	zipName := "tofu_" + version + "_" + osName + "_" + arch + ".zip"
+	release := tofuZip(t)
+
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGatewayTimeout)
+	}))
+	t.Cleanup(gateway.Close)
+	tampered := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "_SHA256SUMS") {
+			_, _ = fmt.Fprintf(w, "%s  %s\n", strings.Repeat("a", 64), zipName)
+			return
+		}
+		_, _ = w.Write(release)
+	}))
+	t.Cleanup(tampered.Close)
+
+	for _, tc := range []struct {
+		name      string
+		releases  string
+		cached    bool
+		wantTried string
+		wantWhy   []string
+	}{
+		{
+			name: "the release host answers 504", releases: gateway.URL,
+			wantTried: "not in the image, ",
+			wantWhy:   []string{gateway.URL + " returned status 504 for " + zipName + " (3 attempts)"},
+		},
+		{
+			name: "nothing listens and the cache entry is unusable", releases: "http://127.0.0.1:1", cached: true,
+			wantTried: "not in the image, not in the organization's cache, ",
+			wantWhy:   []string{"http://127.0.0.1:1 could not be reached for " + zipName, "connection refused", "(3 attempts)"},
+		},
+		{
+			name: "the release fails its checksum", releases: tampered.URL,
+			wantTried: "not in the image, ",
+			wantWhy:   []string{tampered.URL, "checksum mismatch"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := entry("run-engine-fail", runnercontract.CacheKindTofu, "tofu", version, release)
+			// The blob route serves nothing, so the cache entry the descriptor names cannot be used.
+			h, _ := cacheHarness(t, "run-engine-fail", map[string][]byte{})
+			h.api.artifacts.TofuVersion = version
+			h.api.artifacts.Mirror = &runnercontract.Mirror{TofuReleasesURL: tc.releases}
+			if tc.cached {
+				h.api.artifacts.Cache = &runnercontract.CacheDescriptor{OrganizationID: "org", Entries: []runnercontract.CacheEntryRef{e}}
+			}
+
+			res := h.execute(t, "plan")
+			if res.Status != "failed" {
+				t.Fatalf("plan = %+v, want failed", res)
+			}
+			log := runLog(h)
+			want := "could not get OpenTofu " + version + ": " + tc.wantTried
+			if !strings.Contains(log, want) {
+				t.Errorf("run log %q does not hold %q", log, want)
+			}
+			for _, why := range tc.wantWhy {
+				if !strings.Contains(log, why) {
+					t.Errorf("run log %q does not name %q", log, why)
+				}
+			}
+			if strings.Count(log, "could not get OpenTofu") != 1 {
+				t.Errorf("run log %q holds the message other than once", log)
+			}
+			if c := h.api.completed; c == nil || !strings.Contains(c.ErrorMessage, want) || strings.Contains(c.ErrorMessage, "fork/exec") {
+				t.Errorf("completion = %+v, want the message and no fork/exec", c)
+			}
+			if strings.Contains(log, "fork/exec") {
+				t.Errorf("run log %q describes the missing engine with fork/exec", log)
+			}
+			if calls := h.read(t, "calls"); calls != "" {
+				t.Errorf("the engine ran %q after resolution failed", calls)
+			}
+		})
 	}
 }
 

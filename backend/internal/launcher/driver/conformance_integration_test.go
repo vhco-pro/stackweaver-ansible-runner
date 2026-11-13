@@ -42,9 +42,11 @@ import (
 
 const conformanceTofuVersion = "0.0.0-conformance"
 
-// conformanceTofu is the stand-in engine: deterministic output, a saved plan, a state.
+// conformanceTofu is the stand-in engine: deterministic output, a saved plan, a state. It answers
+// `version -json` like OpenTofu, so core/tofu takes it for the host's own binary of the version.
 const conformanceTofu = `#!/bin/sh
 case "$1" in
+version) echo '{"terraform_version":"` + conformanceTofuVersion + `"}' ;;
 init) echo "OpenTofu has been successfully initialized!" ;;
 plan)
   for a in "$@"; do case "$a" in -out=*) out="${a#-out=}" ;; esac; done
@@ -234,8 +236,9 @@ func buildConformanceImage(t *testing.T, e *engine, tag string) {
 }
 
 // inProcessConformance runs the job through the executor function the runner binary registers,
-// with the stand-in tofu where core/tofu's home fallback finds it: the report every other driver
-// must match. It runs as a subtest so that the temporary HOME ends with it: the go build of the
+// with the stand-in tofu as the host's own tofu on PATH, the in-process counterpart of the
+// image's baked binary, so both report the engine "from the image": the report every other
+// driver must match. (Under ~/.tofu-versions it would read as an earlier download on this host.) It runs as a subtest so that the temporary HOME ends with it: the go build of the
 // conformance image needs the real one for the module cache and the git credentials.
 func inProcessConformance(t *testing.T) conformanceRun {
 	t.Helper()
@@ -248,15 +251,12 @@ func inProcessConformance(t *testing.T) conformanceRun {
 
 func runInProcess(t *testing.T) conformanceRun {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	versions := filepath.Join(home, ".tofu-versions")
-	if err := os.MkdirAll(versions, 0o750); err != nil {
+	t.Setenv("HOME", t.TempDir())
+	hostBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hostBin, "tofu"), []byte(conformanceTofu), 0o700); err != nil { //nolint:gosec // G306: the stand-in must be executable
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(versions, "tofu-"+conformanceTofuVersion), []byte(conformanceTofu), 0o700); err != nil { //nolint:gosec // G306: the stand-in must be executable
-		t.Fatal(err)
-	}
+	t.Setenv("PATH", hostBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	inproc := &InProcess{Executors: map[string]ExecutorFunc{"tofu": func(ctx context.Context, inv Invocation) int {
 		c := executor.NewClient(inv.ServerURL, inv.Token, inv.RunnerID)
 		res := tofuexec.Execute(ctx, c, tofuexec.Job{ID: inv.JobID, RunType: inv.RunType}, tofuexec.Options{Console: io.Discard})

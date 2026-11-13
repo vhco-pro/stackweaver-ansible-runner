@@ -4,19 +4,15 @@ package tofuexec
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/michielvha/logger"
 	"github.com/michielvha/stackweaver/backend/internal/executor"
-	"github.com/michielvha/stackweaver/core/tofu"
 )
 
 // ExtractTarGz unpacks a run's configuration tarball into destDir with the executor's shared,
@@ -202,61 +198,4 @@ func parsePlanJSON(planJSON string) planMetadata {
 
 	meta.HasChanges = meta.Additions > 0 || meta.Changes > 0 || meta.Destructions > 0 || meta.OutputChanges > 0
 	return meta
-}
-
-// resolveTofuBinary finds the exact OpenTofu binary for the requested version, downloading it if
-// needed. Resolution and download live in core/tofu so this agent path and the library path in
-// core/plugins/opentofu share one implementation - historically this file carried a near-duplicate
-// downloader that never verified checksums (AUD-058 hardened only the other copy).
-//
-// The version must be set on the workspace or org before a run is created.
-func resolveTofuBinary(requestedVersion, releasesURL string) string {
-	if requestedVersion == "" {
-		logger.Errorf("FATAL: no opentofu version specified -- version must be set on workspace or organization")
-		return "tofu-version-not-set" // will fail with a clear error
-	}
-
-	path, err := tofu.ResolveBinaryFrom(requestedVersion, releasesURL)
-	if err != nil {
-		logger.Errorf("FATAL: cannot get opentofu %s: %v", requestedVersion, err)
-		// Return the canonical versioned path so the command fails with "binary not found"
-		// rather than silently executing a different version.
-		return tofu.VersionedPath(requestedVersion)
-	}
-	return path
-}
-
-// TofuVersion reports the version of the tofu binary on PATH, for runner registration.
-// OpenTofu keeps Terraform's `version -json` schema, including the "terraform_version" key.
-func TofuVersion() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, tofu.BinaryName, "version", "-json") //nolint:gosec // G204: BinaryName is a package constant, args are literals
-	output, err := cmd.Output()
-	if err != nil {
-		// Try without the -json flag
-		cmd = exec.CommandContext(ctx, tofu.BinaryName, "version") //nolint:gosec // G204: BinaryName is a package constant, args are literals
-		output, err = cmd.Output()
-		if err != nil {
-			return "unknown"
-		}
-		// Parse the first line: "OpenTofu vX.Y.Z"
-		lines := strings.Split(string(output), "\n")
-		if len(lines) > 0 {
-			parts := strings.Fields(lines[0])
-			if len(parts) >= 2 {
-				return strings.TrimPrefix(parts[1], "v")
-			}
-		}
-		return "unknown"
-	}
-
-	var versionInfo struct {
-		TerraformVersion string `json:"terraform_version"`
-	}
-	if err := json.Unmarshal(output, &versionInfo); err != nil {
-		return "unknown"
-	}
-	return versionInfo.TerraformVersion
 }
