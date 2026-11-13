@@ -1,6 +1,6 @@
 module github.com/michielvha/stackweaver/backend
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/ProtonMail/go-crypto v1.5.2
@@ -11,7 +11,7 @@ require (
 	github.com/hashicorp/go-tfe v1.112.0
 	github.com/hashicorp/hcl/v2 v2.25.0
 	github.com/michielvha/logger v0.0.5
-	github.com/michielvha/stackweaver/core v0.616.0
+	github.com/michielvha/stackweaver/core v0.616.1
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/zclconf/go-cty v1.19.0
