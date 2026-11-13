@@ -28,6 +28,7 @@ import (
 
 	"github.com/michielvha/stackweaver/backend/internal/executor"
 	"github.com/michielvha/stackweaver/core/runnercontract"
+	"github.com/michielvha/stackweaver/core/tofu"
 )
 
 const stubTofuVersion = "0.0.0-executetest"
@@ -165,20 +166,44 @@ func newTofuHarness(t *testing.T, runID string) *tofuHarness {
 	return &tofuHarness{api: api, client: executor.NewClient(srv.URL, "placeholder-job-token", "runner-1"), record: record}
 }
 
-// passStubEnv lets the stand-in see where to record: the run's environment admits only allowlisted
-// variables, so the test hands them over as the run's own.
-func (h *tofuHarness) passStubEnv(t *testing.T) {
+// prepare passes the stand-in its recording environment and bounds installed stubs to the test.
+func (h *tofuHarness) prepare(t *testing.T) {
 	t.Helper()
 	if h.api.artifacts.EnvironmentVars == nil {
 		h.api.artifacts.EnvironmentVars = map[string]string{}
 	}
 	h.api.artifacts.EnvironmentVars["STUB_RECORD"] = os.Getenv("STUB_RECORD")
 	h.api.artifacts.EnvironmentVars["STUB_RUN"] = os.Getenv("STUB_RUN")
+	// The real installer prefers its global path when CI can write there. Keep
+	// a downloaded test stub within this test's lifetime, just like its HOME.
+	path := tofu.VersionedPath(h.api.artifacts.TofuVersion)
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		t.Cleanup(func() {
+			info, err := os.Lstat(path)
+			if os.IsNotExist(err) {
+				return
+			}
+			if err != nil {
+				t.Errorf("inspect installed test stub: %v", err)
+				return
+			}
+			data, err := os.ReadFile(path) //nolint:gosec // G304: the known versioned test installation
+			if err != nil || !info.Mode().IsRegular() || !bytes.Equal(data, []byte(stubTofu)) {
+				t.Errorf("preserving unexpected file at test installation %s", path)
+				return
+			}
+			if err := os.Remove(path); err != nil {
+				t.Errorf("remove installed test stub: %v", err)
+			}
+		})
+	} else if err != nil {
+		t.Fatalf("inspect existing engine installation: %v", err)
+	}
 }
 
 func (h *tofuHarness) execute(t *testing.T, runType string) Result {
 	t.Helper()
-	h.passStubEnv(t)
+	h.prepare(t)
 	return Execute(t.Context(), h.client, Job{ID: h.api.artifacts.JobID, RunType: runType}, Options{Console: io.Discard})
 }
 
