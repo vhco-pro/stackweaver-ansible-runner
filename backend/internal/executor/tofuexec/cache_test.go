@@ -240,24 +240,28 @@ func TestExecute_ReportsTheEngineFromTheImage(t *testing.T) {
 // does not shadow the organization's cache: the cache supplies it, as #933 (D7, AC33) promises, and
 // without a cache entry the log names the earlier download rather than the image (#1069, D1).
 func TestExecute_PrefersTheCacheToAnEarlierDownload(t *testing.T) {
-	release := tofuZip(t)
-	e := entry("run-cache-earlier", runnercontract.CacheKindTofu, "tofu", stubTofuVersion, release)
-	h, served := cacheHarness(t, "run-cache-earlier", map[string][]byte{e.Path: release})
-	h.api.artifacts.Cache = &runnercontract.CacheDescriptor{OrganizationID: "org", Entries: []runnercontract.CacheEntryRef{e}}
-	if res := h.execute(t, "plan-only"); res.Status != "completed" {
-		t.Fatalf("plan-only = %+v", res)
-	}
-	if got, want := firstLine(h), "OpenTofu "+stubTofuVersion+" from the organization's cache"; got != want || *served != 1 {
-		t.Errorf("the run log opens with %q after %d blob fetches, want %q from one", got, *served, want)
-	}
+	t.Run("cache takes precedence", func(t *testing.T) {
+		release := tofuZip(t)
+		e := entry("run-cache-earlier", runnercontract.CacheKindTofu, "tofu", stubTofuVersion, release)
+		h, served := cacheHarness(t, "run-cache-earlier", map[string][]byte{e.Path: release})
+		h.api.artifacts.Cache = &runnercontract.CacheDescriptor{OrganizationID: "org", Entries: []runnercontract.CacheEntryRef{e}}
+		if res := h.execute(t, "plan-only"); res.Status != "completed" {
+			t.Fatalf("plan-only = %+v", res)
+		}
+		if got, want := firstLine(h), "OpenTofu "+stubTofuVersion+" from the organization's cache"; got != want || *served != 1 {
+			t.Errorf("the run log opens with %q after %d blob fetches, want %q from one", got, *served, want)
+		}
+	})
 
-	h2 := newTofuHarness(t, "run-earlier-only")
-	if res := h2.execute(t, "plan-only"); res.Status != "completed" {
-		t.Fatalf("plan-only = %+v", res)
-	}
-	if got, want := firstLine(h2), "OpenTofu "+stubTofuVersion+" from an earlier download on this host"; got != want {
-		t.Errorf("the run log opens with %q, want %q", got, want)
-	}
+	t.Run("earlier download without a cache entry", func(t *testing.T) {
+		h := newTofuHarness(t, "run-earlier-only")
+		if res := h.execute(t, "plan-only"); res.Status != "completed" {
+			t.Fatalf("plan-only = %+v", res)
+		}
+		if got, want := firstLine(h), "OpenTofu "+stubTofuVersion+" from an earlier download on this host"; got != want {
+			t.Errorf("the run log opens with %q, want %q", got, want)
+		}
+	})
 }
 
 // A run whose engine is neither in the image nor in the organization's cache and cannot be
@@ -404,7 +408,7 @@ func TestExecute_LogsWhatTheCacheSupplied(t *testing.T) {
 	h3.api.artifacts.ConfigTarball = configWithLock(t, lock)
 	h3.api.artifacts.Mirror = &runnercontract.Mirror{TofuReleasesURL: "http://127.0.0.1:1"}
 	h3.api.artifacts.Cache = &runnercontract.CacheDescriptor{OrganizationID: "org", Entries: []runnercontract.CacheEntryRef{tofuLocal, provEntry}}
-	h3.passStubEnv(t)
+	h3.prepare(t)
 	if res := Execute(t.Context(), h3.client, Job{ID: h3.api.artifacts.JobID, RunType: "plan-only"}, Options{Console: io.Discard, CacheDir: local}); res.Status != "completed" {
 		t.Fatalf("plan-only from the node-local copy = %+v", res)
 	}
