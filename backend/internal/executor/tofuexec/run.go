@@ -181,10 +181,21 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 			}
 		}
 	}
-	tfBinary := cache.tofuBinary(ctx, arts.TofuVersion, releases)
-	tfEnv := tofu.RunEnv(vars)
-
 	args, isPlan, logPhase := phaseArgs(job.RunType, planPath, varFile)
+	stdout, stderr := io.Writer(os.Stdout), io.Writer(os.Stderr)
+	if opts.Console != nil {
+		stdout, stderr = opts.Console, opts.Console
+	}
+
+	// The log opens with the engine and where it came from; an engine that cannot be got fails the
+	// run here, before init, with the reason in the log (#1069, D1).
+	tfBinary, source, err := cache.tofuBinary(ctx, arts.TofuVersion, releases)
+	engine := engineReport(arts.TofuVersion, source, err)
+	writeLogLine(ctx, c, job.ID, logPhase, engine, stdout)
+	if err != nil {
+		return failed("", errors.New(strings.TrimSuffix(engine, "\n")))
+	}
+	tfEnv := tofu.RunEnv(vars)
 
 	// The apply phase applies the plan phase's saved plan as it is (AC6): never a second plan,
 	// which would apply something nobody reviewed. OpenTofu refuses a saved plan the state moved
@@ -240,10 +251,6 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 
 	fullOutput := &bytes.Buffer{}
 	streamer := &streamWriter{ctx: runCtx, client: c, jobID: job.ID, phase: logPhase, buffer: &bytes.Buffer{}, lastSend: time.Now(), planned: planned}
-	stdout, stderr := io.Writer(os.Stdout), io.Writer(os.Stderr)
-	if opts.Console != nil {
-		stdout, stderr = opts.Console, opts.Console
-	}
 	cmd.Stdout, cmd.Stderr = jobOutputWriters(streamer, fullOutput, stdout, stderr)
 	// The log opens with what the organization's cache supplied (AC33).
 	if line := cache.summary(); line != "" {
@@ -463,6 +470,17 @@ func (w *streamWriter) flush() {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 10*time.Second)
 	defer cancel()
 	if err := w.client.Output(ctx, w.jobID, req); err != nil {
+		logger.Warnf("Failed to send job output: %v", err)
+	}
+}
+
+// writeLogLine sends one line the executor writes itself into the run's log for phase, ahead of
+// the engine's output, and copies it to the console.
+func writeLogLine(ctx context.Context, c *executor.Client, jobID, phase, line string, console io.Writer) {
+	_, _ = io.WriteString(console, line)
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := c.Output(sendCtx, jobID, runnercontract.JobOutputRequest{Output: line, Stream: phase}); err != nil {
 		logger.Warnf("Failed to send job output: %v", err)
 	}
 }

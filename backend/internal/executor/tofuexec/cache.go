@@ -58,49 +58,94 @@ func (u *cacheUse) entries(kind runnercontract.CacheKind) []runnercontract.Cache
 	return out
 }
 
-// tofuBinary is the run's engine: the cached release when the descriptor names one that verifies,
-// otherwise core/tofu's resolution, whose download is reported.
-func (u *cacheUse) tofuBinary(ctx context.Context, version, releases string) string {
-	if version == "" {
-		return resolveTofuBinary(version, releases) //nolint:contextcheck // core/tofu resolves once per job with its own deadline
-	}
-	if _, err := os.Stat(tofu.VersionedPath(version)); err != nil {
-		for _, e := range u.entries(runnercontract.CacheKindTofu) {
-			if e.Version != version {
-				continue
-			}
-			zip := filepath.Join(u.scratch, "tofu-"+e.SHA256+".zip")
-			src, err := u.cache.Fetch(ctx, e, zip)
-			if err != nil || src == executor.SourceNone {
-				if err != nil {
-					logger.Warnf("The cached tofu %s could not be used: %v", version, err)
-				}
-				continue
-			}
-			path, err := tofu.InstallZip(version, zip)
-			_ = os.Remove(zip)
-			if err == nil {
-				logger.Infof("tofu: installed opentofu %s from the organization's cache (%s)", version, src)
-				u.tofuVersion = version
-				if src == executor.SourceBlob {
-					u.fromAPI++
-				}
-				return path
-			}
-			logger.Warnf("Installing the cached tofu %s failed: %v", version, err)
+// engineSource is where a run's engine came from, or, when it could not be got, what was tried.
+type engineSource struct {
+	// kind is sourceImage, sourceCache or sourceDownload; "" when the engine could not be got.
+	kind string
+	// releases is the release base a downloaded engine came from.
+	releases string
+	// triedCache records that the descriptor named the version and its entries could not be used.
+	triedCache bool
+}
+
+const (
+	sourceImage    = "image"
+	sourceCache    = "cache"
+	sourceDownload = "download"
+	sourceEarlier  = "earlier"
+)
+
+// engineReport is the line a run's log opens with (#1069, D1): the engine version and where it came
+// from, or, when err is set, the one message naming the version, every place tried in order and
+// core/tofu's reason verbatim. Both come from here so the success line, the failure and their tests
+// agree on the words.
+func engineReport(version string, src engineSource, err error) string {
+	if err != nil {
+		tried := "not in the image, "
+		if src.triedCache {
+			tried += "not in the organization's cache, "
 		}
+		return fmt.Sprintf("could not get OpenTofu %s: %s%v\n", version, tried, err)
+	}
+	switch src.kind {
+	case sourceCache:
+		return fmt.Sprintf("OpenTofu %s from the organization's cache\n", version)
+	case sourceDownload:
+		return fmt.Sprintf("OpenTofu %s downloaded from %s\n", version, src.releases)
+	case sourceEarlier:
+		return fmt.Sprintf("OpenTofu %s from an earlier download on this host\n", version)
+	default:
+		return fmt.Sprintf("OpenTofu %s from the image\n", version)
+	}
+}
+
+// tofuBinary is the run's engine and where it came from: the image's (or the host's) own binary of
+// the version, else the cached release when the descriptor names one that verifies, else
+// core/tofu's download, which is reported. It never returns a path that does not exist: when the
+// version cannot be got the error says why, and the run fails on it before init.
+func (u *cacheUse) tofuBinary(ctx context.Context, version, releases string) (string, engineSource, error) {
+	if path, ok := tofu.Baked(version); ok { //nolint:contextcheck // core/tofu bounds its host probe with its own deadline
+		return path, engineSource{kind: sourceImage}, nil
+	}
+	var src engineSource
+	for _, e := range u.entries(runnercontract.CacheKindTofu) {
+		if e.Version != version {
+			continue
+		}
+		src.triedCache = true
+		zip := filepath.Join(u.scratch, "tofu-"+e.SHA256+".zip")
+		from, err := u.cache.Fetch(ctx, e, zip)
+		if err != nil || from == executor.SourceNone {
+			if err != nil {
+				logger.Warnf("The cached tofu %s could not be used: %v", version, err)
+			}
+			continue
+		}
+		path, err := tofu.InstallZip(version, zip)
+		_ = os.Remove(zip)
+		if err == nil {
+			logger.Infof("tofu: installed opentofu %s from the organization's cache (%s)", version, from)
+			u.tofuVersion = version
+			if from == executor.SourceBlob {
+				u.fromAPI++
+			}
+			return path, engineSource{kind: sourceCache}, nil
+		}
+		logger.Warnf("Installing the cached tofu %s failed: %v", version, err)
 	}
 	path, dl, err := tofu.ResolveBinaryReporting(version, releases) //nolint:contextcheck // core/tofu resolves once per job with its own deadline
 	if err != nil {
-		logger.Errorf("FATAL: cannot get opentofu %s: %v", version, err)
-		return tofu.VersionedPath(version)
+		logger.Errorf("Could not get opentofu %s: %v", version, err)
+		return "", src, err
 	}
-	if dl != nil {
-		u.manifest = append(u.manifest, runnercontract.CacheEntry{
-			Kind: runnercontract.CacheKindTofu, Name: "tofu", Version: dl.Version, Platform: dl.Platform, SHA256: dl.SHA256,
-		})
+	if dl == nil {
+		// A copy an earlier job of this launcher downloaded (the in-process driver keeps its home).
+		return path, engineSource{kind: sourceEarlier}, nil
 	}
-	return path
+	u.manifest = append(u.manifest, runnercontract.CacheEntry{
+		Kind: runnercontract.CacheKindTofu, Name: "tofu", Version: dl.Version, Platform: dl.Platform, SHA256: dl.SHA256,
+	})
+	return path, engineSource{kind: sourceDownload, releases: dl.ReleasesURL}, nil
 }
 
 // placeProviders writes the descriptor's provider packages for this platform into a packed

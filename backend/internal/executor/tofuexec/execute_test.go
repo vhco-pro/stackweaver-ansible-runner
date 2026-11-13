@@ -40,6 +40,8 @@ sub="$1"
 echo "$@" >> "$rec/calls"
 env > "$rec/$sub.env"
 case "$sub" in
+version)
+  echo '{"terraform_version":"0.0.0-executetest"}' ;;
 init)
   if [ -n "$TF_CLI_CONFIG_FILE" ]; then
     cp "$TF_CLI_CONFIG_FILE" "$rec/tofurc"
