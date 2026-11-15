@@ -75,7 +75,16 @@ func gitIn(t *testing.T, dir string, args ...string) {
 // gitServer serves a bare repository over HTTPS behind basic authentication, as a VCS host does.
 func gitServer(t *testing.T, user, token string) (url, caFile, commit string) {
 	t.Helper()
-	root := t.TempDir()
+	url, caFile, commit, _ = gitServerAt(t, user, token)
+	return url, caFile, commit
+}
+
+// gitServerAt is gitServer that also returns the directory it serves from: root/work is the
+// repository the first commit was made in and root/repo.git the bare repository served, so a test
+// can push more history after the server is up.
+func gitServerAt(t *testing.T, user, token string) (url, caFile, commit, root string) {
+	t.Helper()
+	root = t.TempDir()
 	work := filepath.Join(root, "work")
 	if err := os.MkdirAll(work, 0o750); err != nil {
 		t.Fatal(err)
@@ -109,7 +118,7 @@ func gitServer(t *testing.T, user, token string) (url, caFile, commit string) {
 	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return srv.URL + "/repo.git", caFile, strings.TrimSpace(string(head))
+	return srv.URL + "/repo.git", caFile, strings.TrimSpace(string(head)), root
 }
 
 // noFileHolds fails when any file under dir contains secret.

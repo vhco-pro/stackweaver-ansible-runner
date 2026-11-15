@@ -181,9 +181,10 @@ func runKind(ctx context.Context, c *executor.Client, jobID string, arts *runner
 		}
 		_, _ = fmt.Fprintf(out, "Captured %s at %s (%d bytes)\n", arts.PlaybookPath, result.Commit, len(data))
 		return c.UploadSnapshot(ctx, jobID, result.Commit, data)
-	case models.WorkItemConfigurationSnapshot:
-		// The run's configuration: the repository at the branch head, without its .git, as a push
-		// captures it; the run's working directory is applied by the OpenTofu executor.
+	case models.WorkItemConfigurationSnapshot, models.WorkItemModuleTagSnapshot:
+		// The run's configuration: the repository at the requested commit or the branch head,
+		// without its .git; the run's working directory is applied by the OpenTofu executor. A
+		// module capture is the repository at its tag, from which the API publishes the version.
 		if arts.Clone == nil {
 			return errors.New("the work item names no repository")
 		}
