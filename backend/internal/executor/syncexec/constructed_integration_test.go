@@ -170,7 +170,7 @@ func executeWorkItem(t *testing.T, rt *ansible.WorkItemRuntime, item *models.Wor
 			if req.Status == "completed" {
 				status = models.WorkItemStatusCompleted
 			}
-			if _, err := rt.Finished(item, status, req.ErrorMessage, req.WorkResult); err != nil {
+			if _, err := rt.FinishedContext(t.Context(), item, status, req.ErrorMessage, req.WorkResult); err != nil {
 				t.Errorf("finishing work item %s: %v", item.ID, err)
 			}
 			_, _ = w.Write([]byte(`{"status":"completed"}`))
