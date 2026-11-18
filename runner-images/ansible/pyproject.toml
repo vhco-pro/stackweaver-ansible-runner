@@ -40,12 +40,21 @@ vmware = [
     "pyvmomi>=9.0",
 ]
 
+# WinRM transport for the bundled Windows collections: pywinrm, NTLM authentication
+# (requests-ntlm) and its message encryption (pyspnego).
+winrm = [
+    "pywinrm>=0.5",
+    "requests-ntlm>=1.3",
+    "pyspnego>=0.11",
+]
+
 # Convenience group: install everything (default for official image)
 all = [
     { include-group = "aws" },
     { include-group = "azure" },
     { include-group = "gcp" },
     { include-group = "vmware" },
+    { include-group = "winrm" },
 ]
 
 [tool.uv]
