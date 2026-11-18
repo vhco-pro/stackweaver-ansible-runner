@@ -869,6 +869,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pyspnego"
+version = "0.12.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4b/58/d7c9cfdf1394a8b4d85ac488888814b28d26c4bd732191bd4169687cbfdd/pyspnego-0.12.4.tar.gz", hash = "sha256:acb314d6ca5c9ce87994b1eebbe2d8b687e0d564f9d650b306afb4c8f9c2ffd5", size = 235376, upload-time = "2026-10-06T03:46:23.105Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/4e/f6c1bb147890f246c3a24ce836be4f6cfc44fd7be08e0a229e3a1c08b560/pyspnego-0.12.4-py3-none-any.whl", hash = "sha256:a29a34de1abe9e9b30d9aa1d363f8e49fc159eb7355b1f2ee86ccb3a2ce3bba9", size = 131003, upload-time = "2026-10-06T03:46:21.509Z" },
+]
+
+[[package]]
 name = "python-dateutil"
 version = "2.9.0.post0"
 source = { registry = "https://pypi.org/simple" }
@@ -907,6 +919,20 @@ version = "9.0.0.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4d/e4/fbb539220f9d7647bf92543401f1b443cd43b25354237291e64618da3e4a/pyvmomi-9.0.0.0-py3-none-any.whl", hash = "sha256:7812642a62b6ce2b439d7e4856d27101ad102734bce41daf77bedfb3e2d9cbf2", size = 1993709, upload-time = "2025-06-17T16:54:05.865Z" },
+]
+
+[[package]]
+name = "pywinrm"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "requests-ntlm" },
+    { name = "xmltodict" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/2f/d835c342c4b11e28beaccef74982e7669986c84bf19654c39f53c8b8243c/pywinrm-0.5.0.tar.gz", hash = "sha256:5428eb1e494af7954546cd4ff15c9ef1a30a75e05b25a39fd606cef22201e9f1", size = 40875, upload-time = "2024-07-16T19:32:05.624Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/45/4340320145c225387f40ce412de1b209d991c322032e4922cc0a9935fd31/pywinrm-0.5.0-py3-none-any.whl", hash = "sha256:c267046d281de613fc7c8a528cdd261564d9b99bdb7c2926221eff3263b700c8", size = 48182, upload-time = "2024-07-16T19:32:03.001Z" },
 ]
 
 [[package]]
@@ -969,6 +995,20 @@ wheels = [
 [package.optional-dependencies]
 socks = [
     { name = "pysocks" },
+]
+
+[[package]]
+name = "requests-ntlm"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyspnego" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/74/5d4e1815107e9d78c44c3ad04740b00efd1189e5a9ec11e5275b60864e54/requests_ntlm-1.3.0.tar.gz", hash = "sha256:b29cc2462623dffdf9b88c43e180ccb735b4007228a542220e882c58ae56c668", size = 16112, upload-time = "2024-06-09T23:52:04.854Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/5d/836b97537a390cf811b0488490c389c5a614f0a93acb23f347bd37a2d914/requests_ntlm-1.3.0-py3-none-any.whl", hash = "sha256:4c7534a7d0e482bb0928531d621be4b2c74ace437e88c5a357ceb7452d25a510", size = 6577, upload-time = "2024-06-09T23:52:03.241Z" },
 ]
 
 [[package]]
@@ -1129,7 +1169,10 @@ all = [
     { name = "boto3" },
     { name = "botocore" },
     { name = "google-auth" },
+    { name = "pyspnego" },
     { name = "pyvmomi" },
+    { name = "pywinrm" },
+    { name = "requests-ntlm" },
 ]
 aws = [
     { name = "boto3" },
@@ -1148,6 +1191,11 @@ gcp = [
 ]
 vmware = [
     { name = "pyvmomi" },
+]
+winrm = [
+    { name = "pyspnego" },
+    { name = "pywinrm" },
+    { name = "requests-ntlm" },
 ]
 
 [package.metadata]
@@ -1169,7 +1217,10 @@ all = [
     { name = "boto3", specifier = ">=1.35" },
     { name = "botocore", specifier = ">=1.35" },
     { name = "google-auth", specifier = ">=2.30" },
+    { name = "pyspnego", specifier = ">=0.11" },
     { name = "pyvmomi", specifier = ">=9.0" },
+    { name = "pywinrm", specifier = ">=0.5" },
+    { name = "requests-ntlm", specifier = ">=1.3" },
 ]
 aws = [
     { name = "boto3", specifier = ">=1.35" },
@@ -1185,6 +1236,11 @@ azure = [
 ]
 gcp = [{ name = "google-auth", specifier = ">=2.30" }]
 vmware = [{ name = "pyvmomi", specifier = ">=9.0" }]
+winrm = [
+    { name = "pyspnego", specifier = ">=0.11" },
+    { name = "pywinrm", specifier = ">=0.5" },
+    { name = "requests-ntlm", specifier = ">=1.3" },
+]
 
 [[package]]
 name = "subprocess-tee"
@@ -1232,6 +1288,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/79/3e/c0bdc27cf06f4e47680bd5803a07cb3dfd17de84cde92dd217dcb9e05253/wcmatch-10.1.tar.gz", hash = "sha256:f11f94208c8c8484a16f4f48638a85d771d9513f4ab3f37595978801cb9465af", size = 117421, upload-time = "2025-06-22T19:14:02.49Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/d8/0d1d2e9d3fabcf5d6840362adcf05f8cf3cd06a73358140c3a97189238ae/wcmatch-10.1-py3-none-any.whl", hash = "sha256:5848ace7dbb0476e5e55ab63c6bbd529745089343427caa5537f230cc01beb8a", size = 39854, upload-time = "2025-06-22T19:14:00.978Z" },
+]
+
+[[package]]
+name = "xmltodict"
+version = "1.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/70/80f3b7c10d2630aa66414bf23d210386700aa390547278c789afa994fd7e/xmltodict-1.0.4.tar.gz", hash = "sha256:6d94c9f834dd9e44514162799d344d815a3a4faec913717a9ecbfa5be1bb8e61", size = 26124, upload-time = "2026-02-22T02:21:22.074Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/34/98a2f52245f4d47be93b580dae5f9861ef58977d73a79eb47c58f1ad1f3a/xmltodict-1.0.4-py3-none-any.whl", hash = "sha256:a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a", size = 13580, upload-time = "2026-02-22T02:21:21.039Z" },
 ]
 
 [[package]]
