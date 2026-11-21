@@ -1,0 +1,53 @@
+# Copyright (c) 2026 VH & Co BV. Licensed under the Business Source License 1.1. See LICENSE for details.
+#
+# Tells the monorepo that this satellite's Release finished, so its held syncs (the chart and the
+# frontend bundle) re-evaluate whether they may publish. See
+# docs/internal/plans/infrastructure/ci-release/release-publication-ordering-plan.md in the monorepo.
+
+name: Signal monorepo
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Mint release-signal installation token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_SIGNAL_APP_ID }}
+          private-key: ${{ secrets.RELEASE_SIGNAL_PRIVATE_KEY }}
+          owner: michielvha
+          repositories: stackweaver
+
+      - name: Dispatch the held syncs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ github.event.workflow_run.head_branch }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          TARGETS: "sync-frontend.yml sync-helm.yml"
+        run: |
+          # Every target is attempted; the job fails afterwards if any dispatch was refused.
+          failed=0
+          for target in $TARGETS; do
+            if gh workflow run "$target" -R michielvha/stackweaver --ref main -f reason="$REPO $VERSION $CONCLUSION"; then
+              echo "dispatched $target ($REPO $VERSION $CONCLUSION)"
+            else
+              echo "::error::dispatch of $target was refused"
+              failed=1
+            fi
+          done
+          exit "$failed"
