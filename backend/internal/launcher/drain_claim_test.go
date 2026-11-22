@@ -14,7 +14,7 @@ import (
 // places the job and drains it, rather than leaving a claimed job with no placement for the API to
 // declare lost (one-launcher spec, A8: an upgrade lets running work finish).
 func TestAStopDuringAClaimLetsThePlacementFinish(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"

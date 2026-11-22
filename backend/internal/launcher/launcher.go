@@ -133,13 +133,18 @@ type Launcher struct {
 	poller *Poller
 	goos   string
 
-	// apiReady is set once the API has declared the job-token capability: without it the launcher
+	// apiReady requires job-token and claim-recovery support: without them the launcher
 	// places nothing, because the only alternative would be handing the executor the runner token
 	// (AC72).
 	apiReady   atomic.Bool
 	registered atomic.Bool
 	lastBeat   atomic.Int64
 	draining   atomic.Bool
+	// singlePlaced records successful placement, so a lost candidate does not consume single mode.
+	singlePlaced atomic.Bool
+	startupReady atomic.Bool
+	// recoveryCancel bounds startup discovery at hard drain. It is assigned before the loop starts.
+	recoveryCancel context.CancelFunc
 
 	// readThrough is the node-local cache, nil when CacheDir is empty.
 	readThrough *cache.ReadThrough
@@ -155,6 +160,10 @@ type Launcher struct {
 
 	mu       sync.Mutex
 	inflight map[string]*supervised
+	// Startup inventories retain the last successful evidence while a later read is unavailable.
+	activeClaims      []runnercontract.ActiveClaim
+	claimsAvailable   bool
+	startupPlacements []driver.Placement
 	// lastInventory is when the job namespace's inventory was last reported.
 	lastInventory time.Time
 	done          chan struct{} // a job ended: capacity is free
@@ -212,7 +221,15 @@ func (l *Launcher) Run(ctx context.Context) error {
 	l.noteAPICapabilities(resp.Capabilities)
 	l.client.logf("Launcher registered with ID %s (driver %s, capacity %d)", resp.RunnerID, l.driver.Name(), l.cfg.Capacity)
 
-	l.reconcile(ctx)
+	l.noteActiveClaims(resp.ActiveClaims)
+	recoveryCtx, stopRecovery := context.WithCancel(context.WithoutCancel(ctx))
+	l.recoveryCancel = stopRecovery
+	defer stopRecovery()
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.reconcile(recoveryCtx)
+	}()
 	go l.reapKept(ctx)
 	go l.populate(ctx)
 	l.loop(ctx)
@@ -303,12 +320,12 @@ func (l *Launcher) checkConfig() error {
 	return nil
 }
 
-// noteAPICapabilities records whether the API issues job tokens. An API that predates them is
+// noteAPICapabilities records whether the API supports original-claim recovery. Older APIs are
 // waited for, never worked around.
 func (l *Launcher) noteAPICapabilities(caps []string) {
-	ready := slices.Contains(caps, runnercontract.CapabilityJobToken)
+	ready := slices.Contains(caps, runnercontract.CapabilityJobToken) && slices.Contains(caps, runnercontract.CapabilityClaimRecovery)
 	if !ready && l.apiReady.Load() == ready {
-		l.client.logf("The API does not issue job tokens yet (an older release): this launcher places nothing until it does")
+		l.client.logf("The API does not support job tokens and claim recovery yet: this launcher waits before placing work")
 	}
 	l.apiReady.Store(ready)
 }
@@ -356,33 +373,44 @@ func (l *Launcher) registerRequest() runnercontract.RegisterRequest {
 func (l *Launcher) running() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.inflight)
+	if l.startupReady.Load() {
+		return len(l.inflight)
+	}
+	known := make(map[string]struct{}, len(l.inflight)+len(l.activeClaims)+len(l.startupPlacements))
+	for key := range l.inflight {
+		known[key] = struct{}{}
+	}
+	for _, claim := range l.activeClaims {
+		known[claim.JobID] = struct{}{}
+	}
+	for _, placement := range l.startupPlacements {
+		key := placement.Labels[driver.LabelJob]
+		if key == "" {
+			key = "placement:" + placement.ID
+		}
+		known[key] = struct{}{}
+	}
+	return len(known)
 }
 
 // loop heartbeats and claims until ctx ends.
 func (l *Launcher) loop(ctx context.Context) {
-	claimed := 0
 	for ctx.Err() == nil {
-		if l.cfg.Single && claimed > 0 {
-			// One job and done: wait for it, then drain and deregister.
-			if l.running() == 0 {
-				return
-			}
-			select {
-			case <-ctx.Done():
-			case <-l.done:
-			case <-time.After(l.cfg.idleBeat()):
-			}
-			continue
+		current := l.running()
+		if l.cfg.Single && l.singlePlaced.Load() && current == 0 {
+			return
 		}
-		free := l.cfg.Capacity - l.running()
+		free := max(0, l.cfg.Capacity-current)
 		if l.cfg.Single {
 			free = min(free, 1)
+			if current > 0 || l.singlePlaced.Load() {
+				free = 0
+			}
 		}
-		if !l.apiReady.Load() {
+		if !l.apiReady.Load() || !l.startupReady.Load() {
 			free = 0
 		}
-		state := runnercontract.HeartbeatRequest{Status: "online", CurrentJobs: l.running(), AvailableCapacity: free}
+		state := runnercontract.HeartbeatRequest{Status: "online", CurrentJobs: current, AvailableCapacity: free}
 		if state.CurrentJobs > 0 {
 			state.Status = "busy"
 		}
@@ -398,6 +426,7 @@ func (l *Launcher) loop(ctx context.Context) {
 		}
 		if err == nil {
 			l.lastBeat.Store(time.Now().UnixNano())
+			l.noteActiveClaims(resp.ActiveClaims)
 			if resp.Capabilities != nil {
 				l.noteAPICapabilities(resp.Capabilities)
 			}
@@ -412,12 +441,11 @@ func (l *Launcher) loop(ctx context.Context) {
 			l.ensureObjects(ctx, resp.Ensure)
 			l.queuePromotions(resp.CachePromotions, resp.Mirror)
 			for _, offer := range resp.PendingJobs {
-				if free <= 0 || ctx.Err() != nil {
+				if free <= 0 || ctx.Err() != nil || !l.apiReady.Load() || !l.startupReady.Load() {
 					break
 				}
 				if l.claim(ctx, offer) {
 					free--
-					claimed++
 				}
 			}
 		}
@@ -434,48 +462,93 @@ func (l *Launcher) loop(ctx context.Context) {
 	}
 }
 
-// claim takes one offer: the atomic claim, the job token, the placement, and the supervision that
-// follows. It reports whether the job is now in flight here.
-func (l *Launcher) claim(ctx context.Context, offer runnercontract.PendingJob) bool {
-	l.mu.Lock()
-	_, already := l.inflight[offer.JobID]
-	l.mu.Unlock()
-	if already {
+// claim reserves capacity before sending any request. One worker retains the original identity
+// through acquisition, placement and supervision, while the heartbeat loop continues.
+func (l *Launcher) claim(parent context.Context, offer runnercontract.PendingJob) bool {
+	if parent.Err() != nil || !validOffer(offer) {
 		return false
 	}
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	s := &supervised{jobID: offer.JobID, cancel: cancel, expected: runnercontract.JobTokenRequest{
+		Attempt: offer.Attempt, Phase: offer.Phase, RunType: offer.RunType,
+	}}
+	l.mu.Lock()
+	if len(l.inflight) >= l.cfg.Capacity || l.draining.Load() {
+		l.mu.Unlock()
+		cancel()
+		return false
+	}
+	for _, existing := range l.inflight {
+		if existing.jobID == offer.JobID {
+			l.mu.Unlock()
+			cancel()
+			return false
+		}
+	}
+	l.inflight[offer.JobID] = s
+	l.wg.Add(1)
+	l.mu.Unlock()
+	go func() {
+		defer l.wg.Done()
+		defer cancel()
+		defer l.finished(offer.JobID)
+		l.acquire(ctx, offer, s)
+	}()
+	return true
+}
+
+func validOffer(offer runnercontract.PendingJob) bool {
+	if offer.JobID == "" || offer.Attempt <= 0 {
+		return false
+	}
+	switch offer.JobType {
+	case "tofu_run":
+		switch offer.RunType {
+		case "plan", "plan-only", "plan-destroy":
+			return offer.Phase == "plan"
+		case "apply", "apply-destroy":
+			return offer.Phase == "apply"
+		}
+	case "ansible_job", runnercontract.JobTypeWorkItem:
+		return offer.Phase == "" && offer.RunType == ""
+	}
+	return false
+}
+
+func (l *Launcher) acquire(ctx context.Context, offer runnercontract.PendingJob, s *supervised) {
 	kind := l.engineOf(offer.JobType)
 	image := l.cfg.JobImages[kind]
 	// Every job runs its engine's job image, the platform default, until run images resolve a job's
 	// own image and level with its offer (D4).
 	report := &runnercontract.Placement{Driver: l.driver.Name(), Image: image, ImageLevel: runnercontract.ImageLevelPlatform}
-	// No new claim once the launcher is told to stop. A claim already sent finishes whatever stop
-	// arrives meanwhile: its answer, then the token, the placement and the supervision, so the
-	// drain waits for the job instead of cancelling it half-placed, which leaves a claimed job with
-	// no placement that the API then declares lost.
-	if ctx.Err() != nil {
-		return false
-	}
-	ctx = context.WithoutCancel(ctx)
-	if err := l.client.Start(ctx, offer.JobID, report); err != nil {
-		if !errors.Is(err, ErrClaimLost) {
+	if err := l.client.Start(ctx, offer, report); err != nil {
+		if !errors.Is(err, ErrClaimLost) && !terminalRefusal(err) {
 			l.client.logf("Claiming job %s failed: %v", offer.JobID, err)
+			l.deliverFailure(ctx, s, "the launcher could not confirm startup: "+err.Error())
 		}
-		return false
+		return
 	}
-	tok, err := l.client.JobToken(ctx, offer.JobID)
+	tok, err := l.client.JobToken(ctx, offer.JobID, s.expected)
 	if err != nil {
 		l.client.logf("Job %s claimed but no job token was issued: %v", offer.JobID, err)
-		_ = l.client.Fail(ctx, offer.JobID, "the launcher could not obtain a job token: "+err.Error())
-		return false
+		if !terminalRefusal(err) {
+			l.deliverFailure(ctx, s, "the launcher could not obtain a job token: "+err.Error())
+		}
+		return
+	}
+	s.token = tok.Token
+	// A token's existing expiry bounds pending delivery as well as execution. Recovery never
+	// extends the server-issued lifetime, and hard drain can still cancel this worker sooner.
+	if !tok.ExpiresAt.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, tok.ExpiresAt)
+		defer cancel()
 	}
 	req := driver.Request{
 		JobID: offer.JobID, Attempt: tok.Attempt, Kind: kind, RunType: offer.RunType, Image: image,
 		Command:     l.cfg.ExecutorCommand[kind],
 		NetworkMode: l.cfg.NetworkMode,
 		Server:      l.cfg.ServerURL, RunnerID: l.client.RunnerID(), Token: tok.Token,
-		Env: ExecutorEnv(os.Environ(), ExecutorInvocation{
-			ServerURL: l.cfg.ServerURL, JobID: offer.JobID, Token: tok.Token, RunType: offer.RunType, RunnerID: l.client.RunnerID(),
-		}),
 		Labels: l.labels(offer.JobID, kind, offer.RunType, tok.Attempt),
 	}
 	if id := tok.Identity; id != nil {
@@ -486,8 +559,12 @@ func (l *Launcher) claim(ctx context.Context, offer runnercontract.PendingJob) b
 		req.KeepFailedFor = time.Duration(p.KeepFailedForSeconds) * time.Second
 	}
 	if tok.Pool == nil || !tok.Pool.NoLocalReadthrough {
-		req.Cache = l.prepareCache(ctx, offer.JobID, tok.Cache)
+		req.Cache, req.CacheRemoteExhausted = l.prepareCache(ctx, offer.JobID, tok.Cache)
 	}
+	req.Env = ExecutorEnv(os.Environ(), ExecutorInvocation{
+		ServerURL: req.Server, JobID: req.JobID, Token: req.Token, RunType: req.RunType, RunnerID: req.RunnerID,
+		CacheRemoteExhausted: req.CacheRemoteExhausted,
+	})
 	// The job's run image, by its level rule, pulled with the image's registry credential (#933,
 	// D6); none runs the platform image.
 	if img := tok.Image; img != nil {
@@ -500,20 +577,29 @@ func (l *Launcher) claim(ctx context.Context, offer runnercontract.PendingJob) b
 			cred, err := l.client.PullCredential(ctx, img.ID)
 			if err != nil {
 				l.client.logf("Job %s: reading the pull credential of its run image failed: %v", offer.JobID, err)
-				_ = l.client.FailWith(ctx, offer.JobID, tok.Token, "the launcher could not read the pull credential of the run image "+img.Ref+": "+err.Error())
-				return false
+				l.deliverFailure(ctx, s, "the launcher could not read the pull credential of the run image "+img.Ref+": "+err.Error())
+				return
 			}
 			req.PullAuth = &driver.RegistryAuth{Registry: cred.Registry, Username: cred.Username, Password: cred.Password}
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	p, err := l.driver.Place(ctx, req)
 	if err != nil {
 		l.client.logf("Placing job %s failed: %v", offer.JobID, err)
-		_ = l.client.FailWith(ctx, offer.JobID, tok.Token, "the job could not be placed: "+err.Error())
-		return false
+		l.deliverFailure(ctx, s, "the job could not be placed: "+err.Error())
+		return
 	}
-	l.supervise(ctx, offer.JobID, p, time.Duration(tok.TimeoutSeconds)*time.Second, tok.Token)
-	return true
+	s.placement = p
+	if ctx.Err() != nil {
+		_ = l.driver.Kill(context.WithoutCancel(ctx), p, l.cfg.killGrace())
+		_ = l.driver.Remove(context.WithoutCancel(ctx), p)
+		return
+	}
+	l.singlePlaced.Store(true)
+	l.watch(ctx, s, time.Duration(tok.TimeoutSeconds)*time.Second)
 }
 
 // labels are what a placement carries so a restarted launcher, or another of the pool, finds it.
@@ -560,6 +646,11 @@ func (l *Launcher) drain(ctx context.Context) error {
 	ticker := time.NewTicker(l.cfg.idleBeat())
 	defer ticker.Stop()
 	for waiting := true; waiting; {
+		if !time.Now().Before(deadline) {
+			l.stopAll(bg)
+			<-finished
+			break
+		}
 		if n := l.running(); n > 0 {
 			l.client.logf("Draining: waiting for %d job(s) to finish", n)
 		}
@@ -567,7 +658,9 @@ func (l *Launcher) drain(ctx context.Context) error {
 		case <-finished:
 			waiting = false
 		case <-ticker.C:
-			_, _ = l.client.Heartbeat(bg, runnercontract.HeartbeatRequest{Status: "busy", CurrentJobs: l.running()}, 0)
+			beatCtx, cancel := context.WithDeadline(bg, deadline)
+			_, _ = l.client.Heartbeat(beatCtx, runnercontract.HeartbeatRequest{Status: "busy", CurrentJobs: l.running()}, 0)
+			cancel()
 		case <-time.After(time.Until(deadline)):
 			l.stopAll(bg)
 			<-finished

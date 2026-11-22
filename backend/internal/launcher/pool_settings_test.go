@@ -13,7 +13,7 @@ import (
 // A job is placed with the limits and the keep-failed window of its own pool, which its token
 // carries (#933, D4, AC24, AC25).
 func TestClaimPlacesWithThePoolSettings(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.pools = map[string]*runnercontract.PoolSettings{"run-1": {KeepFailedForSeconds: 600, CPULimit: "1500m", MemoryLimit: "2Gi", LimitsRequired: true}}
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)

@@ -40,7 +40,7 @@ func TestLauncherWaitsForTheJobTokenCapability(t *testing.T) {
 // Under hosted.strict a launcher refuses the in-process driver and the host-identity network
 // before it registers.
 func TestStrictRefusesInProcessAndHostIdentity(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	cfg := testConfig(api)
 	cfg.Hosted, cfg.Strict, cfg.PoolID = true, true, ""
 
@@ -62,7 +62,7 @@ func TestStrictRefusesInProcessAndHostIdentity(t *testing.T) {
 
 // The launcher refuses a non-Linux host before it does anything.
 func TestRunRefusesANonLinuxHost(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	l := New(testConfig(api), newFakeDriver("container"))
 	l.goos = "windows"
 	if err := l.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "decision 4") {

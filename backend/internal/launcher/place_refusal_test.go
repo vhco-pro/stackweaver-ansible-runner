@@ -14,7 +14,7 @@ import (
 // A job its driver refuses to place (an in-process pool given a custom run image) fails with the
 // driver's message, which names the images and the way out, and no executor runs (#933, D4, AC30).
 func TestARefusedPlacementFailsTheJobWithTheDriversMessage(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("inprocess")
 	d.placeErr = fmt.Errorf("%w: the job resolved the image registry.example/custom:1, and this pool's launcher runs platform:1; use a container or Kubernetes pool for a custom run image", driver.ErrImageRefused)
 	l := New(testConfig(api), d)

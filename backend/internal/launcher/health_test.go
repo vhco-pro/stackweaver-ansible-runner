@@ -15,7 +15,7 @@ import (
 // /healthz answers while the process runs; /readyz only once the launcher is registered, its
 // heartbeat is fresh and its driver can place (#933, D3, AC75).
 func TestHealthAndReadiness(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"

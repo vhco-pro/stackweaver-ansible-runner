@@ -182,6 +182,9 @@ func (l *Launcher) populate(ctx context.Context) {
 // /runner/images/:id/pull-credential); the launcher pulls with it and never hands it to the job.
 func (c *Client) PullCredential(ctx context.Context, imageID string) (runnercontract.PullCredential, error) {
 	var out runnercontract.PullCredential
-	err := c.call(ctx, http.MethodGet, "/api/v2/runner/images/"+url.PathEscape(imageID)+"/pull-credential", c.token(), nil, &out, 30*time.Second)
+	err := c.control(ctx, "pull credential", func(attempt context.Context) error {
+		out = runnercontract.PullCredential{}
+		return c.call(attempt, http.MethodGet, "/api/v2/runner/images/"+url.PathEscape(imageID)+"/pull-credential", c.token(), nil, &out, 0)
+	})
 	return out, err
 }

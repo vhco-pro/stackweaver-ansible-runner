@@ -25,7 +25,7 @@ func TestClaimPreparesTheNodeLocalCache(t *testing.T) {
 	const org = "11111111-1111-1111-1111-111111111111"
 	body := []byte("tofu 1.10.6 zip")
 	sum := hexDigest(body)
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.caches = map[string]*runnercontract.CacheDescriptor{
 		"run-1": {OrganizationID: org, Entries: []runnercontract.CacheEntryRef{{CacheEntry: runnercontract.CacheEntry{Kind: runnercontract.CacheKindTofu, SHA256: sum}}}},
 		"run-2": {OrganizationID: org, Entries: []runnercontract.CacheEntryRef{{CacheEntry: runnercontract.CacheEntry{Kind: runnercontract.CacheKindTofu, SHA256: sum}}}},
@@ -64,7 +64,7 @@ func TestClaimPreparesTheNodeLocalCache(t *testing.T) {
 
 // Without a cache directory, or for a job with no descriptor, nothing is mounted.
 func TestClaimWithoutACacheMountsNothing(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.caches = map[string]*runnercontract.CacheDescriptor{"run-1": {OrganizationID: "11111111-1111-1111-1111-111111111111"}}
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)

@@ -29,7 +29,8 @@ type Invocation struct {
 	Placement *runnercontract.Placement
 	// CacheDir is the launcher's copy of the job's organization's cache; empty for none. The
 	// executor only reads it.
-	CacheDir string
+	CacheDir             string
+	CacheRemoteExhausted bool
 	// LimitsReport says which of the pool's limits were enforced, for the job's output; the
 	// in-process driver enforces none (AC24).
 	LimitsReport string
@@ -100,8 +101,9 @@ func (d *InProcess) Place(ctx context.Context, req Request) (Placement, error) {
 	host, _ := os.Hostname()
 	inv := Invocation{
 		ServerURL: req.Server, JobID: req.JobID, Token: req.Token, RunType: req.RunType, RunnerID: req.RunnerID,
-		Placement:    &runnercontract.Placement{PlacementID: p.ID, Node: host},
-		LimitsReport: LimitsReport(req.Resources, nil),
+		Placement:            &runnercontract.Placement{PlacementID: p.ID, Node: host},
+		LimitsReport:         LimitsReport(req.Resources, nil),
+		CacheRemoteExhausted: req.CacheRemoteExhausted,
 	}
 	if req.Cache != nil {
 		inv.CacheDir = req.Cache.Dir

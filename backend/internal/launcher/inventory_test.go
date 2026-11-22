@@ -28,7 +28,7 @@ func (d *objectDriver) Ensure(_ context.Context, objs []runnercontract.EnsureObj
 // A launcher whose driver manages long-lived objects reports its job namespace's inventory on a
 // heartbeat and creates the objects the API asks for (#933, D8, AC49b).
 func TestLauncherReportsInventoryAndEnsuresObjects(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.ensure = []runnercontract.EnsureObject{{Kind: "ServiceAccount", Name: "sw-deploy", PoolID: "pool-1"}}
 	d := &objectDriver{fakeDriver: newFakeDriver("kubernetes"), ensured: make(chan []runnercontract.EnsureObject, 4)}
 	l := New(testConfig(api), d)

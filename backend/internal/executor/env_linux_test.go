@@ -33,6 +33,15 @@ func TestMain(m *testing.M) {
 			fmt.Println("invocation failed:", err)
 			os.Exit(3)
 		}
+	case "cache":
+		inv, err := InvocationFromEnv()
+		if err != nil {
+			fmt.Println("invocation failed:", err)
+			os.Exit(3)
+		}
+		_, inherited := os.LookupEnv("STACKWEAVER_CACHE_REMOTE_EXHAUSTED")
+		fmt.Printf("exhausted=%t inherited=%t\n", inv.CacheRemoteExhausted, inherited)
+		os.Exit(0)
 	case "unprotected":
 		// The control: the token only removed from the Go environment, the process left dumpable.
 		_ = os.Unsetenv(EnvJobToken)
@@ -45,18 +54,35 @@ func TestMain(m *testing.M) {
 	os.Exit(0)
 }
 
-func runAsExecutor(t *testing.T, role string) string {
+func runAsExecutor(t *testing.T, role string, env ...string) string {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), os.Args[0]) //nolint:gosec // G204: os.Args[0] is this test binary
 	cmd.Env = []string{
 		executorRoleEnv + "=" + role, "PATH=/usr/bin:/bin",
 		EnvServer + "=http://127.0.0.1:1", EnvJobID + "=job-1", EnvJobToken + "=" + testJobToken,
 	}
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("executor helper (%s): %v: %s", role, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func TestCacheExhaustionIsReadOnceAtExecutorStartup(t *testing.T) {
+	for _, tc := range []struct {
+		wire string
+		want string
+	}{
+		{"true", "exhausted=true inherited=false"},
+		{"false", "exhausted=false inherited=false"},
+	} {
+		t.Run(tc.wire, func(t *testing.T) {
+			if got := runAsExecutor(t, "cache", "STACKWEAVER_CACHE_REMOTE_EXHAUSTED="+tc.wire); got != tc.want {
+				t.Errorf("executor invocation = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 // The job token stays in the executor's memory (#933, D1, AC5): a process the job starts, which

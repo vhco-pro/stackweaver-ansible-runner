@@ -12,7 +12,7 @@ import (
 )
 
 // DefaultHeartbeatWait is how long a launcher asks the API to hold its heartbeat; the API caps it.
-const DefaultHeartbeatWait = 25 * time.Second
+const DefaultHeartbeatWait = runnercontract.DefaultHeartbeatWait
 
 // quietFailures is how many heartbeats in a row may fail before the launcher logs it: one cut by a
 // proxy's idle timeout is routine and costs one round trip (AC70).

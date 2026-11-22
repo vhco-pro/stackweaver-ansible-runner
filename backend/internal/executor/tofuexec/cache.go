@@ -40,8 +40,8 @@ type cacheUse struct {
 
 func jobPlatform() string { return runtime.GOOS + "_" + runtime.GOARCH }
 
-func newCacheUse(c *executor.Client, dir string, desc *runnercontract.CacheDescriptor, scratch string) *cacheUse {
-	return &cacheUse{cache: &executor.Cache{Dir: dir, Client: c}, desc: desc, scratch: scratch, fromCache: map[string]bool{}}
+func newCacheUse(c *executor.Client, dir string, desc *runnercontract.CacheDescriptor, scratch string, remoteExhausted bool) *cacheUse {
+	return &cacheUse{cache: executor.NewCache(c, dir, remoteExhausted), desc: desc, scratch: scratch, fromCache: map[string]bool{}}
 }
 
 // entries are the descriptor's entries of kind for this platform.

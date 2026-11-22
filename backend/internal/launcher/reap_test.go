@@ -14,7 +14,7 @@ import (
 // A launcher sweeps the failed placements it kept for inspection once their keep_failed_jobs_for
 // has passed: at start and then periodically, only its own (#933, D4, AC25).
 func TestLauncherReapsItsKeptPlacements(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	cfg := testConfig(api)
 	cfg.ReapInterval = 50 * time.Millisecond
@@ -40,7 +40,7 @@ func TestLauncherReapsItsKeptPlacements(t *testing.T) {
 // API names that runner lost (offline, its work already settled), and never touches its own or
 // those of a runner the API has not named (#933, D3, AC67).
 func TestLauncherReapsTheOrphansOfALostPeer(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.reapRunners = []string{"runner-old"}
 	d := newFakeDriver("kubernetes")
 	d.listed = []driver.Placement{
@@ -76,7 +76,7 @@ func TestLauncherReapsTheOrphansOfALostPeer(t *testing.T) {
 // A runner the API stops naming is no longer reaped: the list is replaced by every heartbeat, so a
 // runner that came back online under the same identity keeps its placements (AC67).
 func TestLauncherForgetsALostPeerTheAPINoLongerNames(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.reapRunners = []string{"runner-old"}
 	d := newFakeDriver("kubernetes")
 	cfg := testConfig(api)

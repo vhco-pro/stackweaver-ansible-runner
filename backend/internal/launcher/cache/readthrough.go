@@ -32,6 +32,12 @@ type Source interface {
 	Fetch(ctx context.Context, org string, kind runnercontract.CacheKind, sha256 string) (io.ReadCloser, error)
 }
 
+// retryableSource lets a source classify its own availability failures. Other sources keep
+// their existing final-error behavior; the read-through owns the acquisition deadline.
+type retryableSource interface {
+	Retryable(error) bool
+}
+
 // ReadThrough is the launcher-owned node-local copy of the caches of the organizations whose jobs
 // the launcher runs (decision 19), laid out <Dir>/<organization>/<kind>/<sha256>. Only the launcher
 // writes it: it fetches what a claimed job's descriptor names and the node lacks, verifies the
@@ -58,71 +64,173 @@ func (r *ReadThrough) logf(format string, args ...any) {
 // or whose body does not hash to its key, is left out: the executor fetches what it lacks through
 // its blob route, and verifies everything it reads either way.
 func (r *ReadThrough) Prepare(ctx context.Context, d *runnercontract.CacheDescriptor) (string, error) {
+	prepared, err := r.PrepareJob(ctx, d)
+	return prepared.Dir, err
+}
+
+// Preparation is the cache mount and the optional remote-acquisition state for one job.
+type Preparation struct {
+	Dir             string
+	RemoteExhausted bool
+}
+
+// PrepareJob warms the organization cache without delaying a claim behind another
+// job's prefetch. The mount remains usable during warm-up because entries are published
+// by verified atomic rename and readers verify the local bytes.
+func (r *ReadThrough) PrepareJob(ctx context.Context, d *runnercontract.CacheDescriptor) (Preparation, error) {
+	if err := ctx.Err(); err != nil {
+		return Preparation{}, err
+	}
 	if _, err := uuid.Parse(d.OrganizationID); err != nil {
-		return "", fmt.Errorf("the cache descriptor names organization %q: %w", d.OrganizationID, err)
+		return Preparation{}, fmt.Errorf("the cache descriptor names organization %q: %w", d.OrganizationID, err)
 	}
-	r.mu.Lock()
+	prepared := Preparation{Dir: filepath.Join(r.Dir, d.OrganizationID)}
+	if err := os.MkdirAll(prepared.Dir, 0o755); err != nil { //nolint:gosec // G301: the job reads it through a read-only mount
+		return Preparation{}, fmt.Errorf("creating the organization's cache directory: %w", err)
+	}
+	if !r.mu.TryLock() {
+		return prepared, ctx.Err()
+	}
 	defer r.mu.Unlock()
-	orgDir := filepath.Join(r.Dir, d.OrganizationID)
-	if err := os.MkdirAll(orgDir, 0o755); err != nil { //nolint:gosec // G301: the job reads it through a read-only mount
-		return "", fmt.Errorf("creating the organization's cache directory: %w", err)
-	}
 	keep := map[string]bool{}
 	for _, e := range d.Entries {
 		if !e.Kind.Valid() || !validDigest(e.SHA256) {
 			continue
 		}
-		path := filepath.Join(orgDir, string(e.Kind), e.SHA256)
+		path := filepath.Join(prepared.Dir, string(e.Kind), e.SHA256)
 		keep[path] = true
 		if fileHashes(path, e.SHA256) {
 			now := time.Now()
 			_ = os.Chtimes(path, now, now)
 			continue
 		}
-		// Absent, or altered on the node: never used, fetched again.
+		if prepared.RemoteExhausted {
+			continue
+		}
+		// An absent or altered copy is never used. Fetch it while this job
+		// still has remote acquisition available.
 		_ = os.Remove(path)
-		if err := r.fetch(ctx, d.OrganizationID, e.CacheEntry, path); err != nil {
+		exhausted, err := r.fetch(ctx, d.OrganizationID, e.CacheEntry, path)
+		prepared.RemoteExhausted = exhausted
+		if err != nil {
 			if ctx.Err() != nil {
-				return "", ctx.Err()
+				return Preparation{}, ctx.Err()
 			}
 			if !errors.Is(err, ErrNotCached) {
 				r.logf("Cache entry %s %s of organization %s not placed: %v", e.Kind, e.SHA256, d.OrganizationID, err)
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return Preparation{}, err
+	}
 	r.evict(keep)
-	return orgDir, nil
+	return prepared, nil
 }
 
-// fetch places one entry at path, only once its body hashes to its key.
-func (r *ReadThrough) fetch(ctx context.Context, org string, e runnercontract.CacheEntry, path string) error {
-	body, err := r.Source.Fetch(ctx, org, e.Kind, e.SHA256)
-	if err != nil {
-		return err
+// fetch places a verified entry and reports whether its acquisition window was exhausted.
+func (r *ReadThrough) fetch(ctx context.Context, org string, e runnercontract.CacheEntry, path string) (bool, error) {
+	deadline := time.Now().Add(2 * time.Minute)
+	delay := 100 * time.Millisecond
+	var last error
+	for {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if !time.Now().Before(deadline) {
+			return true, fmt.Errorf("acquiring cache entry %s: %w", e.SHA256, errors.Join(context.DeadlineExceeded, last))
+		}
+		retry, err := r.fetchAttempt(ctx, org, e, path, deadline)
+		if err == nil || !retry {
+			return false, err
+		}
+		last = err
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			continue
+		}
+		timer := time.NewTimer(min(delay, remaining))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+		timer.Stop()
+		delay = min(delay*2, 5*time.Second)
 	}
-	defer func() { _ = body.Close() }()
+}
+
+func (r *ReadThrough) canRetry(err error) bool {
+	if errors.Is(err, ErrNotCached) {
+		return false
+	}
+	source, ok := r.Source.(retryableSource)
+	if ok {
+		return source.Retryable(err)
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func (r *ReadThrough) fetchAttempt(ctx context.Context, org string, e runnercontract.CacheEntry, path string, deadline time.Time) (bool, error) {
+	attempt, cancel := context.WithCancel(ctx)
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(time.Until(deadline), func() { cancel(); close(timedOut) })
+	body, err := r.Source.Fetch(attempt, org, e.Kind, e.SHA256)
+	if !timer.Stop() {
+		<-timedOut
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if attempt.Err() != nil {
+		err = errors.Join(context.DeadlineExceeded, err)
+	}
+	if err != nil {
+		cancel()
+		if body != nil {
+			if closeErr := body.Close(); closeErr != nil {
+				r.logf("Closing an unavailable cache response: %v", closeErr)
+			}
+		}
+		return r.canRetry(err), err
+	}
+	defer func() {
+		cancel()
+		if err := body.Close(); err != nil {
+			r.logf("Closing cache entry %s: %v", e.SHA256, err)
+		}
+	}()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // G301: read through a read-only mount
-		return err
+		return false, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".incoming-*")
 	if err != nil {
-		return err
+		return false, err
 	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
+	defer func() {
+		if err := os.Remove(tmp.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			r.logf("Removing an incoming cache entry: %v", err)
+		}
+	}()
 	h := sha256.New()
 	_, copyErr := io.Copy(io.MultiWriter(tmp, h), body)
 	closeErr := tmp.Close()
 	if copyErr != nil || closeErr != nil {
-		return errors.Join(copyErr, closeErr)
+		var fileErr *os.PathError
+		retry := closeErr == nil && !errors.As(copyErr, &fileErr) && r.canRetry(copyErr)
+		return retry, errors.Join(copyErr, closeErr)
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
 	}
 	if hex.EncodeToString(h.Sum(nil)) != e.SHA256 {
-		return fmt.Errorf("the %s entry %s does not hash to its key; not placed", e.Kind, e.SHA256)
+		return false, fmt.Errorf("the %s entry %s does not hash to its key; not placed", e.Kind, e.SHA256)
 	}
 	// Read-only on the node too: the job's mount is read-only, and nothing but this step writes.
 	if err := os.Chmod(tmp.Name(), 0o444); err != nil { //nolint:gosec // G302: read by job users through the read-only mount
-		return err
+		return false, err
 	}
-	return os.Rename(tmp.Name(), path)
+	return false, os.Rename(tmp.Name(), path)
 }
 
 // evict removes the least recently used entries until the directory is under Limit, never one in

@@ -14,7 +14,7 @@ import (
 )
 
 // launcherSourceRoots are the source trees that run in a launcher process: this package, its
-// driver and cache subpackages, and the shared Kubernetes placement package its Kubernetes driver
+// driver and cache subpackages, the shared response reader and Kubernetes placement package its Kubernetes driver
 // calls.
 var launcherSourceRoots = []string{".", filepath.Join("..", "..", "..", "core", "runnerdriver")}
 
@@ -49,7 +49,7 @@ func TestLauncherHasNoArtifactsPath(t *testing.T) {
 		}
 	}
 	// The walk reaches every tree a launcher runs, not only the top package.
-	for _, dir := range []string{".", "driver", "cache", filepath.Join("..", "..", "..", "core", "runnerdriver", "kubernetes")} {
+	for _, dir := range []string{".", "driver", "cache", "readbody", filepath.Join("..", "..", "..", "core", "runnerdriver", "kubernetes")} {
 		if checked[dir] == 0 {
 			t.Errorf("no source of %s was checked", dir)
 		}

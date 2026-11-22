@@ -14,7 +14,7 @@ import (
 // left, then deregisters and returns: the ephemeral launcher an operator starts per job with a
 // just-in-time token (#933, D11).
 func TestSingleRunsOneJobThenDeregisters(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	cfg := testConfig(api)
 	cfg.Single = true

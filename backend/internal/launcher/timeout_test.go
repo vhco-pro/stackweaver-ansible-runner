@@ -13,7 +13,7 @@ import (
 // A job or a sync that runs past the timeout its token carries is stopped and reported failed with
 // the timeout as the reason, whatever its kind (#933, D2, AC12).
 func TestSupervisionStopsWorkPastItsTimeout(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.timeouts = map[string]int{"wi-slow": 1, "run-slow": 1}
 	d := newFakeDriver("container")
 	// The failure is reported before the kill: an executor stopped by the kill reports itself

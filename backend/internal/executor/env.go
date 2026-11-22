@@ -34,6 +34,9 @@ const (
 	ExitStopped    = 3
 )
 
+// Private startup wire value, populated by launcher.ExecutorEnv.
+const envCacheRemoteExhausted = "STACKWEAVER_CACHE_REMOTE_EXHAUSTED"
+
 // Invocation is what the `executor` subcommand is started with.
 type Invocation struct {
 	ServerURL string
@@ -42,7 +45,8 @@ type Invocation struct {
 	RunType   string
 	RunnerID  string
 	// CacheDir is the launcher's read-only copy of the organization's cache, when one is mounted.
-	CacheDir string
+	CacheDir             string
+	CacheRemoteExhausted bool
 }
 
 // InvocationFromEnv reads the invocation and keeps the job token in memory only (AC5): it marks the
@@ -55,14 +59,16 @@ func InvocationFromEnv() (Invocation, error) {
 		return Invocation{}, fmt.Errorf("protecting the job token: %w", err)
 	}
 	inv := Invocation{
-		ServerURL: strings.TrimSpace(os.Getenv(EnvServer)),
-		JobID:     strings.TrimSpace(os.Getenv(EnvJobID)),
-		Token:     strings.TrimSpace(os.Getenv(EnvJobToken)),
-		RunType:   strings.TrimSpace(os.Getenv(EnvRunType)),
-		RunnerID:  strings.TrimSpace(os.Getenv(EnvRunnerID)),
-		CacheDir:  strings.TrimSpace(os.Getenv(EnvCacheDir)),
+		ServerURL:            strings.TrimSpace(os.Getenv(EnvServer)),
+		JobID:                strings.TrimSpace(os.Getenv(EnvJobID)),
+		Token:                strings.TrimSpace(os.Getenv(EnvJobToken)),
+		RunType:              strings.TrimSpace(os.Getenv(EnvRunType)),
+		RunnerID:             strings.TrimSpace(os.Getenv(EnvRunnerID)),
+		CacheDir:             strings.TrimSpace(os.Getenv(EnvCacheDir)),
+		CacheRemoteExhausted: os.Getenv(envCacheRemoteExhausted) == "true",
 	}
 	_ = os.Unsetenv(EnvJobToken)
+	_ = os.Unsetenv(envCacheRemoteExhausted)
 	if inv.ServerURL == "" || inv.JobID == "" || inv.Token == "" {
 		return inv, errors.New("the executor needs " + EnvServer + ", " + EnvJobID + " and " + EnvJobToken)
 	}

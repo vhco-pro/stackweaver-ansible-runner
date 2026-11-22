@@ -39,7 +39,7 @@ func (v stubVerifier) Verify(_ context.Context, e runnercontract.CacheEntry, dir
 // the promotion, or dropped with the reason and whether it was a poisoning (#933, D7, AC35).
 func TestHeartbeatPromotionsArePopulated(t *testing.T) {
 	const org = "11111111-1111-1111-1111-111111111111"
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.promotions = []runnercontract.CachePromotion{
 		{ID: "p-good", OrganizationID: org, JobID: "job-1", Entry: runnercontract.CacheEntry{Kind: runnercontract.CacheKindCollection, Name: "community.general", Version: "9.4.0"}},
 		{ID: "p-bad", OrganizationID: org, JobID: "job-1", Entry: runnercontract.CacheEntry{Kind: runnercontract.CacheKindRole, Name: "evil.role", Version: "1.0.0"}},
@@ -79,7 +79,7 @@ func TestHeartbeatPromotionsArePopulated(t *testing.T) {
 
 // hosted.strict refuses a launcher configured to promote without the transparency log (AC76).
 func TestStrictRefusesTheOfflineVerification(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	cfg := testConfig(api)
 	cfg.Hosted, cfg.Strict, cfg.PoolID = true, true, ""
 	cfg.VerifyTransparencyLog = false

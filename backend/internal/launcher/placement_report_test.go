@@ -13,7 +13,7 @@ import (
 // The claim reports the driver, the image and the level it came from (#933, D4, AC77). Until run
 // images resolve a job's own image, every job runs the launcher's image, the platform default.
 func TestClaimReportsThePlatformImageLevel(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	cfg := testConfig(api)
 	cfg.JobImages = map[string]string{"tofu": "stackweaver-runner:test", "ansible": "stackweaver-ansible:test"}
@@ -35,7 +35,7 @@ func TestClaimReportsThePlatformImageLevel(t *testing.T) {
 // Each job is placed in, and its claim names, its own engine's job image, started with the
 // command the launcher sends for that engine (one-launcher spec, A3).
 func TestClaimNamesTheEnginesJobImage(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	cfg := testConfig(api)
 	cfg.JobImages = map[string]string{"tofu": "opentofu-job:1", "ansible": "ansible-job:1"}

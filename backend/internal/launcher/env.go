@@ -4,19 +4,24 @@ package launcher
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
 	"github.com/michielvha/stackweaver/core/security/runenv"
 )
 
+// Keep this private startup variable in sync with executor.InvocationFromEnv.
+const envCacheRemoteExhausted = "STACKWEAVER_CACHE_REMOTE_EXHAUSTED"
+
 // ExecutorInvocation is what a driver hands a placed executor.
 type ExecutorInvocation struct {
-	ServerURL string
-	JobID     string
-	Token     string
-	RunType   string
-	RunnerID  string
+	ServerURL            string
+	JobID                string
+	Token                string
+	RunType              string
+	RunnerID             string
+	CacheRemoteExhausted bool
 }
 
 // ExecutorEnv is the environment a placed executor starts with (AC1): what every process needs
@@ -28,7 +33,7 @@ type ExecutorInvocation struct {
 // A3).
 func ExecutorEnv(environ []string, inv ExecutorInvocation) []string {
 	env := slices.DeleteFunc(runenv.Inherit(environ, runenv.Allowlist{}), func(kv string) bool {
-		return strings.HasPrefix(kv, "PATH=")
+		return strings.HasPrefix(kv, "PATH=") || strings.HasPrefix(kv, envCacheRemoteExhausted+"=")
 	})
 	// The passthrough list travels with the variables it names: the executor's own allowlist
 	// (tofu.RunEnv, ansible.InheritedEnv) reads it to pass them on to the job's tools.
@@ -42,6 +47,7 @@ func ExecutorEnv(environ []string, inv ExecutorInvocation) []string {
 		runnercontract.EnvJobID+"="+inv.JobID,
 		runnercontract.EnvJobToken+"="+inv.Token,
 		runnercontract.EnvRunnerID+"="+inv.RunnerID,
+		envCacheRemoteExhausted+"="+strconv.FormatBool(inv.CacheRemoteExhausted),
 	)
 	if inv.RunType != "" {
 		env = append(env, runnercontract.EnvRunType+"="+inv.RunType)

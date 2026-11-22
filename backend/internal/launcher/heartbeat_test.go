@@ -4,14 +4,42 @@ package launcher
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
 )
+
+func TestHeartbeatDefaultsMatchTheMonitorRecoveryBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		if DefaultHeartbeatWait != runnercontract.DefaultHeartbeatWait || defaultBackoff.Max != runnercontract.LauncherBackoffMax {
+			t.Fatal("launcher defaults differ from the shared recovery-bound inputs")
+		}
+		client := NewClient("http://control.example.test", "registration")
+		called := false
+		client.http.Transport = claimRecoveryRoundTrip(func(request *http.Request) (*http.Response, error) {
+			called = true
+			deadline, bounded := request.Context().Deadline()
+			want := time.Now().Add(runnercontract.DefaultHeartbeatWait + runnercontract.HeartbeatRequestOverhead)
+			if !bounded || !deadline.Equal(want) {
+				t.Errorf("heartbeat deadline = %s, want %s", deadline, want)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		})
+		if _, err := client.Heartbeat(t.Context(), runnercontract.HeartbeatRequest{}, DefaultHeartbeatWait); err != nil {
+			t.Fatal(err)
+		}
+		if !called {
+			t.Fatal("normal heartbeat entry point did not make a request")
+		}
+	})
+}
 
 // A heartbeat a proxy cuts is polled again at once, with nothing logged, and the offer it would
 // have carried arrives on the next one (#933, D3, AC70).

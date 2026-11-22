@@ -15,7 +15,11 @@ import (
 func TestInProcessHandsTheExecutorItsPlacement(t *testing.T) {
 	got := make(chan Invocation, 1)
 	d := &InProcess{Executors: map[string]ExecutorFunc{"tofu": func(_ context.Context, inv Invocation) int { got <- inv; return 0 }}}
-	p, err := d.Place(t.Context(), Request{JobID: "run-1", Attempt: 2, Kind: "tofu"})
+	p, err := d.Place(t.Context(), Request{
+		JobID: "run-1", Attempt: 2, Kind: "tofu",
+		CacheRemoteExhausted: true,
+		Env:                  []string{"STACKWEAVER_CACHE_REMOTE_EXHAUSTED=false"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,6 +28,9 @@ func TestInProcessHandsTheExecutorItsPlacement(t *testing.T) {
 		host, _ := os.Hostname()
 		if inv.Placement == nil || inv.Placement.PlacementID != p.ID || inv.Placement.Node != host {
 			t.Errorf("invocation placement = %+v, want id %s on %s", inv.Placement, p.ID, host)
+		}
+		if !inv.CacheRemoteExhausted {
+			t.Error("the executor did not receive the typed cache result")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the executor never ran")

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,7 +36,8 @@ type Job struct {
 // Options tune an execution; the zero value is what production uses.
 type Options struct {
 	// CacheDir is the launcher's read-only copy of the organization's cache; empty for none.
-	CacheDir string
+	CacheDir             string
+	CacheRemoteExhausted bool
 	// WorkRoot is where the job's work directory is made; empty means the system temp directory.
 	WorkRoot string
 	// StatusInterval is how often the job's status is polled for a stop; zero means two seconds.
@@ -51,13 +53,13 @@ type Result struct {
 	Manifest *runnercontract.CacheManifest
 }
 
-// maxPlaybookSnapshotBytes caps a snapshot download. A snapshot is at most a whole repository;
-// anything near this size is a mistake or an attack on the host's disk.
-const maxPlaybookSnapshotBytes = 1 << 30
+// maxPlaybookSnapshotBytes matches the API cap on a compressed playbook archive.
+const maxPlaybookSnapshotBytes = 32 << 20
 
 // Execute runs one Ansible job end to end: it fetches the artifacts, runs the play and reports the
 // completion, and returns what it reported.
 func Execute(ctx context.Context, c *executor.Client, job Job, opts Options) Result {
+	c.RequireVerifiedPlaybookSnapshots()
 	var arts runnercontract.AnsibleArtifacts
 	var res Result
 	if err := c.Artifacts(ctx, job.ID, &arts, func() int { return arts.ContractVersion }); err != nil {
@@ -69,7 +71,7 @@ func Execute(ctx context.Context, c *executor.Client, job Job, opts Options) Res
 		res = run(ctx, c, job, &arts, opts)
 	}
 	// The completion is reported even after a stop: a canceled job still records how it ended.
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executor.ControlRetryBudget)
 	defer cancel()
 	req := runnercontract.JobCompleteRequest{Status: res.Status, ErrorMessage: res.ErrorMessage}
 	if res.Status == "completed" {
@@ -127,20 +129,31 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 		toolEnv = append(toolEnv, k+"="+v)
 	}
 
-	// The playbook files: the cached snapshot when the playbook has one, otherwise a clone.
+	// Prepare the exact capture assigned by the control plane.
 	repoDir := workDir
 	checkoutDir := filepath.Join(workDir, "repo")
 	switch {
-	case arts.PlaybookSource.HasSnapshot():
+	case arts.PlaybookSource != nil:
+		if !arts.PlaybookSource.HasSnapshot() {
+			return failed(runnercontract.PlaybookSnapshotRerun)
+		}
 		source := arts.PlaybookSource
+		if source.Commit == "" || source.SHA256 == "" || source.Validator == "" {
+			return failed(runnercontract.PlaybookSnapshotRerun)
+		}
 		logger.Infof("Running the playbook snapshot (mode %s, commit %s)", source.Mode, source.Commit)
 		snapshotPath := filepath.Join(workDir, "snapshot.tar.gz")
 		dlCtx, cancelDL := context.WithTimeout(jobCtx, 10*time.Minute)
-		err := c.Download(dlCtx, "/api/v2/runner/jobs/"+job.ID+"/playbook-snapshot", snapshotPath, maxPlaybookSnapshotBytes)
+		path := "/api/v2/runner/jobs/" + job.ID + "/playbook-snapshot"
+		err := c.DownloadVerified(dlCtx, runnercontract.BlobRef{Path: path, SizeBytes: source.SizeBytes, SHA256: source.SHA256}, source.Validator, snapshotPath, maxPlaybookSnapshotBytes)
 		cancelDL()
 		if err != nil {
 			if stopped() {
 				return Result{Status: "canceled"}
+			}
+			var statusError *executor.StatusError
+			if errors.Is(err, executor.ErrDownloadContentChanged) || errors.As(err, &statusError) && statusError.Code == http.StatusPreconditionFailed {
+				return failed(runnercontract.PlaybookSnapshotRerun)
 			}
 			return failed("Failed to download playbook snapshot: " + err.Error())
 		}
@@ -153,6 +166,8 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 			banner = FreshSourceMessage(source.Commit)
 		}
 		EmitEvent(jobCtx, events, PlaybookSourceEvent(banner))
+	case arts.VCS != nil:
+		return failed(runnercontract.PlaybookSnapshotRerun)
 	default:
 		// The executor never clones (#933, decision 18): a VCS-backed playbook runs from its
 		// snapshot, and only an ad hoc job carries its playbook inline.
@@ -176,7 +191,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 
 	// The repository's Galaxy requirements, if it has any. A failed install is reported in the job
 	// output and the play still runs.
-	galaxyCache := &GalaxyCache{Reader: &executor.Cache{Dir: opts.CacheDir, Client: c}}
+	galaxyCache := &GalaxyCache{Reader: executor.NewCache(c, opts.CacheDir, opts.CacheRemoteExhausted)}
 	if arts.Cache != nil {
 		galaxyCache.Entries = arts.Cache.Entries
 	}

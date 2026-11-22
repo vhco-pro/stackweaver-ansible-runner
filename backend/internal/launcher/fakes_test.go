@@ -23,7 +23,9 @@ import (
 type fakeAPI struct {
 	mu           sync.Mutex
 	capabilities []string
-	offers       []runnercontract.PendingJob // offered once each
+	offers       []runnercontract.PendingJob  // offered once each
+	activeClaims []runnercontract.ActiveClaim // complete startup inventory, empty by default
+	claims       map[string]runnercontract.PendingJob
 	statuses     map[string]string
 	started      []string
 	placements   map[string]*runnercontract.Placement
@@ -53,7 +55,7 @@ type fakeAPI struct {
 
 func newFakeAPI(t *testing.T, caps ...string) *fakeAPI {
 	t.Helper()
-	f := &fakeAPI{capabilities: caps, statuses: map[string]string{}, failed: map[string]string{}}
+	f := &fakeAPI{activeClaims: []runnercontract.ActiveClaim{}, capabilities: caps, statuses: map[string]string{}, failed: map[string]string{}}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -62,7 +64,28 @@ func newFakeAPI(t *testing.T, caps ...string) *fakeAPI {
 func (f *fakeAPI) offer(jobs ...runnercontract.PendingJob) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.offers = append(f.offers, jobs...)
+	if f.claims == nil {
+		f.claims = map[string]runnercontract.PendingJob{}
+	}
+	for _, job := range jobs {
+		// Current API offers include the next immutable claim identity. Older test cases that
+		// exercise ordinary placement use their first attempt and the default plan operation.
+		if job.Attempt == 0 {
+			job.Attempt = 1
+		}
+		if job.JobType == "tofu_run" {
+			if job.RunType == "" {
+				job.RunType = "plan"
+			}
+			if strings.HasPrefix(job.RunType, "apply") {
+				job.Phase = "apply"
+			} else {
+				job.Phase = "plan"
+			}
+		}
+		f.claims[job.JobID] = job
+		f.offers = append(f.offers, job)
+	}
 }
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -77,7 +100,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/register":
 		w.WriteHeader(http.StatusCreated)
-		writeJSON(runnercontract.RegisterResponse{RunnerID: "runner-1", RunnerAPIKey: "swr-1", Capabilities: f.capabilities})
+		writeJSON(runnercontract.RegisterResponse{RunnerID: "runner-1", RunnerAPIKey: "swr-1", Capabilities: f.capabilities, ActiveClaims: f.activeClaims})
 	case path == "/heartbeat":
 		f.heartbeats++
 		var req runnercontract.HeartbeatRequest
@@ -90,11 +113,11 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if req.Inventory != nil {
 			f.inventory = req.Inventory
 		}
-		resp := runnercontract.HeartbeatResponse{PendingJobs: out, Ensure: f.ensure, ReapRunners: f.reapRunners}
+		resp := runnercontract.HeartbeatResponse{PendingJobs: out, Ensure: f.ensure, ReapRunners: f.reapRunners, ActiveClaims: f.activeClaims}
 		if f.drain {
 			// A draining runner is offered nothing (#933, D11).
 			f.offers = append(out, f.offers...)
-			resp = runnercontract.HeartbeatResponse{Drain: true}
+			resp = runnercontract.HeartbeatResponse{Drain: true, ActiveClaims: f.activeClaims}
 		}
 		if len(f.promotions) > 0 {
 			resp.CachePromotions, f.promotions = f.promotions, nil
@@ -157,7 +180,12 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.placements = map[string]*runnercontract.Placement{}
 		}
 		f.placements[jobOf(path)] = req.Placement
-		writeJSON(map[string]string{"status": "started"})
+		claim := f.claims[jobOf(path)]
+		if req.Attempt != claim.Attempt || req.Phase != claim.Phase || req.RunType != claim.RunType {
+			http.Error(w, "start must name the offered claim", http.StatusBadRequest)
+			return
+		}
+		writeJSON(map[string]any{"meta": runnercontract.JobStartResponse{Status: "started", Attempt: claim.Attempt, Phase: claim.Phase, RunType: claim.RunType}})
 	case strings.HasSuffix(path, "/output"):
 		if r.Header.Get("Authorization") != "Bearer swj-"+jobOf(path) {
 			http.Error(w, "a placement is reported with the job's token", http.StatusForbidden)
@@ -171,27 +199,48 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.reported[jobOf(path)] = req.Placement
 		writeJSON(map[string]string{"status": "received"})
 	case strings.HasSuffix(path, "/token"):
+		claim, fixed := f.claims[jobOf(path)]
+		if fixed {
+			var req runnercontract.JobTokenRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Attempt != claim.Attempt || req.Phase != claim.Phase || req.RunType != claim.RunType {
+				http.Error(w, "token must name the original claim", http.StatusBadRequest)
+				return
+			}
+		} else {
+			claim.Attempt = 1
+		}
+		if f.statuses[jobOf(path)] == "applied" {
+			w.WriteHeader(http.StatusForbidden)
+			writeJSON(map[string]any{"errors": []map[string]string{{"code": runnercontract.ErrorCodeJobTerminal}}})
+			return
+		}
 		f.tokens = append(f.tokens, jobOf(path))
-		writeJSON(runnercontract.JobToken{Token: "swj-" + jobOf(path), JobID: jobOf(path), Attempt: 1, ContractVersion: runnercontract.Version, TimeoutSeconds: f.timeouts[jobOf(path)], Pool: f.pools[jobOf(path)], Cache: f.caches[jobOf(path)], Image: f.images[jobOf(path)]})
+		writeJSON(runnercontract.JobToken{Token: "swj-" + jobOf(path), JobID: jobOf(path), Attempt: claim.Attempt, Phase: claim.Phase, RunType: claim.RunType, ContractVersion: runnercontract.Version, TimeoutSeconds: f.timeouts[jobOf(path)], Pool: f.pools[jobOf(path)], Cache: f.caches[jobOf(path)], Image: f.images[jobOf(path)]})
 	case strings.HasSuffix(path, "/status"):
 		status := f.statuses[jobOf(path)]
 		if status == "" {
 			status = "running"
 		}
 		if status == "deleted" {
-			http.NotFound(w, r)
+			w.Header().Set("Content-Type", "application/vnd.api+json")
+			w.WriteHeader(http.StatusNotFound)
+			writeJSON(map[string]any{"errors": []map[string]string{{
+				"status": "404", "code": runnercontract.ErrorCodeJobDeleted, "title": "Not Found",
+			}}})
 			return
 		}
 		writeJSON(map[string]string{"status": status})
 	case strings.HasSuffix(path, "/complete"):
-		// A runner that declared the job-token capability completes a job only with that job's
-		// token, as the API's JobData guard has it.
-		if slices.Contains(f.capabilities, runnercontract.CapabilityJobToken) && r.Header.Get("Authorization") != "Bearer swj-"+jobOf(path) {
-			http.Error(w, "this runner reaches job data with a job token", http.StatusForbidden)
-			return
-		}
 		var req runnercontract.JobCompleteRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if slices.Contains(f.capabilities, runnercontract.CapabilityJobToken) && r.Header.Get("Authorization") != "Bearer swj-"+jobOf(path) {
+			claim, exists := f.claims[jobOf(path)]
+			if r.Header.Get("Authorization") != "Bearer swr-1" || !exists || req.Status != "failed" || req.Attempt != claim.Attempt || req.Phase != claim.Phase {
+				http.Error(w, "runner-key completion requires an exact failed startup", http.StatusForbidden)
+				return
+			}
+		}
 		f.failed[jobOf(path)] = req.ErrorMessage
 		writeJSON(map[string]string{"status": "ok"})
 	default:

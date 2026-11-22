@@ -17,32 +17,39 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/michielvha/stackweaver/backend/internal/launcher/readbody"
 	"github.com/michielvha/stackweaver/core/runnercontract"
 )
 
 // ErrJobStopped is the cause a job's context is canceled with when the API says the job is over for
-// this executor: canceled, terminal, or its token revoked because a later attempt exists.
+// this executor: canceled, deleted, terminal, or its token revoked because a later attempt exists.
 var ErrJobStopped = errors.New("the job was stopped")
+
+var errArtifactSequenceExhausted = errors.New("artifact request sequence exhausted")
 
 // capabilities are what this executor announces on every request.
 var capabilities = strings.Join([]string{
 	runnercontract.CapabilityPlaybookSnapshot,
 	runnercontract.CapabilityBlob,
 	runnercontract.CapabilityJobToken,
+	runnercontract.CapabilityClaimRecovery,
 }, ",")
 
 // Client speaks the runner control plane for one job.
 type Client struct {
-	serverURL string
-	token     string
+	verifiedPlaybookSnapshots atomic.Bool
+	serverURL                 string
+	token                     string
 	// runnerID fills the runner_id member several request bodies still carry; the API trusts the
 	// token, not the body.
 	runnerID string
@@ -54,8 +61,12 @@ type Client struct {
 	// limitsReport is the in-process driver's limits report; a placed executor reads its own from
 	// EnvLimitsReport.
 	limitsReport string
-	// reported is set once the API has answered the job's completion (ExitCode).
-	reported atomic.Bool
+	// reported records received committed-completion headers. retired records a terminal
+	// disposition independently, including revocation after an acknowledgement was lost.
+	reported         atomic.Bool
+	retired          atomic.Bool
+	sequenceMu       sync.Mutex
+	artifactSequence int64
 }
 
 // EnvPlaced is set by a driver that places the executor in a container or pod: the executor then
@@ -112,32 +123,99 @@ func (c *Client) newRequest(ctx context.Context, method, path, contentType strin
 		return nil, fmt.Errorf("building %s %s: %w", method, path, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set(runnercontract.CapabilitiesHeader, capabilities)
+	announced := capabilities
+	if c.verifiedPlaybookSnapshots.Load() {
+		announced += "," + runnercontract.CapabilityVerifiedPlaybookSnapshot
+	}
+	req.Header.Set(runnercontract.CapabilitiesHeader, announced)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
 	return req, nil
 }
 
-// do sends a request and returns the body of a 2xx answer, or an error naming the status.
-func (c *Client) do(req *http.Request) ([]byte, error) {
+// requestPolicy keeps replay-safe control requests separate from excluded writes.
+type requestPolicy int
+
+const (
+	writeRequest requestPolicy = iota
+	readRequest
+	artifactRequest
+	completionRequest
+	cacheRequest
+)
+
+// ControlRetryBudget bounds delivery of an idempotent control operation.
+const ControlRetryBudget = 2 * time.Minute
+
+const controlRequestTimeout = 20 * time.Second
+
+const requiredReadBudget = 5 * time.Minute
+
+// do returns response headers even when the response refuses the request. Completion only
+// needs committed HTTP 200 headers, so a lost optional body cannot erase the acknowledgement.
+func (c *Client) do(req *http.Request, policy requestPolicy) ([]byte, http.Header, error) {
 	resp, err := c.http.Do(req) //nolint:gosec // G704: the server URL is the operator-configured endpoint
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", req.Method, req.URL.Path, err)
+		return nil, nil, fmt.Errorf("%s %s: %w", req.Method, req.URL.Path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if policy == completionRequest && resp.StatusCode == http.StatusOK {
+		return nil, resp.Header, nil
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s %s: %w", req.Method, req.URL.Path, err)
+		return nil, resp.Header, fmt.Errorf("reading %s %s: %w", req.Method, req.URL.Path, err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		code, detail := errorOf(body)
-		return body, &StatusError{Code: resp.StatusCode, ErrorCode: code, Detail: detail, Body: string(body)}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 || policy == completionRequest {
+		code, detail := runnercontract.DecodeError(body)
+		return body, resp.Header, &StatusError{Code: resp.StatusCode, ErrorCode: code, Detail: detail, Body: string(body)}
 	}
-	return body, nil
+	return body, resp.Header, nil
 }
 
-// StatusError is a non-2xx answer.
+// artifactHTTPClient keeps each physical artifact request under sequence control. Standard
+// transports use a fresh HTTP/1 connection so neither reused-connection nor HTTP/2 stream
+// recovery can silently replay a request. Redirects retain their policy and get a fresh sequence.
+func (c *Client) artifactHTTPClient() (*http.Client, func()) {
+	client := *c.http
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	closeTransport := func() {}
+	if standard, ok := transport.(*http.Transport); ok {
+		isolated := standard.Clone()
+		isolated.DisableKeepAlives = true
+		isolated.Protocols = new(http.Protocols)
+		isolated.Protocols.SetHTTP1(true)
+		if isolated.TLSClientConfig != nil {
+			isolated.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		}
+		transport = isolated
+		closeTransport = isolated.CloseIdleConnections
+	}
+	client.Transport = transport
+	redirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if redirect != nil {
+			if err := redirect(req, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		sequence, err := c.nextArtifactSequence(0)
+		if err != nil {
+			return err
+		}
+		req.Header.Set(runnercontract.ArtifactSequenceHeader, strconv.FormatInt(sequence, 10))
+		return nil
+	}
+	return &client, closeTransport
+}
+
+// StatusError is an HTTP answer that does not satisfy the operation's response contract.
 type StatusError struct {
 	Code      int
 	ErrorCode string
@@ -159,20 +237,8 @@ func (e *StatusError) Error() string {
 // Stops reports whether the answer means the job is over for this executor.
 func (e *StatusError) Stops() bool {
 	return e.Code == http.StatusForbidden &&
-		(e.ErrorCode == runnercontract.ErrorCodeJobTokenRevoked || e.ErrorCode == runnercontract.ErrorCodeJobTerminal)
-}
-
-func errorOf(body []byte) (code, detail string) {
-	var doc struct {
-		Errors []struct {
-			Code   string `json:"code"`
-			Detail string `json:"detail"`
-		} `json:"errors"`
-	}
-	if json.Unmarshal(body, &doc) != nil || len(doc.Errors) == 0 {
-		return "", ""
-	}
-	return doc.Errors[0].Code, doc.Errors[0].Detail
+		(e.ErrorCode == runnercontract.ErrorCodeJobTokenRevoked || e.ErrorCode == runnercontract.ErrorCodeJobTerminal) ||
+		e.Code == http.StatusNotFound && e.ErrorCode == runnercontract.ErrorCodeJobDeleted
 }
 
 func truncate(s string, n int) string {
@@ -182,12 +248,8 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// Sending again through a rolling upgrade (#933, D14, AC72). The executor's requests can reach
-// API replicas of two releases: a replica that predates job tokens answers a valid one 401, and a
-// proxy whose replica is going away answers 502, 503 or 504. Those answers say nothing about the
-// job, so the request is sent again, with the same body, until a replica of the new release
-// answers, the request's context ends or retryFor passes. Every other answer is final: a coded 403
-// stops the job (StatusError.Stops), and any other refusal is the API's verdict on the request.
+// Excluded writes retain the rolling-upgrade retry policy for 401, 502, 503 and 504.
+// Replay-safe control requests additionally use the bounded policy below.
 var (
 	retryFirstWait = 100 * time.Millisecond
 	retryMaxWait   = 5 * time.Second
@@ -233,27 +295,106 @@ func retryWait(ctx context.Context, wait time.Duration, deadline time.Time) (tim
 	return min(wait*2, retryMaxWait), true
 }
 
-// send sends a request, and sends it again while the answer is retryable.
-func (c *Client) send(ctx context.Context, method, path, contentType string, body []byte, header http.Header) ([]byte, error) {
+// controlRetryable includes interrupted responses and uncoded authentication failures.
+func controlRetryable(err error) bool {
+	if errors.Is(err, errArtifactSequenceExhausted) {
+		return false
+	}
+	var status *StatusError
+	if !errors.As(err, &status) {
+		return true
+	}
+	return status.Code == http.StatusUnauthorized && status.ErrorCode == "" ||
+		status.Code == http.StatusInternalServerError ||
+		status.Code == http.StatusBadGateway || status.Code == http.StatusServiceUnavailable ||
+		status.Code == http.StatusGatewayTimeout
+}
+
+func (c *Client) recordRetirement(err error, policy requestPolicy) {
+	var status *StatusError
+	if errors.As(err, &status) && (status.Stops() ||
+		policy == completionRequest && status.Code == http.StatusConflict && status.ErrorCode == runnercontract.ErrorCodeJobTerminal) {
+		c.retired.Store(true)
+	}
+}
+
+// nextArtifactSequence also adopts an authorized superseded response's sequence floor.
+func (c *Client) nextArtifactSequence(latest int64) (int64, error) {
+	c.sequenceMu.Lock()
+	defer c.sequenceMu.Unlock()
+	c.artifactSequence = max(c.artifactSequence, latest)
+	if c.artifactSequence == math.MaxInt64 {
+		return 0, errArtifactSequenceExhausted
+	}
+	c.artifactSequence++
+	return c.artifactSequence, nil
+}
+
+func controlWait(ctx context.Context, wait time.Duration, deadline time.Time) (time.Duration, bool) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 || ctx.Err() != nil {
+		return wait, false
+	}
+	timer := time.NewTimer(min(jittered(wait), remaining))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return wait, false
+	case <-timer.C:
+		return min(wait*2, retryMaxWait), time.Now().Before(deadline) && ctx.Err() == nil
+	}
+}
+
+// send retains the write policy and bounds every replay-safe control attempt separately.
+func (c *Client) send(ctx context.Context, policy requestPolicy, method, path, contentType string, body []byte, header http.Header) ([]byte, error) {
+	if policy == readRequest || policy == artifactRequest {
+		return c.readContent(ctx, path, policy, header, -1)
+	}
 	deadline := time.Now().Add(retryFor)
+	if policy != writeRequest {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, ControlRetryBudget)
+		defer cancel()
+		deadline, _ = ctx.Deadline()
+	}
 	wait := retryFirstWait
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var reader io.Reader
 		if body != nil {
 			reader = bytes.NewReader(body)
 		}
-		req, err := c.newRequest(ctx, method, path, contentType, reader)
+		requestCtx := ctx
+		cancel := func() {}
+		if policy != writeRequest {
+			requestCtx, cancel = context.WithTimeout(ctx, controlRequestTimeout)
+		}
+		req, err := c.newRequest(requestCtx, method, path, contentType, reader)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 		for k, v := range header {
 			req.Header[k] = v
 		}
-		out, err := c.do(req)
-		if err == nil || !retryable(err) {
+		out, _, err := c.do(req, policy)
+		cancel()
+		if err == nil {
+			return out, nil
+		}
+		shouldRetry := retryable(err)
+		waitAgain := retryWait
+		if policy != writeRequest {
+			c.recordRetirement(err, policy)
+			shouldRetry = controlRetryable(err)
+			waitAgain = controlWait
+		}
+		if !shouldRetry {
 			return out, err
 		}
-		next, ok := retryWait(ctx, wait, deadline)
+		next, ok := waitAgain(ctx, wait, deadline)
 		if !ok {
 			return out, err
 		}
@@ -261,12 +402,12 @@ func (c *Client) send(ctx context.Context, method, path, contentType string, bod
 	}
 }
 
-func (c *Client) postJSON(ctx context.Context, path string, v any) ([]byte, error) {
+func (c *Client) postJSON(ctx context.Context, policy requestPolicy, path string, v any) ([]byte, error) {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return nil, fmt.Errorf("encoding %s: %w", path, err)
 	}
-	return c.send(ctx, http.MethodPost, path, "application/json", body, nil)
+	return c.send(ctx, policy, http.MethodPost, path, "application/json", body, nil)
 }
 
 func jobPath(jobID, rest string) string {
@@ -275,8 +416,7 @@ func jobPath(jobID, rest string) string {
 
 // Status polls the job's status. stop is true when the job is over for this executor: the API
 // reports it canceled, refuses the token with job-token-revoked or job-terminal, or answers 404
-// because the job was deleted while it ran (with its job template, or by a playbook force delete),
-// and nobody is waiting for it any more. Every other failure is returned as an error to retry.
+// with job-deleted. Every other failure is returned as an error to retry.
 func (c *Client) Status(ctx context.Context, jobID string) (stop bool, err error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -284,10 +424,10 @@ func (c *Client) Status(ctx context.Context, jobID string) (stop bool, err error
 	if err != nil {
 		return false, err
 	}
-	body, err := c.do(req)
+	body, _, err := c.do(req, readRequest)
 	if err != nil {
 		var se *StatusError
-		if errors.As(err, &se) && (se.Stops() || se.Code == http.StatusNotFound) {
+		if errors.As(err, &se) && se.Stops() {
 			return true, nil
 		}
 		return false, err
@@ -322,7 +462,7 @@ func (c *Client) WatchCancellation(ctx context.Context, jobID string, interval t
 
 // Artifacts fetches the job's artifacts into out and checks their contract version.
 func (c *Client) Artifacts(ctx context.Context, jobID string, out any, version func() int) error {
-	body, err := c.send(ctx, http.MethodGet, jobPath(jobID, "/artifacts"), "", nil, nil)
+	body, err := c.send(ctx, artifactRequest, http.MethodGet, jobPath(jobID, "/artifacts"), "", nil, nil)
 	if err != nil {
 		return fmt.Errorf("fetching artifacts: %w", err)
 	}
@@ -346,33 +486,33 @@ func (c *Client) Output(ctx context.Context, jobID string, req runnercontract.Jo
 			req.Placement = placement()
 		}
 	})
-	_, err := c.postJSON(ctx, jobPath(jobID, "/output"), req)
+	_, err := c.postJSON(ctx, writeRequest, jobPath(jobID, "/output"), req)
 	return err
 }
 
 // Event records an event the executor writes itself (Ansible preparation events).
 func (c *Client) Event(ctx context.Context, jobID string, ev runnercontract.JobEventRequest) error {
-	_, err := c.postJSON(ctx, jobPath(jobID, "/events"), ev)
+	_, err := c.postJSON(ctx, writeRequest, jobPath(jobID, "/events"), ev)
 	return err
 }
 
 // Complete reports the job's outcome.
 func (c *Client) Complete(ctx context.Context, jobID string, req runnercontract.JobCompleteRequest) error {
 	req.RunnerID = c.runnerID
-	_, err := c.postJSON(ctx, jobPath(jobID, "/complete"), req)
-	// The API holds an outcome once it accepted this one, or answers that it already holds one
-	// (409) or that the job is gone (404).
-	var se *StatusError
-	if err == nil || errors.As(err, &se) && (se.Code == http.StatusConflict || se.Code == http.StatusNotFound) {
+	_, err := c.postJSON(ctx, completionRequest, jobPath(jobID, "/complete"), req)
+	if err == nil {
 		c.reported.Store(true)
 	}
 	return err
 }
 
-// ExitCode is the executor's exit code for a job that ended with status: its outcome once the API
-// has its completion, ExitUnreported while it has none, so the launcher reports the job instead of
-// leaving it running. A stop exits as a stop either way: the job is over and nobody reports it.
+// ExitCode returns the outcome after confirmed delivery, ExitStopped after a terminal
+// disposition, or ExitUnreported so the launcher can recover a missing completion.
+// Cancellation also retains the existing stopped exit.
 func (c *Client) ExitCode(status string) int {
+	if c.retired.Load() {
+		return ExitStopped
+	}
 	if status != "canceled" && !c.reported.Load() {
 		return ExitUnreported
 	}
@@ -380,7 +520,7 @@ func (c *Client) ExitCode(status string) int {
 }
 
 func (c *Client) postBytes(ctx context.Context, path string, data []byte) error {
-	_, err := c.send(ctx, http.MethodPost, path, "application/octet-stream", data, nil)
+	_, err := c.send(ctx, writeRequest, http.MethodPost, path, "application/octet-stream", data, nil)
 	return err
 }
 
@@ -399,7 +539,7 @@ func (c *Client) UploadPlan(ctx context.Context, jobID string, plan []byte) erro
 func (c *Client) UploadSnapshot(ctx context.Context, jobID, commit string, data []byte) error {
 	header := http.Header{}
 	header.Set(runnercontract.HeaderSnapshotCommit, commit)
-	if _, err := c.send(ctx, http.MethodPost, jobPath(jobID, "/snapshot"), "application/gzip", data, header); err != nil {
+	if _, err := c.send(ctx, writeRequest, http.MethodPost, jobPath(jobID, "/snapshot"), "application/gzip", data, header); err != nil {
 		return fmt.Errorf("uploading the snapshot: %w", err)
 	}
 	return nil
@@ -407,13 +547,23 @@ func (c *Client) UploadSnapshot(ctx context.Context, jobID, commit string, data 
 
 // Get fetches an API path, such as a plan descriptor's or a playbook snapshot's.
 func (c *Client) Get(ctx context.Context, path string) ([]byte, error) {
-	return c.send(ctx, http.MethodGet, path, "", nil, nil)
+	return c.send(ctx, readRequest, http.MethodGet, path, "", nil, nil)
 }
 
 // Blob fetches an artifact too large to inline and checks it against its sha256 before returning
 // it: the executor trusts neither the transport nor the store.
 func (c *Client) Blob(ctx context.Context, ref runnercontract.BlobRef) ([]byte, error) {
-	data, err := c.Get(ctx, ref.Path)
+	header := make(http.Header)
+	expectedSize := int64(-1)
+	if ref.SHA256 != "" {
+		digest, err := hex.DecodeString(ref.SHA256)
+		if err != nil || len(digest) != sha256.Size || ref.SHA256 != strings.ToLower(ref.SHA256) || ref.SizeBytes < 0 {
+			return nil, errors.New("blob reference has an invalid digest or size")
+		}
+		header.Set("If-Match", "\""+ref.SHA256+"\"")
+		expectedSize = ref.SizeBytes
+	}
+	data, err := c.readContent(ctx, ref.Path, readRequest, header, expectedSize)
 	if err != nil {
 		return nil, fmt.Errorf("fetching blob %s: %w", ref.Path, err)
 	}
@@ -424,61 +574,233 @@ func (c *Client) Blob(ctx context.Context, ref runnercontract.BlobRef) ([]byte, 
 	return data, nil
 }
 
-// Download streams an API path, such as a playbook snapshot, to dest and refuses a body larger than
-// maxBytes. It has no overall timeout of its own, because the control-plane client's would cut a
-// large body short; ctx bounds it instead.
+// Download streams required content to dest, bounded by maxBytes and the job context.
+// Acquisition retries share five minutes. A successful body can outlive that allowance.
 func (c *Client) Download(ctx context.Context, path, dest string, maxBytes int64) error {
-	resp, err := c.openDownload(ctx, path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // G304: dest is inside the job's own work directory
-	if err != nil {
-		return fmt.Errorf("creating %s: %w", dest, err)
-	}
-	// One byte past the cap, so a body exactly at the cap is told apart from one cut off by it.
-	written, err := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
-	if closeErr := out.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("writing %s: %w", dest, err)
-	}
-	if written > maxBytes {
-		return fmt.Errorf("%s is larger than the %d byte limit", path, maxBytes)
-	}
-	return nil
+	return c.download(ctx, path, dest, maxBytes, readRequest, nil)
 }
 
-// openDownload requests path for Download and returns the 200 answer, sending the request again
-// while the answer is retryable.
-func (c *Client) openDownload(ctx context.Context, path string) (*http.Response, error) {
-	dl := &http.Client{Transport: c.http.Transport}
-	deadline := time.Now().Add(retryFor)
+// ErrDownloadContentChanged means that the complete body differs from the assigned artifact.
+var ErrDownloadContentChanged = errors.New("download content changed")
+
+// RequireVerifiedPlaybookSnapshots opts the Ansible job image into snapshot validation.
+func (c *Client) RequireVerifiedPlaybookSnapshots() { c.verifiedPlaybookSnapshots.Store(true) }
+
+type downloadVerification struct {
+	runnercontract.BlobRef
+	validator string
+}
+
+// DownloadVerified streams an assigned artifact to disk with one validator and acquisition deadline.
+func (c *Client) DownloadVerified(ctx context.Context, ref runnercontract.BlobRef, validator, dest string, maxBytes int64) error {
+	digest, err := hex.DecodeString(ref.SHA256)
+	if err != nil || len(digest) != sha256.Size || ref.SHA256 != strings.ToLower(ref.SHA256) || ref.SizeBytes <= 0 || ref.SizeBytes > maxBytes ||
+		len(validator) < 3 || strings.Count(validator, "\"") != 2 || validator[0] != '"' || validator[len(validator)-1] != '"' {
+		return errors.New("download reference has an invalid digest or size")
+	}
+	return c.download(ctx, ref.Path, dest, ref.SizeBytes, readRequest, &downloadVerification{BlobRef: ref, validator: validator})
+}
+
+func acquisitionDeadline(ctx context.Context, budget time.Duration) time.Time {
+	deadline := time.Now().Add(budget)
+	if parent, ok := ctx.Deadline(); ok && parent.Before(deadline) {
+		return parent
+	}
+	return deadline
+}
+
+func acquisitionError(ctx context.Context, path string, last error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("acquiring %s: %w", path, errors.Join(context.DeadlineExceeded, last))
+}
+
+// openContent retries acquisition against one deadline. Required reads may spend the remaining
+// allowance in storage or hashing before headers. Optional cache attempts retain twenty seconds.
+func (c *Client) openContent(ctx context.Context, path string, policy requestPolicy, header http.Header, deadline time.Time) (*http.Response, error) {
 	wait := retryFirstWait
+	var latest int64
+	var last error
 	for {
-		req, err := c.newRequest(ctx, http.MethodGet, path, "", nil)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, acquisitionError(ctx, path, last)
+		}
+		requestCtx, cancel := context.WithCancel(ctx)
+		req, err := c.newRequest(requestCtx, http.MethodGet, path, "", nil)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
-		resp, err := dl.Do(req) //nolint:gosec // G704: the server URL is the operator-configured endpoint
-		if err != nil {
-			return nil, fmt.Errorf("requesting %s: %w", path, err)
+		for key, values := range header {
+			req.Header[key] = values
 		}
-		if resp.StatusCode == http.StatusOK {
+		if policy == artifactRequest {
+			sequence, err := c.nextArtifactSequence(latest)
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+			req.Header.Set(runnercontract.ArtifactSequenceHeader, strconv.FormatInt(sequence, 10))
+		}
+		client := *c.http
+		closeTransport := func() {}
+		if policy == artifactRequest {
+			isolated, closeIsolated := c.artifactHTTPClient()
+			client = *isolated
+			closeTransport = closeIsolated
+		}
+		client.Timeout = 0
+		allowance := remaining
+		if policy == cacheRequest {
+			allowance = min(controlRequestTimeout, remaining)
+		}
+		timedOut := make(chan struct{})
+		timer := time.AfterFunc(allowance, func() { cancel(); close(timedOut) })
+		resp, err := client.Do(req) //nolint:gosec // G704: the server URL is the operator-configured endpoint
+		if err == nil && (resp.StatusCode < 200 || resp.StatusCode > 299) {
+			// A complete error document preserves explicit refusal codes with long details.
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			code, detail := runnercontract.DecodeError(body)
+			err = &StatusError{Code: resp.StatusCode, ErrorCode: code, Detail: detail, Body: strings.TrimSpace(string(body))}
+			if readErr != nil {
+				err = fmt.Errorf("reading %s: %w", path, readErr)
+			}
+		}
+		if !timer.Stop() {
+			<-timedOut
+		}
+		if err == nil && requestCtx.Err() == nil {
+			resp.Body = readbody.New(requestCtx, resp.Body, func() { cancel(); closeTransport() })
 			return resp, nil
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		_ = resp.Body.Close()
-		code, detail := errorOf(body)
-		err = &StatusError{Code: resp.StatusCode, ErrorCode: code, Detail: detail, Body: strings.TrimSpace(string(body))}
-		if !retryable(err) {
+		if err == nil {
+			_ = resp.Body.Close()
+			err = requestCtx.Err()
+		}
+		cancel()
+		closeTransport()
+		c.recordRetirement(err, policy)
+		shouldRetry := controlRetryable(err)
+		var status *StatusError
+		if policy == artifactRequest && errors.As(err, &status) && status.Code == http.StatusConflict && status.ErrorCode == runnercontract.ErrorCodeArtifactReadSuperseded {
+			parsed, parseErr := strconv.ParseInt(resp.Header.Get(runnercontract.ArtifactSequenceHeader), 10, 64)
+			if parseErr != nil || parsed <= 0 {
+				return nil, errors.New("superseded artifact response has an invalid sequence")
+			}
+			latest = parsed
+			shouldRetry = true
+		}
+		if !shouldRetry {
 			return nil, err
 		}
-		next, ok := retryWait(ctx, wait, deadline)
+		last = err
+		next, ok := controlWait(ctx, wait, deadline)
 		if !ok {
+			return nil, acquisitionError(ctx, path, last)
+		}
+		wait = next
+	}
+}
+
+// readContent retries interrupted bodies against the original acquisition deadline. A nonnegative
+// expectedSize also requires a complete body of exactly that size before a blob can be used.
+func (c *Client) readContent(ctx context.Context, path string, policy requestPolicy, header http.Header, expectedSize int64) ([]byte, error) {
+	deadline := acquisitionDeadline(ctx, requiredReadBudget)
+	wait := retryFirstWait
+	for {
+		resp, err := c.openContent(ctx, path, policy, header, deadline)
+		if err != nil {
 			return nil, err
+		}
+		var reader io.Reader = resp.Body
+		if expectedSize >= 0 && expectedSize < math.MaxInt64 {
+			reader = io.LimitReader(reader, expectedSize+1)
+		}
+		data, err := io.ReadAll(reader)
+		_ = resp.Body.Close()
+		if err == nil && expectedSize >= 0 {
+			if int64(len(data)) > expectedSize {
+				return nil, fmt.Errorf("%s exceeds its %d byte reference", path, expectedSize)
+			}
+			if int64(len(data)) < expectedSize {
+				err = io.ErrUnexpectedEOF
+			}
+		}
+		if err == nil {
+			return data, nil
+		}
+		next, ok := controlWait(ctx, wait, deadline)
+		if !ok {
+			return nil, acquisitionError(ctx, path, err)
+		}
+		wait = next
+	}
+}
+
+func (c *Client) download(ctx context.Context, path, dest string, maxBytes int64, policy requestPolicy, ref *downloadVerification) error {
+	if maxBytes < 0 {
+		return errors.New("download size limit must be nonnegative")
+	}
+	budget := requiredReadBudget
+	if policy == cacheRequest {
+		budget = ControlRetryBudget
+	}
+	deadline := acquisitionDeadline(ctx, budget)
+	wait := retryFirstWait
+	var header http.Header
+	if ref != nil {
+		header = http.Header{"If-Match": {ref.validator}}
+	}
+	for {
+		resp, err := c.openContent(ctx, path, policy, header, deadline)
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) //nolint:gosec // G304: dest is inside the job's own work directory
+		if err != nil {
+			_ = resp.Body.Close()
+			return fmt.Errorf("creating %s: %w", dest, err)
+		}
+		var writer io.Writer = out
+		digest := sha256.New()
+		if ref != nil {
+			writer = io.MultiWriter(out, digest)
+		}
+		written, copyErr := io.Copy(writer, io.LimitReader(resp.Body, min(maxBytes, math.MaxInt64-1)+1))
+		closeErr := out.Close()
+		_ = resp.Body.Close()
+		if ref != nil && copyErr == nil {
+			switch {
+			case written < ref.SizeBytes:
+				copyErr = io.ErrUnexpectedEOF
+			case written > ref.SizeBytes || hex.EncodeToString(digest.Sum(nil)) != ref.SHA256:
+				_ = os.Remove(dest)
+				return ErrDownloadContentChanged
+			}
+		}
+		if copyErr == nil && closeErr == nil && written <= maxBytes {
+			return nil
+		}
+		_ = os.Remove(dest)
+		if written > maxBytes {
+			return fmt.Errorf("%s is larger than the %d byte limit", path, maxBytes)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("closing %s: %w", dest, closeErr)
+		}
+		var fileErr *os.PathError
+		if errors.As(copyErr, &fileErr) {
+			return fmt.Errorf("writing %s: %w", dest, copyErr)
+		}
+		next, ok := controlWait(ctx, wait, deadline)
+		if !ok {
+			return acquisitionError(ctx, path, copyErr)
 		}
 		wait = next
 	}
@@ -511,7 +833,7 @@ func (c *Client) Preflight(ctx context.Context, jobID, stream string) bool {
 		return true
 	}
 	c.ReportRefusal(ctx, jobID, stream, err)
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ControlRetryBudget)
 	defer cancel()
 	_ = c.Complete(reportCtx, jobID, runnercontract.JobCompleteRequest{Status: "failed", ExitCode: 1, ErrorMessage: err.Error()})
 	return false
