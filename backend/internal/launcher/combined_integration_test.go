@@ -108,7 +108,7 @@ func TestCombinedLauncher_ServesBothEnginesInTheirJobImages(t *testing.T) {
 	buildStampedJobImage(t, tofuImage, "tofu")
 	buildStampedJobImage(t, ansibleImage, "ansible")
 
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	cfg := testConfig(api)
 	cfg.Engines = plain.Engines
 	cfg.JobImages = map[string]string{EngineTofu: tofuImage, EngineAnsible: ansibleImage}

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
@@ -72,6 +73,48 @@ func TestCache_ReadsTheLocalCopyWhenItVerifies(t *testing.T) {
 	}
 	if *served != 0 {
 		t.Errorf("the blob route served %d times though the local copy verified", *served)
+	}
+}
+
+func TestCacheStartsWithTheLaunchersExhaustionForOneJob(t *testing.T) {
+	body := []byte("collection")
+	remote := ref(runnercontract.CacheKindCollection, body)
+	var served atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != remote.Path {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		served.Add(1)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	client := NewClient(srv.URL, "job-token", "runner")
+	dir := t.TempDir()
+	local := ref(runnercontract.CacheKindCollection, []byte("local collection"))
+	if err := os.MkdirAll(filepath.Join(dir, "collection"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "collection", local.SHA256), []byte("local collection"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	output := t.TempDir()
+	reader := NewCache(client, dir, true)
+	if source, err := reader.Fetch(t.Context(), remote, filepath.Join(output, "remote.tar.gz")); source != SourceNone || err != nil {
+		t.Fatalf("exhausted job fetched its missing entry from %s: %v", source, err)
+	}
+	if source, err := reader.Fetch(t.Context(), local, filepath.Join(output, "local.tar.gz")); source != SourceLocal || err != nil {
+		t.Fatalf("exhausted job could not use its verified local entry: %s, %v", source, err)
+	}
+	if count := served.Load(); count != 0 {
+		t.Fatalf("exhausted job fetched %d remote entries", count)
+	}
+	reader = NewCache(client, dir, false)
+	if source, err := reader.Fetch(t.Context(), remote, filepath.Join(output, "next.tar.gz")); source != SourceBlob || err != nil {
+		t.Fatalf("fresh job could not fetch its entry: %s, %v", source, err)
+	}
+	if count := served.Load(); count != 1 {
+		t.Errorf("fresh job fetched %d remote entries, want one", count)
 	}
 }
 

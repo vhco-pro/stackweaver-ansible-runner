@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
 )
@@ -36,8 +37,16 @@ const (
 // runner token the executor does not hold.
 type Cache struct {
 	// Dir is the launcher's copy of the organization's cache, mounted read-only; empty when none.
-	Dir    string
-	Client *Client
+	Dir             string
+	Client          *Client
+	remoteExhausted atomic.Bool
+}
+
+// NewCache creates one reader for a job and seeds the launcher's acquisition result.
+func NewCache(client *Client, dir string, remoteExhausted bool) *Cache {
+	reader := &Cache{Dir: dir, Client: client}
+	reader.remoteExhausted.Store(remoteExhausted)
+	return reader
 }
 
 // Fetch copies entry e to dst, verified, and reports where it came from. An entry the job cannot
@@ -50,12 +59,15 @@ func (c *Cache) Fetch(ctx context.Context, e runnercontract.CacheEntryRef, dst s
 			return SourceLocal, nil
 		}
 	}
-	if c.Client == nil || e.Path == "" {
+	if c.remoteExhausted.Load() || c.Client == nil || e.Path == "" {
 		return SourceNone, nil
 	}
 	tmp := dst + ".partial"
-	err := c.Client.Download(ctx, e.Path, tmp, maxCacheEntryBytes)
+	err := c.Client.download(ctx, e.Path, tmp, maxCacheEntryBytes, cacheRequest, nil)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			c.remoteExhausted.Store(true)
+		}
 		_ = os.Remove(tmp)
 		var se *StatusError
 		if errors.As(err, &se) && (se.Code == http.StatusForbidden || se.Code == http.StatusNotFound) {

@@ -45,7 +45,8 @@ type Options struct {
 	// StatusInterval is how often the job's status is polled for a stop; zero means two seconds.
 	StatusInterval time.Duration
 	// CacheDir is the launcher's read-only copy of the organization's cache; empty for none.
-	CacheDir string
+	CacheDir             string
+	CacheRemoteExhausted bool
 }
 
 // Result is the outcome of a phase.
@@ -103,7 +104,7 @@ func complete(ctx context.Context, c *executor.Client, job Job, res Result, plan
 		req.PlanJSON = planJSON
 	}
 	// The completion is reported even after a stop: a canceled job still records how it ended.
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executor.ControlRetryBudget)
 	defer cancel()
 	if err := c.Complete(reportCtx, job.ID, req); err != nil {
 		logger.Warnf("Failed to report the completion of job %s: %v", job.ID, err)
@@ -141,7 +142,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 		return failed("", fmt.Errorf("creating the cache directory: %w", err))
 	}
 	defer func() { _ = os.RemoveAll(scratch) }()
-	cache := newCacheUse(c, opts.CacheDir, arts.Cache, scratch)
+	cache := newCacheUse(c, opts.CacheDir, arts.Cache, scratch, opts.CacheRemoteExhausted)
 	cache.placeProviders(ctx)
 
 	terraformDir := workDir
@@ -167,7 +168,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	replaceRemoteBackend(terraformDir)
 
 	if err := restoreState(ctx, c, arts, terraformDir); err != nil {
-		logger.Warnf("Failed to restore state for job %s: %v", job.ID, err)
+		return failed("", fmt.Errorf("restoring the workspace state: %w", err))
 	}
 
 	releases := ""
@@ -389,6 +390,9 @@ func restoreState(ctx context.Context, c *executor.Client, arts *runnercontract.
 		data = b
 	default:
 		return nil
+	}
+	if len(data) == 0 {
+		return errors.New("workspace state is empty")
 	}
 	return os.WriteFile(filepath.Join(dir, "terraform.tfstate"), data, 0o600)
 }

@@ -6,6 +6,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -165,10 +167,11 @@ func TestAPIEventSink_UnreachableControlPlaneReturnsError(t *testing.T) {
 type fakeControlPlane struct {
 	mu sync.Mutex
 
-	artifacts      map[string]any // served as the job's artifacts document
-	snapshot       []byte
-	snapshotStatus int    // 0 means 200
-	jobStatus      string // what the status poll reports; "" means running
+	artifacts          map[string]any // served as the job's artifacts document
+	snapshot           []byte
+	snapshotStatus     int // 0 means 200
+	unverifiedSnapshot bool
+	jobStatus          string // what the status poll reports; "" means running
 
 	// onSnapshot runs when the snapshot is requested, after the executor made its work directory.
 	onSnapshot func()
@@ -177,6 +180,7 @@ type fakeControlPlane struct {
 	artifactsCapabilities string // X-Stackweaver-Runner-Capabilities of the last artifacts request
 	snapshotRequests      int
 	snapshotAuth          string
+	snapshotValidators    []string
 	completion            map[string]any // the body of the completion report
 	outputs               []string       // the output lines streamed
 }
@@ -188,6 +192,14 @@ func (cp *fakeControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/artifacts"):
 		cp.artifactsCapabilities = r.Header.Get("X-Stackweaver-Runner-Capabilities")
 		doc := maps.Clone(cp.artifacts)
+		if original, ok := doc["playbook_source"].(map[string]any); ok && original["captured_at"] != nil && original["sha256"] == nil && !cp.unverifiedSnapshot {
+			source := maps.Clone(original)
+			digest := sha256.Sum256(cp.snapshot)
+			source["sha256"] = hex.EncodeToString(digest[:])
+			source["size_bytes"] = len(cp.snapshot)
+			source["validator"] = `"test-capture"`
+			doc["playbook_source"] = source
+		}
 		if _, set := doc["contract_version"]; !set {
 			doc["contract_version"] = runnercontract.Version // what the API serves
 		}
@@ -200,6 +212,7 @@ func (cp *fakeControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/playbook-snapshot"):
 		cp.snapshotRequests++
 		cp.snapshotAuth = r.Header.Get("Authorization")
+		cp.snapshotValidators = append(cp.snapshotValidators, r.Header.Get("If-Match"))
 		if cp.onSnapshot != nil {
 			cp.onSnapshot()
 		}

@@ -14,7 +14,7 @@ import (
 // Told to stop (SIGTERM), a launcher claims nothing more, lets its in-flight job finish and then
 // deregisters (#933, D3, AC18).
 func TestDrainFinishesInFlightWorkAndDeregisters(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"
@@ -56,7 +56,7 @@ func TestDrainFinishesInFlightWorkAndDeregisters(t *testing.T) {
 // An executor whose completion did not reach the API exits with the unreported code (2, as a Go
 // panic does): the launcher reports the job, so it does not stay running for ever.
 func TestSupervisionReportsAnExecutorThatCouldNotReport(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("kubernetes")
 	l := New(testConfig(api), d)
 	l.goos = "linux"
@@ -71,7 +71,7 @@ func TestSupervisionReportsAnExecutorThatCouldNotReport(t *testing.T) {
 // A placement whose executor ends without reporting (a crash, an OOM kill) is reported failed by
 // the launcher; a canceled job's placement is stopped.
 func TestSupervisionReportsACrashAndStopsACancel(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"
@@ -111,11 +111,11 @@ func TestSupervisionReportsACrashAndStopsACancel(t *testing.T) {
 	}
 }
 
-// A job deleted while it runs (with its job template, or by a playbook force delete) answers 404: its
+// A job deleted while it runs answers 404 with job-deleted. Its
 // placement is stopped and removed as a cancel is, nobody is waiting for the play any more, and no
 // failure is reported for a job that no longer exists.
 func TestSupervisionStopsAPlacementWhoseJobWasDeleted(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"
@@ -145,7 +145,7 @@ func TestSupervisionStopsAPlacementWhoseJobWasDeleted(t *testing.T) {
 // alone. That placement is removed as canceled too, never kept as a failure (AC12). A placement the
 // launcher stopped at the job's timeout ends with the same code and is a failure (AC25).
 func TestSupervisionRemovesAPlacementTheExecutorStoppedAsCanceled(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"
@@ -163,7 +163,7 @@ func TestSupervisionRemovesAPlacementTheExecutorStoppedAsCanceled(t *testing.T) 
 // A drain requested through the API (the heartbeat answers Drain) stops claiming, lets the
 // in-flight job finish and deregisters, like SIGTERM does (#933, D11, AC18).
 func TestRemoteDrainFinishesInFlightWorkAndDeregisters(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
 	l.goos = "linux"

@@ -3,9 +3,11 @@
 package executor
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
 )
@@ -31,15 +33,17 @@ func TestExitCode_AnUnreportedCompletionLeavesTheReportToTheLauncher(t *testing.
 	}{
 		{"completed, reported", answering(http.StatusOK), "completed", ExitCompleted},
 		{"failed, reported", answering(http.StatusOK), "failed", ExitFailed},
-		{"failed, the API already holds a completion", answering(http.StatusConflict), "failed", ExitFailed},
-		{"failed, the job was deleted", answering(http.StatusNotFound), "failed", ExitFailed},
+		{"failed, an uncoded conflict", answering(http.StatusConflict), "failed", ExitUnreported},
+		{"failed, an uncoded not-found response", answering(http.StatusNotFound), "failed", ExitUnreported},
 		{"failed, the API unreachable", unreachable, "failed", ExitUnreported},
 		{"completed, the API unreachable", unreachable, "completed", ExitUnreported},
 		{"failed, the API refusing", answering(http.StatusInternalServerError), "failed", ExitUnreported},
 		{"canceled, the API unreachable", unreachable, "canceled", ExitStopped},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_ = tc.client.Complete(t.Context(), "run-x", runnercontract.JobCompleteRequest{Status: tc.status})
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			_ = tc.client.Complete(ctx, "run-x", runnercontract.JobCompleteRequest{Status: tc.status})
 			if got := tc.client.ExitCode(tc.status); got != tc.want {
 				t.Errorf("ExitCode(%q) = %d, want %d", tc.status, got, tc.want)
 			}

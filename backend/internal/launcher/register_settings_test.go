@@ -11,7 +11,7 @@ import (
 // A launcher reports its deployment-level settings at registration, so every pool it serves shows
 // them read-only (#933, D0, D15): hosted.strict, the cache verification mode and the node cache.
 func TestRegisterRequestReportsLauncherSettings(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	cfg := testConfig(api)
 	cfg.Strict, cfg.VerifyTransparencyLog, cfg.CacheDir, cfg.CacheLimit = true, true, t.TempDir(), 3<<30
 	req := New(cfg, newFakeDriver("container")).registerRequest()

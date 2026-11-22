@@ -67,7 +67,7 @@ func Execute(ctx context.Context, c *executor.Client, jobID string, opts Options
 	} else {
 		res, result = run(ctx, c, jobID, &arts, opts)
 	}
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executor.ControlRetryBudget)
 	defer cancel()
 	if err := c.Complete(reportCtx, jobID, runnercontract.JobCompleteRequest{Status: res.Status, ErrorMessage: res.ErrorMessage, WorkResult: result}); err != nil {
 		logger.Warnf("Failed to report the completion of work item %s: %v", jobID, err)

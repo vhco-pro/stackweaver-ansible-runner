@@ -98,7 +98,7 @@ func runExecutor() int {
 	// SIGTERM from a driver stopping the placement cancels the job, which the executor reports.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	return execute(ctx, driver.Invocation{ServerURL: inv.ServerURL, JobID: inv.JobID, Token: inv.Token, RunType: inv.RunType, RunnerID: inv.RunnerID, CacheDir: inv.CacheDir})
+	return execute(ctx, driver.Invocation{ServerURL: inv.ServerURL, JobID: inv.JobID, Token: inv.Token, RunType: inv.RunType, RunnerID: inv.RunnerID, CacheDir: inv.CacheDir, CacheRemoteExhausted: inv.CacheRemoteExhausted})
 }
 
 // jobExecutor runs one job of its kind and returns the status it reported.
@@ -111,10 +111,10 @@ var executors = map[executor.Kind]jobExecutor{
 		return syncexec.Execute(ctx, client, inv.JobID, syncexec.Options{}).Status
 	},
 	executor.KindTofu: func(ctx context.Context, client *executor.Client, inv driver.Invocation) string {
-		return tofuexec.Execute(ctx, client, tofuexec.Job{ID: inv.JobID, RunType: inv.RunType}, tofuexec.Options{CacheDir: inv.CacheDir}).Status
+		return tofuexec.Execute(ctx, client, tofuexec.Job{ID: inv.JobID, RunType: inv.RunType}, tofuexec.Options{CacheDir: inv.CacheDir, CacheRemoteExhausted: inv.CacheRemoteExhausted}).Status
 	},
 	executor.KindAnsible: func(ctx context.Context, client *executor.Client, inv driver.Invocation) string {
-		return ansibleexec.Execute(ctx, client, ansibleexec.Job{ID: inv.JobID}, ansibleexec.Options{CacheDir: inv.CacheDir}).Status
+		return ansibleexec.Execute(ctx, client, ansibleexec.Job{ID: inv.JobID}, ansibleexec.Options{CacheDir: inv.CacheDir, CacheRemoteExhausted: inv.CacheRemoteExhausted}).Status
 	},
 }
 

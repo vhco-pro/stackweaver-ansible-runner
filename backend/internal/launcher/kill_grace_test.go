@@ -47,7 +47,7 @@ func (d *graceDriver) grace(job string) (time.Duration, bool) {
 // job that stops on its interrupt is gone within the cancel's ten seconds whatever the grace is
 // (#933, D3, AC12).
 func TestCancelKeepsTheGraceButRemovesOnExit(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := &graceDriver{fakeDriver: newFakeDriver("kubernetes"), graces: map[string]time.Duration{}, killed: make(chan string, 1)}
 	cfg := testConfig(api)
 	cfg.KillGrace = time.Hour

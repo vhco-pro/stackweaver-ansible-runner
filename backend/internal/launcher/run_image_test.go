@@ -15,7 +15,7 @@ import (
 // (#933, D6, AC27).
 func TestClaimPlacesTheRunImageWithItsPullCredential(t *testing.T) {
 	ref := "registry.internal:5000/acme/tofu-aws@sha256:" + strings.Repeat("ab", 32)
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.images = map[string]*runnercontract.JobImage{
 		"run-1": {ID: "img-1", Ref: ref, Level: "workspace", Kind: "tofu", PullCredential: true},
 		"run-2": {ID: "img-2", Ref: "ghcr.io/acme/public:1", Level: "organization", Kind: "tofu"},
@@ -52,7 +52,7 @@ func TestClaimPlacesTheRunImageWithItsPullCredential(t *testing.T) {
 // A run image whose credential cannot be read fails the job with the reason rather than placing it
 // unauthenticated.
 func TestClaimFailsAJobWhosePullCredentialIsGone(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.images = map[string]*runnercontract.JobImage{"run-1": {ID: "img-gone", Ref: "registry.internal/x:1", Level: "workspace", PullCredential: true}}
 	d := newFakeDriver("container")
 	l := New(testConfig(api), d)
@@ -78,7 +78,7 @@ func TestClaimUsesThePoolsPullSecretOnPods(t *testing.T) {
 		wantAuth   bool
 	}{{"kubernetes", "registry-ghcr", false}, {"container", "", true}} {
 		t.Run(tc.driver, func(t *testing.T) {
-			api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+			api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 			api.images = map[string]*runnercontract.JobImage{
 				"run-1": {ID: "img-1", Ref: "ghcr.io/acme/tofu:1", Level: "workspace", Kind: "tofu", PullCredential: true, PullSecret: "registry-ghcr"},
 			}

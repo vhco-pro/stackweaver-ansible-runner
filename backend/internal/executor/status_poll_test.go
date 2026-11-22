@@ -32,7 +32,16 @@ func TestStatusPollStopRule(t *testing.T) {
 		{"canceled", 200, `{"status":"canceled"}`, true, false},
 		{"revoked", 403, `{"errors":[{"status":"403","code":"job-token-revoked","title":"Forbidden"}]}`, true, false},
 		{"terminal", 403, `{"errors":[{"status":"403","code":"job-terminal","title":"Forbidden"}]}`, true, false},
-		{"job deleted", 404, `{"errors":[{"status":"404","title":"Not Found"}]}`, true, false},
+		{"job deleted", 404, `{"errors":[{"status":"404","code":"job-deleted","title":"Not Found"}]}`, true, false},
+		{"bare 404", 404, `{"errors":[{"status":"404","title":"Not Found"}]}`, false, true},
+		{"malformed 404", 404, `upstream unavailable`, false, true},
+		{"wrong code 404", 404, `{"errors":[{"code":"job-token-revoked"}]}`, false, true},
+		{"deletion code wrong status", 500, `{"errors":[{"code":"job-deleted"}]}`, false, true},
+		{"terminal code wrong status", 401, `{"errors":[{"code":"job-terminal"}]}`, false, true},
+		{"textual deletion", 404, `{"message":"job-deleted"}`, false, true},
+		{"later error deletion", 404, `{"errors":[{"title":"Not Found"},{"code":"job-deleted"}]}`, false, true},
+		{"internal error", 500, `internal error`, false, true},
+		{"service unavailable", 503, `unavailable`, false, true},
 		{"bare 403", 403, `{"errors":[{"status":"403","title":"Forbidden"}]}`, false, true},
 		{"bare 401", 401, `{"errors":[{"status":"401","title":"Unauthorized"}]}`, false, true},
 		{"server error", 502, `bad gateway`, false, true},
@@ -58,8 +67,10 @@ func TestStatusPollStopRule(t *testing.T) {
 func TestWatchCancellation(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) < 3 {
-			w.WriteHeader(http.StatusUnauthorized) // an old replica during an upgrade
+		statuses := []int{http.StatusUnauthorized, http.StatusNotFound, http.StatusServiceUnavailable, http.StatusInternalServerError, http.StatusForbidden}
+		if call := int(calls.Add(1)); call <= len(statuses) {
+			w.WriteHeader(statuses[call-1])
+			_, _ = w.Write([]byte(`{"errors":[{"title":"Control plane unavailable"}]}`))
 			return
 		}
 		w.WriteHeader(http.StatusForbidden)
@@ -75,8 +86,8 @@ func TestWatchCancellation(t *testing.T) {
 		if !errors.Is(context.Cause(ctx), ErrJobStopped) {
 			t.Fatalf("stopped with cause %v, want ErrJobStopped", context.Cause(ctx))
 		}
-		if calls.Load() < 3 {
-			t.Fatalf("stopped after %d polls, want it to retry through the 401s", calls.Load())
+		if calls.Load() < 6 {
+			t.Fatalf("stopped after %d polls, want it to retry through indeterminate responses", calls.Load())
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the watcher never stopped the job")

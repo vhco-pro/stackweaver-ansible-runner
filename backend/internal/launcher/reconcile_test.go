@@ -14,12 +14,30 @@ import (
 // fails the job whose placement died while it was down, and stops a placement whose job is over
 // (#933, D3, AC16).
 func TestReconcileAfterARestart(t *testing.T) {
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	api.statuses["run-a"], api.statuses["job-b"], api.statuses["run-dead"], api.statuses["run-over"] = "applying", "running", "planning", "applied"
+	// Current claims carry the original identity. Finished placements require an explicit
+	// terminal refusal for that original claim before they release capacity.
+	api.activeClaims = []runnercontract.ActiveClaim{
+		{JobID: "run-a", JobType: "tofu_run", Attempt: 1, Phase: "apply", RunType: "apply"},
+		{JobID: "job-b", JobType: "ansible_job", Attempt: 1},
+		{JobID: "run-dead", JobType: "tofu_run", Attempt: 1, Phase: "plan", RunType: "plan"},
+	}
+	api.claims = map[string]runnercontract.PendingJob{}
+	for _, claim := range api.activeClaims {
+		api.claims[claim.JobID] = runnercontract.PendingJob{JobID: claim.JobID, JobType: claim.JobType, Attempt: claim.Attempt, Phase: claim.Phase, RunType: claim.RunType}
+	}
+	api.claims["run-over"] = runnercontract.PendingJob{JobID: "run-over", JobType: "tofu_run", Attempt: 1, Phase: "apply", RunType: "apply"}
 	d := newFakeDriver("container")
 	d.reattach = true
 	placement := func(job string, ended bool) driver.Placement {
-		return driver.Placement{ID: "c-" + job, Ended: ended, Labels: map[string]string{driver.LabelJob: job, driver.LabelRunner: "runner-1", driver.LabelManaged: "true"}}
+		labels := map[string]string{driver.LabelJob: job, driver.LabelRunner: "runner-1", driver.LabelManaged: "true", driver.LabelAttempt: "1", driver.LabelKind: "tofu"}
+		if job == "job-b" {
+			labels[driver.LabelKind] = "ansible"
+		} else {
+			labels[driver.LabelRunType] = api.claims[job].RunType
+		}
+		return driver.Placement{ID: "c-" + job, Ended: ended, Labels: labels}
 	}
 	d.listed = []driver.Placement{placement("run-a", false), placement("job-b", false), placement("run-dead", true), placement("run-over", false)}
 	l := New(testConfig(api), d)

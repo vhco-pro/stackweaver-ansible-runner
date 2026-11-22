@@ -33,6 +33,7 @@ var capabilities = []string{
 	runnercontract.CapabilityBlob,
 	runnercontract.CapabilityJobToken,
 	runnercontract.CapabilityWorkItems,
+	runnercontract.CapabilityClaimRecovery,
 }
 
 // Backoff is the retry schedule for calls that must eventually succeed: registration and
@@ -56,7 +57,7 @@ func (b Backoff) next(n int) time.Duration {
 	return d
 }
 
-var defaultBackoff = Backoff{Initial: time.Second, Max: time.Minute}
+var defaultBackoff = Backoff{Initial: time.Second, Max: runnercontract.LauncherBackoffMax}
 
 // Client speaks the runner control plane for a launcher. It authenticates its registration with
 // the registration token (a customer pool's agent token or the deployment's hosted secret) and
@@ -109,8 +110,9 @@ func (c *Client) token() string {
 
 // StatusError is a non-2xx answer.
 type StatusError struct {
-	Code int
-	Body string
+	Code      int
+	ErrorCode string
+	Body      string
 }
 
 func (e *StatusError) Error() string {
@@ -124,6 +126,12 @@ func (e *StatusError) Error() string {
 // call sends one request with a JSON body (nil for none) and decodes a 2xx answer into out (nil to
 // discard it). timeout bounds the whole call; zero means ctx alone does.
 func (c *Client) call(ctx context.Context, method, path, bearer string, in, out any, timeout time.Duration) error {
+	_, err := c.callStatus(ctx, method, path, bearer, in, out, timeout, false)
+	return err
+}
+
+// callStatus also retains received headers when the optional response body is lost.
+func (c *Client) callStatus(ctx context.Context, method, path, bearer string, in, out any, timeout time.Duration, completion bool) (int, error) {
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -133,13 +141,13 @@ func (c *Client) call(ctx context.Context, method, path, bearer string, in, out 
 	if in != nil {
 		data, err := json.Marshal(in)
 		if err != nil {
-			return fmt.Errorf("encoding %s: %w", path, err)
+			return 0, fmt.Errorf("encoding %s: %w", path, err)
 		}
 		body = bytes.NewReader(data)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.serverURL+path, body)
 	if err != nil {
-		return fmt.Errorf("building %s %s: %w", method, path, err)
+		return 0, fmt.Errorf("building %s %s: %w", method, path, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set(runnercontract.CapabilitiesHeader, strings.Join(capabilities, ","))
@@ -148,22 +156,26 @@ func (c *Client) call(ctx context.Context, method, path, bearer string, in, out 
 	}
 	resp, err := c.http.Do(req) //nolint:gosec // G704: the server URL is the operator-configured endpoint
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return 0, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if completion && resp.StatusCode == http.StatusOK {
+		return resp.StatusCode, nil
+	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return fmt.Errorf("reading %s %s: %w", method, path, err)
+		return resp.StatusCode, fmt.Errorf("reading %s %s: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &StatusError{Code: resp.StatusCode, Body: string(data)}
+		code, _ := runnercontract.DecodeError(data)
+		return resp.StatusCode, &StatusError{Code: resp.StatusCode, ErrorCode: code, Body: string(data)}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decoding %s %s: %w", method, path, err)
+			return resp.StatusCode, fmt.Errorf("decoding %s %s: %w", method, path, err)
 		}
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // retry runs fn until it succeeds or ctx ends, waiting by the backoff between attempts, and calls
@@ -216,33 +228,60 @@ func (c *Client) Heartbeat(ctx context.Context, req runnercontract.HeartbeatRequ
 	req.RunnerID = c.RunnerID()
 	req.WaitSeconds = int(wait / time.Second)
 	var resp runnercontract.HeartbeatResponse
-	err := c.call(ctx, http.MethodPost, "/api/v2/runner/heartbeat", c.token(), req, &resp, wait+30*time.Second)
+	err := c.call(ctx, http.MethodPost, "/api/v2/runner/heartbeat", c.token(), req, &resp, wait+runnercontract.HeartbeatRequestOverhead)
 	return resp, err
 }
 
-// Start claims an offered job (the atomic claim, the cap check and, for a run, the state lock),
-// reporting what the launcher knows of the placement. ErrClaimLost means skip it.
-func (c *Client) Start(ctx context.Context, jobID string, placement *runnercontract.Placement) error {
-	err := c.call(ctx, http.MethodPost, "/api/v2/runner/jobs/"+jobID+"/start", c.token(),
-		runnercontract.JobStartRequest{RunnerID: c.RunnerID(), Placement: placement}, nil, 30*time.Second)
-	var se *StatusError
-	if errors.As(err, &se) && se.Code == http.StatusConflict {
-		return ErrClaimLost
+// Start claims one original offer and requires the matching enveloped acknowledgement.
+func (c *Client) Start(ctx context.Context, offer runnercontract.PendingJob, placement *runnercontract.Placement) error {
+	request := runnercontract.JobStartRequest{
+		RunnerID: c.RunnerID(), Placement: placement,
+		Attempt: offer.Attempt, Phase: offer.Phase, RunType: offer.RunType,
 	}
-	return err
+	return c.control(ctx, "start", func(attempt context.Context) error {
+		var response struct {
+			Meta runnercontract.JobStartResponse `json:"meta"`
+		}
+		err := c.call(attempt, http.MethodPost, "/api/v2/runner/jobs/"+offer.JobID+"/start", c.token(), request, &response, 0)
+		var status *StatusError
+		if errors.As(err, &status) && (status.Code == http.StatusConflict || status.Code == http.StatusForbidden) {
+			return ErrClaimLost
+		}
+		if err != nil {
+			return err
+		}
+		if response.Meta.Status != "started" || response.Meta.Attempt != offer.Attempt || response.Meta.Phase != offer.Phase || response.Meta.RunType != offer.RunType {
+			return errors.New("start acknowledgement does not match the original offer")
+		}
+		return nil
+	})
 }
 
-// JobToken asks for the token the executor of a claimed job runs with, and checks its contract
-// version.
-func (c *Client) JobToken(ctx context.Context, jobID string) (runnercontract.JobToken, error) {
-	var tok runnercontract.JobToken
-	if err := c.call(ctx, http.MethodPost, "/api/v2/runner/jobs/"+jobID+"/token", c.token(), nil, &tok, 30*time.Second); err != nil {
-		return tok, err
+// JobToken acquires supervision credentials. A supplied identity always binds the original claim.
+// The empty form remains for reconciliation of placements created before claim recovery.
+func (c *Client) JobToken(ctx context.Context, jobID string, expected ...runnercontract.JobTokenRequest) (runnercontract.JobToken, error) {
+	var token runnercontract.JobToken
+	var request any
+	if len(expected) > 0 {
+		request = expected[0]
 	}
-	if err := runnercontract.CheckVersion(tok.ContractVersion); err != nil {
-		return tok, fmt.Errorf("refusing the job token: %w", err)
-	}
-	return tok, nil
+	err := c.control(ctx, "job token", func(attempt context.Context) error {
+		token = runnercontract.JobToken{}
+		if err := c.call(attempt, http.MethodPost, "/api/v2/runner/jobs/"+jobID+"/token", c.token(), request, &token, 0); err != nil {
+			return err
+		}
+		if err := runnercontract.CheckVersion(token.ContractVersion); err != nil {
+			return fmt.Errorf("refusing the job token: %w", err)
+		}
+		if len(expected) > 0 {
+			claim := expected[0]
+			if token.Token == "" || token.JobID != jobID || token.Attempt != claim.Attempt || token.Phase != claim.Phase || token.RunType != claim.RunType {
+				return errors.New("job token does not match the original claim")
+			}
+		}
+		return nil
+	})
+	return token, err
 }
 
 // Status reads a job's status, which the launcher's supervision uses to stop a placement the API
@@ -255,20 +294,89 @@ func (c *Client) Status(ctx context.Context, jobID string) (string, error) {
 	return out.Status, err
 }
 
-// Fail reports a job the launcher could not run, or whose placement died, as failed.
-func (c *Client) Fail(ctx context.Context, jobID, message string) error {
-	return c.FailWith(ctx, jobID, c.token(), message)
+// Fail reports a failed startup using the runner key and the original expected claim.
+func (c *Client) Fail(ctx context.Context, jobID, message string, expected ...runnercontract.JobTokenRequest) error {
+	return c.FailWith(ctx, jobID, c.token(), message, expected...)
 }
 
-// FailWith reports a job failed with the job's own token: a runner that declared the job-token
-// capability completes a job only with it (the API's JobData guard), so every failure the launcher
-// reports for a job it holds a token for goes through here.
-func (c *Client) FailWith(ctx context.Context, jobID, token, message string) error {
+// FailWith retries the same failure payload. A committed acknowledgement or coded terminal
+// refusal retires delivery without replacing an outcome already stored by the API.
+func (c *Client) FailWith(ctx context.Context, jobID, token, message string, expected ...runnercontract.JobTokenRequest) error {
 	if token == "" {
 		token = c.token()
 	}
-	return c.call(ctx, http.MethodPost, "/api/v2/runner/jobs/"+jobID+"/complete", token,
-		runnercontract.JobCompleteRequest{RunnerID: c.RunnerID(), Status: "failed", ExitCode: 1, ErrorMessage: message}, nil, 30*time.Second)
+	request := runnercontract.JobCompleteRequest{RunnerID: c.RunnerID(), Status: "failed", ExitCode: 1, ErrorMessage: message}
+	if len(expected) > 0 {
+		request.Attempt, request.Phase = expected[0].Attempt, expected[0].Phase
+	}
+	return c.control(ctx, "failure report", func(attempt context.Context) error {
+		status, err := c.callStatus(attempt, http.MethodPost, "/api/v2/runner/jobs/"+jobID+"/complete", token, request, nil, 0, true)
+		if status == http.StatusOK || terminalRefusal(err) {
+			return nil
+		}
+		if err == nil {
+			return &StatusError{Code: status, Body: "completion has no committed acknowledgement"}
+		}
+		return err
+	})
+}
+
+// control bounds acquisition or delivery independently of a caller's earlier operation.
+func (c *Client) control(parent context.Context, operation string, call func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
+	defer cancel()
+	for failures := 0; ; failures++ {
+		attempt, stop := context.WithTimeout(ctx, 20*time.Second)
+		err := call(attempt)
+		stop()
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s: %w", operation, errors.Join(ctx.Err(), err))
+		}
+		if err == nil || !retryControl(err) {
+			return err
+		}
+		c.logf("%s failed (attempt %d), retrying: %v", operation, failures+1, err)
+		// A short capped backoff leaves room to recover near the end of the delivery budget.
+		backoff := Backoff{Initial: c.backoff.Initial, Max: min(c.backoff.Max, 5*time.Second)}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s: %w", operation, errors.Join(ctx.Err(), err))
+		case <-time.After(backoff.next(failures)):
+		}
+	}
+}
+
+func retryControl(err error) bool {
+	if errors.Is(err, ErrClaimLost) {
+		return false
+	}
+	var status *StatusError
+	if !errors.As(err, &status) {
+		return true
+	}
+	switch status.Code {
+	case http.StatusUnauthorized:
+		return status.ErrorCode == ""
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func terminalRefusal(err error) bool {
+	var status *StatusError
+	if !errors.As(err, &status) {
+		return false
+	}
+	switch status.Code {
+	case http.StatusForbidden:
+		return status.ErrorCode == runnercontract.ErrorCodeJobTokenRevoked || status.ErrorCode == runnercontract.ErrorCodeJobTerminal
+	case http.StatusConflict:
+		return status.ErrorCode == runnercontract.ErrorCodeJobTerminal
+	case http.StatusNotFound:
+		return status.ErrorCode == runnercontract.ErrorCodeJobDeleted
+	}
+	return false
 }
 
 // ReportPlacement reports what the launcher learnt of a placement after the claim, such as the image

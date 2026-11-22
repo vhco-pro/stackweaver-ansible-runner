@@ -111,6 +111,10 @@ func (f *fakeTofuAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var req runnercontract.JobOutputRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.outputs = append(f.outputs, req)
+	case strings.HasSuffix(r.URL.Path, "/empty-state") && r.Method == http.MethodGet:
+		w.WriteHeader(http.StatusOK)
+	case strings.HasSuffix(r.URL.Path, "/state") && r.Method == http.MethodGet:
+		http.Error(w, "state blob is unavailable", http.StatusNotFound)
 	case strings.HasSuffix(r.URL.Path, "/state"):
 		f.state, _ = io.ReadAll(r.Body)
 	case strings.HasSuffix(r.URL.Path, "/complete"):
@@ -266,6 +270,33 @@ func TestExecute_PlanOnlyUploadsNoSavedPlan(t *testing.T) {
 	}
 	if h.api.plan != nil {
 		t.Errorf("a plan-only run uploaded a saved plan (%q)", h.api.plan)
+	}
+}
+
+func TestExecute_RefusesUnreadableDeclaredState(t *testing.T) {
+	tests := []struct {
+		name  string
+		state string
+		blob  *runnercontract.BlobRef
+	}{
+		{name: "invalid inline state", state: "invalid base64!"},
+		{name: "missing state blob", blob: &runnercontract.BlobRef{Path: "/state"}},
+		{name: "empty inline state", state: "\n"},
+		{name: "empty state blob", blob: &runnercontract.BlobRef{Path: "/empty-state"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTofuHarness(t, "run-unreadable-state")
+			h.api.artifacts.StateJSON = tt.state
+			h.api.artifacts.StateBlob = tt.blob
+			res := h.execute(t, "plan-only")
+			if res.Status != "failed" || !strings.Contains(errString(res.Err), "restoring the workspace state") {
+				t.Errorf("unreadable state: status %q, error %v", res.Status, res.Err)
+			}
+			if calls := h.read(t, "calls"); calls != "" {
+				t.Errorf("OpenTofu ran %q without the declared state", calls)
+			}
+		})
 	}
 }
 

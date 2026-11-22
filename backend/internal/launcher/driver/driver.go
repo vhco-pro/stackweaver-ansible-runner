@@ -141,6 +141,8 @@ type Request struct {
 	Runtime string
 	// Cache is the node-local read-only cache to mount, nil for none.
 	Cache *CacheMount
+	// CacheRemoteExhausted carries the launcher result to an in-process executor.
+	CacheRemoteExhausted bool
 	// PullAuth is the registry credential the job's image is pulled with, nil for none (#933, D6).
 	PullAuth *RegistryAuth
 	// PullSecret is the pool's long-lived pull Secret for the image's registry (#933, D8): a pod

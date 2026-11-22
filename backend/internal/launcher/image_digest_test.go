@@ -26,7 +26,7 @@ func (d *digestDriver) ImageDigest(context.Context, driver.Placement) (string, e
 // job on Kubernetes records the image digest it ran in (#933, D4, AC27, AC77).
 func TestSupervisionReportsTheImageDigestTheDriverLearns(t *testing.T) {
 	const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := &digestDriver{fakeDriver: newFakeDriver("kubernetes"), digest: digest}
 	l := New(testConfig(api), d)
 	l.goos = "linux"
@@ -46,7 +46,7 @@ func TestSupervisionReportsTheImageDigestTheDriverLearns(t *testing.T) {
 // custom run image specs saw an empty digest for jobs of a few seconds).
 func TestTheImageDigestOfAShortJobIsReportedWhileItRuns(t *testing.T) {
 	const digest = "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-	api := newFakeAPI(t, runnercontract.CapabilityJobToken)
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
 	d := &digestDriver{fakeDriver: newFakeDriver("kubernetes"), digest: digest}
 	cfg := testConfig(api)
 	cfg.StatusInterval = time.Hour

@@ -28,35 +28,21 @@ type supervised struct {
 	placement driver.Placement
 	cancel    context.CancelFunc
 	// token is the job's token, which the launcher reports a failure of the job with.
-	token string
-}
-
-// supervise watches a placement until it ends (D3): it stops it when the API reports the job
-// canceled or the job's timeout passes, and reports the job failed when the executor ends without
-// having reported (a crash, an out-of-memory kill, a placement that died).
-func (l *Launcher) supervise(parent context.Context, jobID string, p driver.Placement, timeout time.Duration, token string) {
-	// The supervision outlives the claim that started it; only its own end stops it.
-	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
-	s := &supervised{jobID: jobID, placement: p, cancel: cancel, token: token}
-	l.mu.Lock()
-	l.inflight[jobID] = s
-	l.mu.Unlock()
-	l.wg.Add(1)
-	go func() {
-		defer l.wg.Done()
-		defer cancel()
-		defer l.finished(jobID)
-		l.watch(ctx, s, timeout)
-	}()
+	token    string
+	expected runnercontract.JobTokenRequest
 }
 
 func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Duration) {
+	// Hard drain signals supervision, which stops the placement before releasing its waiter.
+	waitCtx, stopWaiting := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopWaiting()
+	placement := s.placement
 	exited := make(chan struct {
 		exit driver.Exit
 		err  error
 	}, 1)
 	go func() {
-		exit, err := l.driver.Wait(ctx, s.placement)
+		exit, err := l.driver.Wait(waitCtx, placement)
 		exited <- struct {
 			exit driver.Exit
 			err  error
@@ -99,9 +85,7 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 			// canceled, and the API keeps the first completion it is given (AC12).
 			reason := fmt.Sprintf("the job exceeded its timeout of %s and was stopped", timeout)
 			l.client.logf("Job %s: %s", s.jobID, reason)
-			if ferr := l.client.FailWith(context.WithoutCancel(ctx), s.jobID, s.token, reason); ferr != nil {
-				l.client.logf("Reporting job %s failed: %v", s.jobID, ferr)
-			}
+			l.deliverFailure(ctx, s, reason)
 			timedOut = true
 			_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
 		case <-digestTick:
@@ -111,7 +95,7 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 		case <-ticker.C:
 			status, err := l.client.Status(ctx, s.jobID)
 			var se *StatusError
-			deleted = errors.As(err, &se) && se.Code == http.StatusNotFound
+			deleted = deleted || (errors.As(err, &se) && se.Code == http.StatusNotFound && se.ErrorCode == runnercontract.ErrorCodeJobDeleted)
 			if deleted || (err == nil && status == "canceled") {
 				l.client.logf("Job %s was canceled or deleted, stopping its placement", s.jobID)
 				// Removed as canceled once it has stopped: never kept as a failure (AC12).
@@ -119,6 +103,8 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 				_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
 			}
 		case <-ctx.Done():
+			_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
+			_ = l.driver.Remove(context.WithoutCancel(ctx), s.placement)
 			return
 		}
 	}
@@ -135,7 +121,7 @@ func (l *Launcher) reportImageDigest(ctx context.Context, s *supervised, d drive
 	if err != nil || digest == "" {
 		return false
 	}
-	if err := l.client.ReportPlacement(context.WithoutCancel(ctx), s.jobID, s.token, runnercontract.Placement{ImageDigest: digest}); err != nil {
+	if err := l.client.ReportPlacement(ctx, s.jobID, s.token, runnercontract.Placement{ImageDigest: digest}); err != nil {
 		l.client.logf("Reporting the image digest of job %s: %v", s.jobID, err)
 	}
 	return true
@@ -157,9 +143,7 @@ func (l *Launcher) ended(ctx context.Context, s *supervised, exit driver.Exit, e
 		}
 	}
 	if reason != "" {
-		if ferr := l.client.FailWith(bg, s.jobID, s.token, reason); ferr != nil {
-			l.client.logf("Reporting job %s failed: %v", s.jobID, ferr)
-		}
+		l.deliverFailure(ctx, s, reason)
 	}
 	if rerr := l.driver.Remove(bg, s.placement); rerr != nil {
 		l.client.logf("Removing the placement of job %s: %v", s.jobID, rerr)
@@ -167,9 +151,9 @@ func (l *Launcher) ended(ctx context.Context, s *supervised, exit driver.Exit, e
 }
 
 // finished forgets a job and wakes the loop: capacity is free.
-func (l *Launcher) finished(jobID string) {
+func (l *Launcher) finished(key string) {
 	l.mu.Lock()
-	delete(l.inflight, jobID)
+	delete(l.inflight, key)
 	l.mu.Unlock()
 	select {
 	case l.done <- struct{}{}:
@@ -178,15 +162,31 @@ func (l *Launcher) finished(jobID string) {
 }
 
 // stopAll kills every in-flight placement: the drain grace is over.
-func (l *Launcher) stopAll(ctx context.Context) {
-	l.mu.Lock()
-	jobs := make([]*supervised, 0, len(l.inflight))
-	for _, s := range l.inflight {
-		jobs = append(jobs, s)
+func (l *Launcher) stopAll(_ context.Context) {
+	if l.recoveryCancel != nil {
+		l.recoveryCancel()
 	}
-	l.mu.Unlock()
-	for _, s := range jobs {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, s := range l.inflight {
 		l.client.logf("Drain grace over: stopping job %s", s.jobID)
-		_ = l.driver.Kill(ctx, s.placement, l.cfg.killGrace())
+		s.cancel()
+	}
+}
+
+// deliverFailure retains capacity and the exact payload until delivery, terminal refusal or the
+// worker's hard deadline. Each delivery window has a fresh budget after acquisition has ended.
+func (l *Launcher) deliverFailure(ctx context.Context, s *supervised, reason string) {
+	for ctx.Err() == nil {
+		if err := l.client.FailWith(ctx, s.jobID, s.token, reason, s.expected); err == nil {
+			return
+		} else {
+			l.client.logf("Reporting job %s failed: %v", s.jobID, err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 }

@@ -322,3 +322,75 @@ func TestAzureTenantBridge(t *testing.T) {
 		})
 	}
 }
+
+func TestExecutorSubcommandPreservesCompletionDispositionForEveryKind(t *testing.T) {
+	bin := binary(t)
+	for _, job := range []struct {
+		name, id, runType string
+		tools             []string
+	}{
+		{"ansible", "job-disposition", "", []string{"ansible"}},
+		{"plan", "run-disposition", "plan", []string{"tofu"}},
+		{"apply", "run-disposition", "apply", []string{"tofu"}},
+		{"destroy-plan", "run-disposition", "plan-destroy", []string{"tofu"}},
+		{"destroy-apply", "run-disposition", "apply-destroy", []string{"tofu"}},
+		{"ansible-sync", runnercontract.WorkItemPrefix + "disposition", "", []string{"ansible"}},
+		{"tofu-sync", runnercontract.WorkItemPrefix + "disposition", "", []string{"tofu"}},
+	} {
+		for _, reply := range []struct {
+			name string
+			http int
+			code string
+			exit int
+		}{
+			{"committed-failure", http.StatusOK, "", executor.ExitFailed},
+			{"revoked", http.StatusForbidden, runnercontract.ErrorCodeJobTokenRevoked, executor.ExitStopped},
+			{"terminal", http.StatusConflict, runnercontract.ErrorCodeJobTerminal, executor.ExitStopped},
+			{"deleted", http.StatusNotFound, runnercontract.ErrorCodeJobDeleted, executor.ExitStopped},
+			{"uncoded-conflict", http.StatusConflict, "", executor.ExitUnreported},
+			{"uncoded-not-found", http.StatusNotFound, "", executor.ExitUnreported},
+			{"uncommitted-accepted", http.StatusAccepted, "", executor.ExitUnreported},
+		} {
+			t.Run(job.name+"/"+reply.name, func(t *testing.T) {
+				var completions int
+				var mu sync.Mutex
+				api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.HasSuffix(r.URL.Path, "/artifacts") {
+						// Normal engine preparation refuses the unsupported artifact contract,
+						// then reports its actual failed outcome through its ordinary caller.
+						_, _ = w.Write([]byte(`{"contract_version":999999}`))
+						return
+					}
+					if strings.HasSuffix(r.URL.Path, "/complete") {
+						mu.Lock()
+						completions++
+						mu.Unlock()
+						w.WriteHeader(reply.http)
+						_, _ = w.Write([]byte(`{"errors":[{"code":"` + reply.code + `"}]}`))
+						return
+					}
+					_, _ = w.Write([]byte(`{}`))
+				}))
+				defer api.Close()
+				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, bin, "executor") //nolint:gosec // G204: the binary this test built
+				cmd.Env = []string{
+					"PATH=" + stubPath(t, job.tools...), "HOME=" + t.TempDir(),
+					runnercontract.EnvServer + "=" + api.URL, runnercontract.EnvJobID + "=" + job.id,
+					runnercontract.EnvJobToken + "=job-token", runnercontract.EnvRunType + "=" + job.runType,
+				}
+				out, err := cmd.CombinedOutput()
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != reply.exit {
+					t.Fatalf("normal executor returned %v, want exit %d, output %s", err, reply.exit, out)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if completions != 1 {
+					t.Errorf("normal engine sent %d completions, want one", completions)
+				}
+			})
+		}
+	}
+}
