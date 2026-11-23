@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"runtime"
 	"slices"
@@ -132,6 +133,8 @@ type Launcher struct {
 	driver driver.Driver
 	poller *Poller
 	goos   string
+	// onHealthListen, when set, is called with the health listener's address once it listens.
+	onHealthListen func(net.Addr)
 
 	// apiReady requires job-token and claim-recovery support: without them the launcher
 	// places nothing, because the only alternative would be handing the executor the runner token

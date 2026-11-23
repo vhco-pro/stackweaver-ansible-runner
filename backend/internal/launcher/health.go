@@ -33,12 +33,14 @@ func (l *Launcher) Ready(ctx context.Context) error {
 	return nil
 }
 
-// HealthHandler serves /healthz (the process is up) and /readyz (Ready).
+// HealthHandler serves /healthz and /livez (the process is up) and /readyz (Ready).
 func (l *Launcher) HealthHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+	alive := func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
-	})
+	}
+	mux.HandleFunc("GET /healthz", alive)
+	mux.HandleFunc("GET /livez", alive)
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -57,6 +59,9 @@ func (l *Launcher) serveHealth(ctx context.Context, addr string) (func(), error)
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listening for health checks on %s: %w", addr, err)
+	}
+	if l.onHealthListen != nil {
+		l.onHealthListen(ln.Addr())
 	}
 	srv := &http.Server{Handler: l.HealthHandler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
