@@ -109,7 +109,7 @@ const (
 // Kubernetes driver runs as `<ExecutorPath> executor` (A1, A5).
 const ExecutorPath = "/usr/local/bin/stackweaver-launcher"
 
-// DefaultHealthAddr is where /healthz and /readyz are served when RUNNER_HEALTH_ADDR is unset.
+// DefaultHealthAddr is where /healthz, /livez and /readyz are served when RUNNER_HEALTH_ADDR is unset.
 const DefaultHealthAddr = ":9090"
 
 // Binary is what the launcher binary brings to its launcher: the executors that run each engine's
