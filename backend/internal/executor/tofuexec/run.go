@@ -216,6 +216,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	}
 
 	initCmd := exec.CommandContext(ctx, tfBinary, "init", "-no-color", "-input=false", "-reconfigure") //nolint:gosec // G204: intentional opentofu execution
+	executor.BoundOrphanPipes(initCmd)
 	initCmd.Dir = terraformDir
 	// The run's environment never carries the executor's own (its job token, whatever the host
 	// holds): tofu.RunEnv admits only what OpenTofu needs and what the operator passes through.
@@ -403,6 +404,7 @@ func extractPlanJSON(ctx context.Context, tfBinary, dir string, env []string, pl
 		return ""
 	}
 	show := exec.CommandContext(ctx, tfBinary, "show", "-json", planPath) //nolint:gosec // G204: intentional opentofu execution
+	executor.BoundOrphanPipes(show)
 	show.Dir = dir
 	show.Env = env
 	out, err := show.CombinedOutput()

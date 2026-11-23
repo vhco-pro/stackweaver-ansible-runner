@@ -4,11 +4,54 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestInProcessRetainsPlacementUntilExecutorExits(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	canceled := make(chan struct{})
+	d := &InProcess{Executors: map[string]ExecutorFunc{"tofu": func(ctx context.Context, _ Invocation) int {
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		return 0
+	}}}
+	p, err := d.Place(t.Context(), Request{JobID: "run-confirm-stop", Attempt: 1, Kind: "tofu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Kill(t.Context(), p, time.Millisecond); !errors.Is(err, ErrStopUnconfirmed) {
+		t.Errorf("stopping a running executor = %v, want ErrStopUnconfirmed", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not cancel the executor")
+	}
+	if err := d.Remove(t.Context(), p); err == nil {
+		t.Fatal("remove forgot the running placement")
+	}
+	unblock()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, err := d.Wait(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Kill(ctx, p, 0); err != nil {
+		t.Fatalf("stopping an already finished job: %v", err)
+	}
+	if err := d.Remove(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // The in-process driver hands its executor the placement it made, the id and the host, for the
 // executor to report as the job's placement record (#933, D4, AC77).

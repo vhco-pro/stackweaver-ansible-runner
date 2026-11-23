@@ -597,8 +597,7 @@ func (l *Launcher) acquire(ctx context.Context, offer runnercontract.PendingJob,
 	}
 	s.placement = p
 	if ctx.Err() != nil {
-		_ = l.driver.Kill(context.WithoutCancel(ctx), p, l.cfg.killGrace())
-		_ = l.driver.Remove(context.WithoutCancel(ctx), p)
+		l.stopPlacement(ctx, s)
 		return
 	}
 	l.singlePlaced.Store(true)
@@ -638,7 +637,7 @@ func (l *Launcher) engineOf(jobType string) string {
 }
 
 // drain waits for in-flight jobs up to DrainGrace, heartbeating so the launcher is not marked
-// offline meanwhile, stops what is left, and deregisters.
+// offline meanwhile, stops what is left, and deregisters after supervision finishes.
 func (l *Launcher) drain(ctx context.Context) error {
 	l.draining.Store(true)
 	// The drain runs after the launcher was told to stop, so it does not inherit that cancellation.
@@ -651,7 +650,7 @@ func (l *Launcher) drain(ctx context.Context) error {
 	for waiting := true; waiting; {
 		if !time.Now().Before(deadline) {
 			l.stopAll(bg)
-			<-finished
+			l.awaitStopped(bg, finished, ticker.C)
 			break
 		}
 		if n := l.running(); n > 0 {
@@ -666,7 +665,7 @@ func (l *Launcher) drain(ctx context.Context) error {
 			cancel()
 		case <-time.After(time.Until(deadline)):
 			l.stopAll(bg)
-			<-finished
+			l.awaitStopped(bg, finished, ticker.C)
 			waiting = false
 		}
 	}
@@ -675,6 +674,35 @@ func (l *Launcher) drain(ctx context.Context) error {
 	}
 	l.client.logf("Launcher deregistered")
 	return nil
+}
+
+// awaitStopped waits for supervision to finish after the stop, heartbeating meanwhile: an
+// in-process job can outlive the kill grace, and a launcher that goes quiet is marked offline,
+// which ends its jobs as lost while they may still be saving their results.
+func (l *Launcher) awaitStopped(ctx context.Context, finished <-chan struct{}, beat <-chan time.Time) {
+	for {
+		select {
+		case <-finished:
+			return
+		case <-beat:
+			l.client.logf("Draining: waiting for %d stopped job(s) to exit", l.running())
+			beatCtx, cancel := context.WithTimeout(ctx, l.cfg.idleBeat())
+			sent := make(chan struct{})
+			go func() {
+				defer close(sent)
+				_, _ = l.client.Heartbeat(beatCtx, runnercontract.HeartbeatRequest{Status: "busy", CurrentJobs: l.running()}, 0)
+			}()
+			// The exit is not held behind a heartbeat in flight; that heartbeat is abandoned.
+			select {
+			case <-finished:
+				cancel()
+				<-sent
+				return
+			case <-sent:
+				cancel()
+			}
+		}
+	}
 }
 
 // ObjectManager is a driver that keeps long-lived objects in its job namespace (the Kubernetes

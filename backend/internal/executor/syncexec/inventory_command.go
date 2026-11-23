@@ -10,6 +10,8 @@ import (
 	"io"
 	"os/exec"
 	"slices"
+
+	"github.com/michielvha/stackweaver/backend/internal/executor"
 )
 
 // failOnUnparsedSource is ansible-core's INVENTORY_ANY_UNPARSED_IS_FAILED setting, switched on.
@@ -49,6 +51,7 @@ func InventoryCommandEnv(base, credentials []string) []string {
 // in core (TestNoEngineExecOutsideTheExecutor) keeps any other caller from appearing.
 func RunAnsibleInventory(ctx context.Context, args, env []string, diagnostics io.Writer) (inventory map[string]any, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, "ansible-inventory", args...) //nolint:gosec // intentional: executing ansible command
+	executor.BoundOrphanPipes(cmd)
 	cmd.Env = env
 
 	var stdout, captured bytes.Buffer

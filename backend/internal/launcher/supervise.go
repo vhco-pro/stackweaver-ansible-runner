@@ -83,11 +83,11 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 		case <-deadline:
 			// The failure is reported before the kill: the executor the kill stops reports itself
 			// canceled, and the API keeps the first completion it is given (AC12).
-			reason := fmt.Sprintf("the job exceeded its timeout of %s and was stopped", timeout)
+			reason := fmt.Sprintf("the job exceeded its timeout of %s and is being stopped", timeout)
 			l.client.logf("Job %s: %s", s.jobID, reason)
 			l.deliverFailure(ctx, s, reason)
 			timedOut = true
-			_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
+			l.stopRunning(ctx, s)
 		case <-digestTick:
 			if digestPending = !l.reportImageDigest(ctx, s, digester); !digestPending {
 				digestTick = nil
@@ -100,14 +100,36 @@ func (l *Launcher) watch(ctx context.Context, s *supervised, timeout time.Durati
 				l.client.logf("Job %s was canceled or deleted, stopping its placement", s.jobID)
 				// Removed as canceled once it has stopped: never kept as a failure (AC12).
 				s.placement.Canceled = true
-				_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
+				l.stopRunning(ctx, s)
 			}
 		case <-ctx.Done():
-			_ = l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace())
-			_ = l.driver.Remove(context.WithoutCancel(ctx), s.placement)
+			stopWaiting()
+			l.stopPlacement(ctx, s)
 			return
 		}
 	}
+}
+
+// stopRunning stops a placement the watch loop keeps waiting on, so its exit still ends the watch.
+func (l *Launcher) stopRunning(ctx context.Context, s *supervised) {
+	if err := l.driver.Kill(context.WithoutCancel(ctx), s.placement, l.cfg.killGrace()); errors.Is(err, driver.ErrStopUnconfirmed) {
+		l.client.logf("Waiting for job %s to finish (%v)", s.jobID, err)
+	}
+}
+
+// stopPlacement retains the worker when cancellation could not confirm executor exit.
+func (l *Launcher) stopPlacement(ctx context.Context, s *supervised) {
+	bg := context.WithoutCancel(ctx)
+	if err := l.driver.Kill(bg, s.placement, l.cfg.killGrace()); errors.Is(err, driver.ErrStopUnconfirmed) {
+		// The job can still be shutting down child processes. Keep the launcher alive
+		// until that cleanup completes.
+		l.client.logf("Waiting for job %s to finish (%v)", s.jobID, err)
+		if _, err := l.driver.Wait(bg, s.placement); err != nil {
+			l.client.logf("Waiting for job %s to stop: %v", s.jobID, err)
+			return
+		}
+	}
+	_ = l.driver.Remove(bg, s.placement)
 }
 
 // digestPollInterval is how often a placement's image digest is read until it is reported.

@@ -147,9 +147,8 @@ func (d *InProcess) Wait(ctx context.Context, p Placement) (Exit, error) {
 	}
 }
 
-// Kill cancels the executor's context, which stops its user process, and waits up to grace for it
-// to report.
-func (d *InProcess) Kill(_ context.Context, p Placement, grace time.Duration) error {
+// Kill asks the executor to stop and waits up to grace for it to return.
+func (d *InProcess) Kill(ctx context.Context, p Placement, grace time.Duration) error {
 	j, err := d.job(p)
 	if err != nil {
 		return err
@@ -157,17 +156,34 @@ func (d *InProcess) Kill(_ context.Context, p Placement, grace time.Duration) er
 	j.cancel()
 	select {
 	case <-j.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-time.After(grace):
+		select {
+		case <-j.done:
+			return nil
+		default:
+			return fmt.Errorf("%w: %s", ErrStopUnconfirmed, p.ID)
+		}
 	}
-	return nil
 }
 
 // Remove forgets an ended placement.
 func (d *InProcess) Remove(_ context.Context, p Placement) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	delete(d.running, p.ID)
-	return nil
+	j := d.running[p.ID]
+	if j == nil {
+		return nil
+	}
+	select {
+	case <-j.done:
+		delete(d.running, p.ID)
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", ErrStopUnconfirmed, p.ID)
+	}
 }
 
 // List returns this process's running placements matching selector; none outlives the process.
