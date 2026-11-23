@@ -4,12 +4,112 @@ package launcher
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/michielvha/stackweaver/backend/internal/launcher/driver"
 	"github.com/michielvha/stackweaver/core/runnercontract"
 )
+
+func TestDrainRetainsInProcessWorkWhenStopCannotBeConfirmed(t *testing.T) {
+	api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	started, canceled := make(chan struct{}), make(chan struct{})
+	// The executor sees the stop but keeps cleaning up, as a job saving its state does.
+	d := &driver.InProcess{Executors: map[string]driver.ExecutorFunc{"tofu": func(ctx context.Context, _ driver.Invocation) int {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		return exitCompleted
+	}}}
+	cfg := testConfig(api)
+	cfg.DrainGrace = 10 * time.Millisecond
+	cfg.KillGrace = 5 * time.Millisecond
+	d.JobImages = cfg.JobImages
+	l := New(cfg, d)
+	l.goos = "linux"
+	stopUnconfirmed := make(chan struct{})
+	var signal sync.Once
+	l.Client().Log = func(_ string, args ...any) {
+		for _, arg := range args {
+			if err, ok := arg.(error); ok && errors.Is(err, driver.ErrStopUnconfirmed) {
+				signal.Do(func() { close(stopUnconfirmed) })
+			}
+		}
+	}
+	api.offer(runnercontract.PendingJob{JobID: "run-confirm-stop", JobType: "tofu_run"})
+
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+	result := make(chan error, 1)
+	go func() { result <- l.Run(ctx) }()
+	select {
+	case <-started:
+	case err := <-result:
+		t.Fatalf("launcher exited before starting the executor: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("launcher did not start the executor")
+	}
+
+	stop()
+	for name, ch := range map[string]chan struct{}{"the executor was not canceled": canceled, "the stop grace period did not elapse": stopUnconfirmed} {
+		select {
+		case <-ch:
+		case err := <-result:
+			t.Fatalf("launcher exited while the job was still running: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal(name)
+		}
+	}
+	api.mu.Lock()
+	beats := api.heartbeats
+	api.mu.Unlock()
+
+	// Hold for many heartbeat intervals: the launcher keeps the slot, stays registered and keeps
+	// heartbeating, so the monitor does not mark it offline while the job exits.
+	for hold := time.Now().Add(300 * time.Millisecond); time.Now().Before(hold); time.Sleep(10 * time.Millisecond) {
+		select {
+		case err := <-result:
+			t.Fatalf("launcher exited while the job was still running: %v", err)
+		default:
+		}
+		if _, _, _, deregistered := api.snapshot(); deregistered {
+			t.Fatal("launcher deregistered before observing executor exit")
+		}
+		if n := l.running(); n != 1 {
+			t.Fatalf("launcher running = %d, want one retained slot", n)
+		}
+	}
+	api.mu.Lock()
+	beatsWhileWaiting := api.heartbeats - beats
+	api.mu.Unlock()
+	if beatsWhileWaiting == 0 {
+		t.Error("launcher stopped heartbeating while it waited for the job to exit")
+	}
+
+	unblock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("drain after job exit: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("launcher did not exit after the job stopped")
+	}
+	if n := l.running(); n != 0 {
+		t.Errorf("launcher running = %d after job exit, want zero", n)
+	}
+	if _, _, _, deregistered := api.snapshot(); !deregistered {
+		t.Error("launcher did not deregister after the job stopped")
+	}
+}
 
 // Told to stop (SIGTERM), a launcher claims nothing more, lets its in-flight job finish and then
 // deregisters (#933, D3, AC18).

@@ -183,6 +183,9 @@ type Exit struct {
 // ErrNotFound is returned for a placement that no longer exists.
 var ErrNotFound = errors.New("placement not found")
 
+// ErrStopUnconfirmed is returned when an executor may still be running.
+var ErrStopUnconfirmed = errors.New("job stop could not be confirmed")
+
 // Driver places executors.
 // ImageDigester is a driver that learns a placement's image digest only once the placement runs:
 // the Kubernetes driver, whose kubelet pulls the image (#933, D4, AC77). ImageDigest answers ""
