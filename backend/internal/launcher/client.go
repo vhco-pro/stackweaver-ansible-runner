@@ -145,7 +145,7 @@ func (c *Client) callStatus(ctx context.Context, method, path, bearer string, in
 		}
 		body = bytes.NewReader(data)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.serverURL+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, c.serverURL+path, body) //nolint:gosec // G704: the server URL is the operator-configured endpoint
 	if err != nil {
 		return 0, fmt.Errorf("building %s %s: %w", method, path, err)
 	}

@@ -3,12 +3,16 @@
 package launcher
 
 import (
+	"context"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/michielvha/stackweaver/backend/internal/launcher/driver"
+	"github.com/michielvha/stackweaver/core/runnercontract"
 )
 
 // configFrom reads a launcher's configuration from env on top of a customer launcher's minimum.
@@ -237,8 +241,8 @@ func TestPlacementTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.PlacementTimeout != driver.DefaultPlacementTimeout {
-		t.Errorf("default placement timeout = %s, want %s", cfg.PlacementTimeout, driver.DefaultPlacementTimeout)
+	if cfg.PlacementTimeout != 5*time.Minute {
+		t.Errorf("default placement timeout = %s, want 5m", cfg.PlacementTimeout)
 	}
 	cfg, err = configFrom(t, map[string]string{EnvDriver: driver.NameKubernetes, EnvPlacementTimeout: "90s"})
 	if err != nil || cfg.PlacementTimeout.Seconds() != 90 {
@@ -246,6 +250,44 @@ func TestPlacementTimeout(t *testing.T) {
 	}
 	if _, err := configFrom(t, map[string]string{EnvDriver: driver.NameKubernetes, EnvPlacementTimeout: "soon"}); err == nil || !strings.Contains(err.Error(), EnvPlacementTimeout) {
 		t.Errorf("an unreadable placement timeout = %v, want refused naming %s", err, EnvPlacementTimeout)
+	}
+}
+
+// RUNNER_INVENTORY_INTERVAL and RUNNER_REAP_INTERVAL set how often the job namespace's inventory
+// rides on a heartbeat and how often kept placements are swept. Kind sets them low; an install
+// that sets neither keeps one minute each.
+func TestInventoryAndReapIntervals(t *testing.T) {
+	cfg, err := configFrom(t, map[string]string{EnvDriver: driver.NameKubernetes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InventoryInterval != time.Minute || cfg.ReapInterval != time.Minute {
+		t.Errorf("defaults = inventory %s, reap %s, want 1m each", cfg.InventoryInterval, cfg.ReapInterval)
+	}
+	for _, tc := range []struct {
+		env string
+		got func(Config) time.Duration
+	}{
+		{EnvInventoryInterval, func(c Config) time.Duration { return c.InventoryInterval }},
+		{EnvReapInterval, func(c Config) time.Duration { return c.ReapInterval }},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			cfg, err := configFrom(t, map[string]string{EnvDriver: driver.NameKubernetes, tc.env: "10s"})
+			if err != nil || tc.got(cfg) != 10*time.Second {
+				t.Errorf("%s=10s = %s, %v", tc.env, tc.got(cfg), err)
+			}
+			for _, blank := range []string{"", "   ", "\t"} {
+				cfg, err := configFrom(t, map[string]string{EnvDriver: driver.NameKubernetes, tc.env: blank})
+				if err != nil || tc.got(cfg) != time.Minute {
+					t.Errorf("%s=%q = %s, %v, want the 1m default", tc.env, blank, tc.got(cfg), err)
+				}
+			}
+			for _, bad := range []string{"soon", "0s", "-1s"} {
+				if _, err := configFrom(t, map[string]string{EnvDriver: driver.NameKubernetes, tc.env: bad}); err == nil || !strings.Contains(err.Error(), tc.env) {
+					t.Errorf("%s=%q = %v, want refused naming %s", tc.env, bad, err, tc.env)
+				}
+			}
+		})
 	}
 }
 
@@ -292,5 +334,146 @@ func TestKubernetesWarnsAboutIdentityTokens(t *testing.T) {
 		if got != want {
 			t.Errorf("%s: identitytoken warning = %v, want %v (%v)", drv, got, want, cfg.Warnings)
 		}
+	}
+}
+
+// startedLauncher runs the executable's own startup function, buildLauncher, against api with d as
+// the driver and logf as the client's log, so a value ConfigFromEnv parses reaches the launcher the
+// way the executable's does.
+func startedLauncher(t *testing.T, api *fakeAPI, d driver.Driver, env map[string]string, logf func(string, ...any)) *Launcher {
+	t.Helper()
+	full := map[string]string{
+		EnvServer: api.srv.URL, EnvToken: "swa-agent", EnvPoolID: "pool-1", EnvHealthAddr: "off", EnvDriver: driver.NameKubernetes,
+	}
+	maps.Copy(full, env)
+	factory := func(context.Context, Binary, Config, func(string) string) (driver.Driver, error) { return d, nil }
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	l, err := buildLauncher(t.Context(), bothExecutors(), envOf(full), nil, factory, logf, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.goos = "linux"
+	return l
+}
+
+// runUntilStopped runs l and returns a function that stops it and waits for Run to return.
+func runUntilStopped(t *testing.T, l *Launcher) func() {
+	t.Helper()
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = l.Run(ctx)
+	}()
+	return func() {
+		stop()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("Run did not return within fifteen seconds")
+		}
+	}
+}
+
+// A launcher started from its environment sweeps at the RUNNER_REAP_INTERVAL it was given. The
+// bounds are loose, so a delayed process still passes, and do not overlap, so a fixed interval
+// fails at one of the two settings: no cadence gives at least 15 periodic sweeps in two seconds at
+// 40ms and at most 12 at 200ms.
+func TestStartedLauncherSweepsAtTheConfiguredReapInterval(t *testing.T) {
+	for _, c := range []struct {
+		interval string
+		min, max int
+	}{{"40ms", 15, 1 << 30}, {"200ms", 1, 12}} {
+		t.Run(c.interval, func(t *testing.T) {
+			t.Parallel()
+			api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
+			d := newFakeDriver("kubernetes")
+			l := startedLauncher(t, api, d, map[string]string{EnvReapInterval: c.interval}, nil)
+			own := func() int {
+				d.mu.Lock()
+				defer d.mu.Unlock()
+				n := 0
+				for _, sel := range d.reaped {
+					if sel[driver.LabelRunner] == "runner-1" {
+						n++
+					}
+				}
+				return n
+			}
+			stop := runUntilStopped(t, l)
+			eventually(t, "the startup sweep", func() bool { return own() >= 1 })
+			first := own()
+			time.Sleep(2 * time.Second)
+			periodic := own() - first
+			stop()
+			if periodic < c.min || periodic > c.max {
+				t.Errorf("RUNNER_REAP_INTERVAL=%s: %d periodic sweeps in 2s after the startup sweep, want %d to %d", c.interval, periodic, c.min, c.max)
+			}
+		})
+	}
+}
+
+// slowReadDriver takes 300ms over each successful collection and records when each began and ended.
+type slowReadDriver struct {
+	*fakeDriver
+	mu           sync.Mutex
+	starts, ends []time.Time
+}
+
+func (d *slowReadDriver) Inventory(context.Context) ([]runnercontract.InventoryEntry, error) {
+	start := time.Now()
+	time.Sleep(300 * time.Millisecond)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.starts, d.ends = append(d.starts, start), append(d.ends, time.Now())
+	return nil, nil
+}
+
+func (d *slowReadDriver) Ensure(context.Context, []runnercontract.EnsureObject) error { return nil }
+
+// A launcher started from its environment, whose heartbeats are answered at once, leaves at least
+// RUNNER_INVENTORY_INTERVAL from the end of one successful collection to the start of the next,
+// and does collect again: at least three more reads within 15s at 1s and at least one more within
+// 12s at 4s. The 1s window allows for the first loop, which sends a plain heartbeat and waits one
+// 10s idle beat while startup recovery is not ready. A fixed interval fails one of the two settings.
+func TestStartedLauncherCollectsAtTheConfiguredInventoryInterval(t *testing.T) {
+	for _, c := range []struct {
+		interval time.Duration
+		window   time.Duration
+		minMore  int
+	}{{time.Second, 15 * time.Second, 3}, {4 * time.Second, 12 * time.Second, 1}} {
+		t.Run(c.interval.String(), func(t *testing.T) {
+			t.Parallel()
+			api := newFakeAPI(t, runnercontract.CapabilityJobToken, runnercontract.CapabilityClaimRecovery)
+			d := &slowReadDriver{fakeDriver: newFakeDriver("kubernetes")}
+			l := startedLauncher(t, api, d, map[string]string{EnvInventoryInterval: c.interval.String()}, nil)
+			stop := runUntilStopped(t, l)
+			eventually(t, "the first collection", func() bool {
+				d.mu.Lock()
+				defer d.mu.Unlock()
+				return len(d.ends) >= 1
+			})
+			time.Sleep(c.window)
+			stop()
+			d.mu.Lock()
+			starts, ends := slices.Clone(d.starts), slices.Clone(d.ends)
+			d.mu.Unlock()
+			more := 0
+			for _, s := range starts[1:] {
+				if s.Sub(ends[0]) <= c.window {
+					more++
+				}
+			}
+			if more < c.minMore {
+				t.Errorf("RUNNER_INVENTORY_INTERVAL=%s: %d more collections within %s of the first, want at least %d", c.interval, more, c.window, c.minMore)
+			}
+			for i := 1; i < len(starts); i++ {
+				if gap := starts[i].Sub(ends[i-1]); gap < c.interval {
+					t.Errorf("RUNNER_INVENTORY_INTERVAL=%s: collection %d began %s after the previous one ended, want at least %s", c.interval, i, gap, c.interval)
+				}
+			}
+		})
 	}
 }

@@ -21,33 +21,37 @@ import (
 
 // fakeAPI is the runner control plane a launcher talks to.
 type fakeAPI struct {
-	mu           sync.Mutex
-	capabilities []string
-	offers       []runnercontract.PendingJob  // offered once each
-	activeClaims []runnercontract.ActiveClaim // complete startup inventory, empty by default
-	claims       map[string]runnercontract.PendingJob
-	statuses     map[string]string
-	started      []string
-	placements   map[string]*runnercontract.Placement
-	reported     map[string]*runnercontract.Placement // POST /output with a placement alone
-	timeouts     map[string]int                       // a job's TimeoutSeconds in its token
-	pools        map[string]*runnercontract.PoolSettings
-	caches       map[string]*runnercontract.CacheDescriptor // a job's descriptor in its token
-	images       map[string]*runnercontract.JobImage        // a job's run image in its token
-	pullCreds    map[string]runnercontract.PullCredential   // GET /runner/images/:id/pull-credential
-	cacheObjects map[string][]byte                          // GET /runner/cache: org/kind/sha -> body
-	cacheFetches []string
-	promotions   []runnercontract.CachePromotion // handed out once, with the next heartbeat
-	uploads      []string                        // PUT /runner/cache: path?query and body
-	drops        map[string]map[string]any
-	ensure       []runnercontract.EnsureObject
-	inventory    []runnercontract.InventoryEntry
-	tokens       []string
-	failed       map[string]string
-	deregistered bool
-	drain        bool     // the heartbeat answers Drain, as after POST /runners/:id/actions/drain
-	reapRunners  []string // the heartbeat names these lost runners of the pool for reaping
-	heartbeats   int
+	mu sync.Mutex
+	// failHeartbeats makes the next n heartbeats fail after their inventory is taken in, as a
+	// response lost on the way back would; inventoryReports counts every inventory taken in.
+	failHeartbeats   int
+	inventoryReports int
+	capabilities     []string
+	offers           []runnercontract.PendingJob  // offered once each
+	activeClaims     []runnercontract.ActiveClaim // complete startup inventory, empty by default
+	claims           map[string]runnercontract.PendingJob
+	statuses         map[string]string
+	started          []string
+	placements       map[string]*runnercontract.Placement
+	reported         map[string]*runnercontract.Placement // POST /output with a placement alone
+	timeouts         map[string]int                       // a job's TimeoutSeconds in its token
+	pools            map[string]*runnercontract.PoolSettings
+	caches           map[string]*runnercontract.CacheDescriptor // a job's descriptor in its token
+	images           map[string]*runnercontract.JobImage        // a job's run image in its token
+	pullCreds        map[string]runnercontract.PullCredential   // GET /runner/images/:id/pull-credential
+	cacheObjects     map[string][]byte                          // GET /runner/cache: org/kind/sha -> body
+	cacheFetches     []string
+	promotions       []runnercontract.CachePromotion // handed out once, with the next heartbeat
+	uploads          []string                        // PUT /runner/cache: path?query and body
+	drops            map[string]map[string]any
+	ensure           []runnercontract.EnsureObject
+	inventory        []runnercontract.InventoryEntry
+	tokens           []string
+	failed           map[string]string
+	deregistered     bool
+	drain            bool     // the heartbeat answers Drain, as after POST /runners/:id/actions/drain
+	reapRunners      []string // the heartbeat names these lost runners of the pool for reaping
+	heartbeats       int
 	// onStart runs when a job is claimed (POST /start), before the claim is answered.
 	onStart func(job string)
 	srv     *httptest.Server
@@ -112,6 +116,12 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Inventory != nil {
 			f.inventory = req.Inventory
+			f.inventoryReports++
+		}
+		if f.failHeartbeats > 0 {
+			f.failHeartbeats--
+			http.Error(w, "response lost", http.StatusBadGateway)
+			return
 		}
 		resp := runnercontract.HeartbeatResponse{PendingJobs: out, Ensure: f.ensure, ReapRunners: f.reapRunners, ActiveClaims: f.activeClaims}
 		if f.drain {
