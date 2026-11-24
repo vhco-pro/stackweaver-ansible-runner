@@ -80,8 +80,13 @@ type Config struct {
 	// HealthAddr is where /healthz and /readyz are served; empty serves none.
 	HealthAddr string
 	// ReapInterval is how often the failed placements kept for inspection are swept once their
-	// keep_failed_jobs_for has passed; zero means a minute.
+	// keep_failed_jobs_for has passed (RUNNER_REAP_INTERVAL); zero means DefaultReapInterval.
 	ReapInterval time.Duration
+	// InventoryInterval is the minimum gap between two successful collections of the job
+	// namespace's inventory (RUNNER_INVENTORY_INTERVAL, D8); zero means DefaultInventoryInterval.
+	// A held or retried heartbeat delays the next collection, and a failed one is tried again on
+	// the next loop.
+	InventoryInterval time.Duration
 	// CacheDir is the launcher-owned node-local copy of the caches of the organizations whose jobs
 	// it runs (#933, D7, decision 19); empty switches the read-through off.
 	CacheDir string
@@ -97,11 +102,25 @@ type Config struct {
 	Cosign string
 }
 
+// DefaultReapInterval and DefaultInventoryInterval apply when the launcher's environment leaves
+// RUNNER_REAP_INTERVAL and RUNNER_INVENTORY_INTERVAL unset.
+const (
+	DefaultReapInterval      = time.Minute
+	DefaultInventoryInterval = time.Minute
+)
+
 func (c Config) reapInterval() time.Duration {
 	if c.ReapInterval > 0 {
 		return c.ReapInterval
 	}
-	return time.Minute
+	return DefaultReapInterval
+}
+
+func (c Config) inventoryInterval() time.Duration {
+	if c.InventoryInterval > 0 {
+		return c.InventoryInterval
+	}
+	return DefaultInventoryInterval
 }
 
 func (c Config) idleBeat() time.Duration {
@@ -712,13 +731,15 @@ type ObjectManager interface {
 	Ensure(ctx context.Context, objs []runnercontract.EnsureObject) error
 }
 
-// inventoryInterval is how often the job namespace's inventory rides on a heartbeat (D8).
-const inventoryInterval = time.Minute
+// InventoryReadMessage is logged, with the object count, each time a collection of the job
+// namespace's inventory succeeds. A heartbeat resent after a lost response reuses the collection
+// and logs nothing. The line is for operators; no harness depends on it.
+const InventoryReadMessage = "Read the job namespace's inventory: %d objects"
 
 // inventoryDue returns the job namespace's inventory when a report is due, else nil.
 func (l *Launcher) inventoryDue(ctx context.Context) []runnercontract.InventoryEntry {
 	om, ok := l.driver.(ObjectManager)
-	if !ok || time.Since(l.lastInventory) < inventoryInterval {
+	if !ok || time.Since(l.lastInventory) < l.cfg.inventoryInterval() {
 		return nil
 	}
 	inv, err := om.Inventory(ctx)
@@ -727,6 +748,7 @@ func (l *Launcher) inventoryDue(ctx context.Context) []runnercontract.InventoryE
 		return nil
 	}
 	l.lastInventory = time.Now()
+	l.client.logf(InventoryReadMessage, len(inv))
 	if inv == nil {
 		inv = []runnercontract.InventoryEntry{}
 	}

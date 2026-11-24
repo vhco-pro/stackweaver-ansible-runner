@@ -55,6 +55,12 @@ const (
 	// EnvPlacementTimeout is how long a Kubernetes job pod may fail to pull an image before its
 	// job fails (OD21).
 	EnvPlacementTimeout = "RUNNER_PLACEMENT_TIMEOUT"
+	// EnvInventoryInterval is the minimum gap between two successful collections of the job
+	// namespace's inventory (D8); unset or blank, a minute.
+	EnvInventoryInterval = "RUNNER_INVENTORY_INTERVAL"
+	// EnvReapInterval is how often the failed placements kept for inspection are swept; unset, a
+	// minute.
+	EnvReapInterval     = "RUNNER_REAP_INTERVAL"
 	EnvSocket           = "RUNNER_DOCKER_SOCKET"
 	EnvJobUser          = "RUNNER_JOB_USER"
 	EnvAllowRoot        = "RUNNER_ALLOW_ROOT"
@@ -160,6 +166,13 @@ func ConfigFromEnv(b Binary, getenv func(string) string) (Config, error) {
 	if err := jobImagesFromEnv(&cfg, b, getenv); err != nil {
 		return cfg, err
 	}
+	var err error
+	if cfg.InventoryInterval, err = durationFromEnv(getenv, EnvInventoryInterval, DefaultInventoryInterval); err != nil {
+		return cfg, err
+	}
+	if cfg.ReapInterval, err = durationFromEnv(getenv, EnvReapInterval, DefaultReapInterval); err != nil {
+		return cfg, err
+	}
 	for _, l := range strings.Split(getenv(EnvLabels), ",") {
 		if l = strings.TrimSpace(l); l != "" {
 			cfg.Labels = append(cfg.Labels, l)
@@ -238,15 +251,21 @@ func jobImagesFromEnv(cfg *Config, b Binary, getenv func(string) string) error {
 			}
 		}
 	}
-	cfg.PlacementTimeout = driver.DefaultPlacementTimeout
-	if v := strings.TrimSpace(getenv(EnvPlacementTimeout)); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil || d <= 0 {
-			return fmt.Errorf("%s=%q is not a positive duration", EnvPlacementTimeout, v)
-		}
-		cfg.PlacementTimeout = d
+	cfg.PlacementTimeout, err = durationFromEnv(getenv, EnvPlacementTimeout, driver.DefaultPlacementTimeout)
+	return err
+}
+
+// durationFromEnv reads the positive duration in the variable name, or def when it is unset.
+func durationFromEnv(getenv func(string) string, name string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(getenv(name))
+	if v == "" {
+		return def, nil
 	}
-	return nil
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s=%q is not a positive duration", name, v)
+	}
+	return d, nil
 }
 
 // executorCommands is the executor's command in each engine's job image: the one binary at its
@@ -437,6 +456,33 @@ func SingleFromArgs(args []string) bool {
 	return false
 }
 
+// driverFactory builds the launcher's driver from its configuration and environment; the
+// executable passes DriverFromEnv.
+type driverFactory func(ctx context.Context, b Binary, cfg Config, getenv func(string) string) (driver.Driver, error)
+
+// buildLauncher is the executable's startup, from its environment to the launcher it runs: the
+// configuration ConfigFromEnv parses, its deprecations and warnings sent to warnf, --single from
+// args, the driver newDriver builds, and the client's log, what the launcher does and every retried
+// failure, routed to infof. Main calls it, and tests call it with a test driver, so a parsed value
+// reaches a test's launcher the way it reaches the executable's.
+func buildLauncher(ctx context.Context, b Binary, getenv func(string) string, args []string, newDriver driverFactory, infof, warnf func(string, ...any)) (*Launcher, error) {
+	cfg, err := ConfigFromEnv(b, getenv) //nolint:contextcheck // its toolchain probe bounds itself with its own deadline
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range slices.Concat(cfg.Deprecations, cfg.Warnings) {
+		warnf("launcher: %s", w)
+	}
+	cfg.Single = cfg.Single || SingleFromArgs(args)
+	d, err := newDriver(ctx, b, cfg, getenv)
+	if err != nil {
+		return nil, err
+	}
+	l := New(cfg, d)
+	l.Client().Log = infof
+	return l, nil
+}
+
 // Main runs a runner binary as a launcher until SIGTERM or SIGINT, then drains, and returns the
 // process exit code.
 func Main(b Binary) int {
@@ -449,23 +495,11 @@ func Main(b Binary) int {
 		logger.Errorf("launcher: %v", err)
 		return 1
 	}
-	cfg, err := ConfigFromEnv(b, os.Getenv)
+	l, err := buildLauncher(ctx, b, os.Getenv, os.Args, DriverFromEnv, logger.Infof, logger.Warnf)
 	if err != nil {
 		logger.Errorf("launcher: %v", err)
 		return 1
 	}
-	for _, w := range slices.Concat(cfg.Deprecations, cfg.Warnings) {
-		logger.Warnf("launcher: %s", w)
-	}
-	cfg.Single = cfg.Single || SingleFromArgs(os.Args)
-	d, err := DriverFromEnv(ctx, b, cfg, os.Getenv)
-	if err != nil {
-		logger.Errorf("launcher: %v", err)
-		return 1
-	}
-	l := New(cfg, d)
-	// What the launcher does and every retried failure go to its log.
-	l.Client().Log = logger.Infof
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Errorf("launcher: %v", err)
 		return 1
