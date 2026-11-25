@@ -21,9 +21,17 @@ func TestExitCode_AnUnreportedCompletionLeavesTheReportToTheLauncher(t *testing.
 		t.Cleanup(srv.Close)
 		return NewClient(srv.URL, "tok", "r1")
 	}
-	gone := httptest.NewServer(http.NotFoundHandler())
-	unreachable := NewClient(gone.URL, "tok", "r1")
-	gone.Close()
+	// An API that cannot be reached: a server this test keeps for its whole run, which drops every
+	// connection without answering. A closed server's address will not do, because its port is free
+	// for any other test process to listen on and answer, which then counts as a report.
+	dropping := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(dropping.Close)
+	unreachable := NewClient(dropping.URL, "tok", "r1")
 
 	for _, tc := range []struct {
 		name   string
