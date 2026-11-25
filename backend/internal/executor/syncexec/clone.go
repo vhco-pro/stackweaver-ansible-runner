@@ -118,18 +118,16 @@ func (c *cloner) clone(ctx context.Context, src *runnercontract.CloneSource, des
 		c.observe(args, cloneEnv)
 	}
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: the URL and branch are validated above; positionals after --
-	executor.BoundOrphanPipes(cmd)
 	cmd.Env, cmd.ExtraFiles = cloneEnv, extra
 	var stderr bytes.Buffer
 	cmd.Stdout = out
 	cmd.Stderr = io.MultiWriter(out, &stderr)
-	if err := cmd.Run(); err != nil {
+	if err := executor.Run(ctx, cmd); err != nil {
 		return "", fmt.Errorf("cloning %s: %w: %s", src.URL, err, strings.TrimSpace(stderr.String()))
 	}
 	rev := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
-	executor.BoundOrphanPipes(rev)
 	rev.Dir, rev.Env = dest, env
-	commit, err := rev.Output()
+	commit, err := executor.Output(ctx, rev)
 	if err != nil {
 		return "", fmt.Errorf("reading the cloned commit: %w", err)
 	}
@@ -146,12 +144,11 @@ func (c *cloner) clone(ctx context.Context, src *runnercontract.CloneSource, des
 		defer release()
 		full := append([]string{"-c", "credential.helper="}, args...)
 		cmd := exec.CommandContext(ctx, "git", full...) //nolint:gosec // G204: the commit and refs are validated above
-		executor.BoundOrphanPipes(cmd)
 		cmd.Dir, cmd.Env, cmd.ExtraFiles = dest, cmdEnv, extra
 		var stderr bytes.Buffer
 		cmd.Stdout = out
 		cmd.Stderr = io.MultiWriter(out, &stderr)
-		if err := cmd.Run(); err != nil {
+		if err := executor.Run(ctx, cmd); err != nil {
 			return fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
 		}
 		return nil

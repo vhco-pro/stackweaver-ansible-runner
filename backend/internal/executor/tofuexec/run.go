@@ -216,12 +216,11 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	}
 
 	initCmd := exec.CommandContext(ctx, tfBinary, "init", "-no-color", "-input=false", "-reconfigure") //nolint:gosec // G204: intentional opentofu execution
-	executor.BoundOrphanPipes(initCmd)
 	initCmd.Dir = terraformDir
 	// The run's environment never carries the executor's own (its job token, whatever the host
 	// holds): tofu.RunEnv admits only what OpenTofu needs and what the operator passes through.
 	initCmd.Env = tfEnv
-	if out, err := initCmd.CombinedOutput(); err != nil {
+	if out, err := executor.CombinedOutput(ctx, initCmd); err != nil {
 		return failed(string(out), fmt.Errorf("opentofu init failed: %s: %w", string(out), err))
 	}
 	cache.reportProviders(terraformDir)
@@ -404,10 +403,9 @@ func extractPlanJSON(ctx context.Context, tfBinary, dir string, env []string, pl
 		return ""
 	}
 	show := exec.CommandContext(ctx, tfBinary, "show", "-json", planPath) //nolint:gosec // G204: intentional opentofu execution
-	executor.BoundOrphanPipes(show)
 	show.Dir = dir
 	show.Env = env
-	out, err := show.CombinedOutput()
+	out, err := executor.CombinedOutput(ctx, show)
 	if err != nil {
 		logger.Warnf("Failed to extract plan JSON: %v", err)
 		return ""

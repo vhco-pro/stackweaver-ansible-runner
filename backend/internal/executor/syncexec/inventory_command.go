@@ -51,14 +51,13 @@ func InventoryCommandEnv(base, credentials []string) []string {
 // in core (TestNoEngineExecOutsideTheExecutor) keeps any other caller from appearing.
 func RunAnsibleInventory(ctx context.Context, args, env []string, diagnostics io.Writer) (inventory map[string]any, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, "ansible-inventory", args...) //nolint:gosec // intentional: executing ansible command
-	executor.BoundOrphanPipes(cmd)
 	cmd.Env = env
 
 	var stdout, captured bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = io.MultiWriter(&captured, diagnostics)
 
-	if err := cmd.Run(); err != nil {
+	if err := executor.Run(ctx, cmd); err != nil {
 		return nil, captured.String(), fmt.Errorf("running ansible-inventory: %w\nstderr: %s", err, captured.String())
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &inventory); err != nil {
