@@ -4,6 +4,7 @@ package executor
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -32,13 +33,25 @@ func TestMirrorEnv(t *testing.T) {
 	}
 	for name, want := range map[string]string{
 		"HTTP_PROXY": "http://proxy:3128", "http_proxy": "http://proxy:3128",
-		"PIP_INDEX_URL":                   "https://pypi.internal/simple",
-		"ANSIBLE_GALAXY_SERVER_HUB_URL":   "https://hub/",
-		"ANSIBLE_GALAXY_SERVER_HUB_TOKEN": "tok",
+		"PIP_INDEX_URL":                 "https://pypi.internal/simple",
+		"ANSIBLE_GALAXY_SERVER_HUB_URL": "https://hub/",
 	} {
 		if env[name] != want {
 			t.Errorf("%s = %q, want %q", name, env[name], want)
 		}
+	}
+	// A Galaxy token is the deployment's credential: it goes to ansible-galaxy alone, never into
+	// the environment a play, a run or a sync shares with the job's own code.
+	for name := range env {
+		if strings.HasSuffix(name, "_TOKEN") {
+			t.Errorf("MirrorEnv carries the Galaxy token %s", name)
+		}
+	}
+	if got := GalaxyTokenEnv(m); !slices.Equal(got, []string{"ANSIBLE_GALAXY_SERVER_HUB_TOKEN=tok"}) {
+		t.Errorf("GalaxyTokenEnv = %v, want only the hub token", got)
+	}
+	if got := GalaxyTokenEnv(nil); len(got) != 0 {
+		t.Errorf("GalaxyTokenEnv(nil) = %v, want nothing", got)
 	}
 	for name := range env {
 		if strings.Contains(name, "BAD") {
