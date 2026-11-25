@@ -32,6 +32,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/michielvha/stackweaver/backend/internal/executor"
 	"github.com/michielvha/stackweaver/core/dbtest"
+	"github.com/michielvha/stackweaver/core/dbtest/testschema"
 	"github.com/michielvha/stackweaver/core/models"
 	"github.com/michielvha/stackweaver/core/repository"
 	"github.com/michielvha/stackweaver/core/runnercontract"
@@ -62,7 +63,7 @@ func setupConstructedFixture(t *testing.T) *constructedFixture {
 	if err != nil {
 		t.Fatalf("connecting to the test database: %v", err)
 	}
-	if err := models.AutoMigrate(db); err != nil {
+	if err := testschema.Ensure(db); err != nil {
 		t.Fatal(err)
 	}
 	sfx := uuid.NewString()[:8]
