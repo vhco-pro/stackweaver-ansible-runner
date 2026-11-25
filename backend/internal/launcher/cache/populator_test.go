@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -314,11 +315,13 @@ func TestRoleVerifier_KeysTheArchiveByTheTagsCommit(t *testing.T) {
 	}
 }
 
-func TestGitVerifier_OnlyAnExactCommit(t *testing.T) {
+// gitFixture is a local repository with one commit that serves any commit by SHA.
+func gitFixture(t *testing.T) (repo, commit string) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
-	repo := t.TempDir()
+	repo = t.TempDir()
 	run := func(args ...string) string {
 		t.Helper()
 		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // G204: the test's own git fixture
@@ -335,10 +338,13 @@ func TestGitVerifier_OnlyAnExactCommit(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(repo, "galaxy.yml"), []byte("name: c\n"), 0o600)
 	run("add", ".")
 	run("commit", "-q", "-m", "one")
-	commit := run("rev-parse", "HEAD")
+	return repo, run("rev-parse", "HEAD")
+}
 
-	v := &GitVerifier{}
-	e := runnercontract.CacheEntry{Kind: runnercontract.CacheKindGit, Name: "file://" + repo, Version: commit}
+func TestGitVerifier_OnlyAnExactCommit(t *testing.T) {
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+	v := &GitVerifier{Git: fakeGit{commit: commit, archive: []byte("source at the commit")}}
+	e := runnercontract.CacheEntry{Kind: runnercontract.CacheKindGit, Name: "https://git.example.test/org/collection.git", Version: commit}
 	a, err := v.Verify(t.Context(), e, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -346,15 +352,90 @@ func TestGitVerifier_OnlyAnExactCommit(t *testing.T) {
 	if a.SHA256 == "" || !strings.HasSuffix(a.SourceURL, "@"+commit) {
 		t.Errorf("artifact = %+v", a)
 	}
-	again, err := v.Verify(t.Context(), e, t.TempDir())
-	if err != nil || again.SHA256 != a.SHA256 {
-		t.Errorf("the same commit archived to %s then %s (%v): the key must be reproducible", a.SHA256, again.SHA256, err)
-	}
 	for _, version := range []string{"main", "HEAD", commit[:12], strings.Repeat("0", 40)} {
 		e.Version = version
 		if _, err := v.Verify(t.Context(), e, t.TempDir()); err == nil {
 			t.Errorf("a git source at %q was promoted", version)
 		}
+	}
+}
+
+// A job reports the repository of a git source, so the launcher fetches only an https URL of the
+// form the sync clone accepts, never a local path, file, ssh or plain http source.
+func TestGitVerifier_RefusesARepositoryThatIsNotHTTPS(t *testing.T) {
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+	for _, repo := range []string{
+		"file:///etc/stackweaver",
+		"/var/lib/stackweaver/repo",
+		"../repo",
+		"ssh://git@git.example.test/org/repo.git",
+		"git@git.example.test:org/repo.git",
+		"http://git.example.test/org/repo.git",
+		"https://user:secret@git.example.test/org/repo.git",
+		"ext::sh -c id",
+		"-uhttps://git.example.test/org/repo.git",
+	} {
+		git := &recordingGit{}
+		_, err := (&GitVerifier{Git: git}).Verify(t.Context(), runnercontract.CacheEntry{Kind: runnercontract.CacheKindGit, Name: repo, Version: commit}, t.TempDir())
+		if err == nil || git.calls > 0 {
+			t.Errorf("the repository %q was fetched (err %v, %d git calls)", repo, err, git.calls)
+		}
+	}
+}
+
+type recordingGit struct{ calls int }
+
+func (g *recordingGit) TagCommit(context.Context, string, string) (string, error) {
+	g.calls++
+	return "", errors.New("unexpected")
+}
+
+func (g *recordingGit) Archive(context.Context, string, string, string) error {
+	g.calls++
+	return errors.New("unexpected")
+}
+
+// The launcher's git speaks https only and consults no credential helper or configuration of the
+// host, so a fetch cannot reach a local repository even when its URL gets past the verifier.
+func TestExecGit_FetchesOverHTTPSOnly(t *testing.T) {
+	repo, commit := gitFixture(t)
+	if err := (execGit{}).Archive(t.Context(), "file://"+repo, commit, filepath.Join(t.TempDir(), "source.tar.gz")); err == nil {
+		t.Fatal("the launcher's git fetched a file:// repository")
+	}
+	args := (execGit{}).config()
+	for _, want := range []string{"credential.helper=", "protocol.allow=never", "protocol.https.allow=always"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("git options %v lack %s", args, want)
+		}
+	}
+	env := strings.Join(gitEnv(), "\n")
+	for _, want := range []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_TERMINAL_PROMPT=0"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("git environment lacks %s", want)
+		}
+	}
+}
+
+// The same commit archives to the same bytes, so the cache key is reproducible.
+func TestExecGit_ArchiveIsReproducible(t *testing.T) {
+	repo, commit := gitFixture(t)
+	git := execGit{protocols: []string{"file"}}
+	sum := func() string {
+		dst := filepath.Join(t.TempDir(), "source.tar.gz")
+		if err := git.Archive(t.Context(), "file://"+repo, commit, dst); err != nil {
+			t.Fatal(err)
+		}
+		d, _, err := fileDigest(dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	if a, b := sum(), sum(); a != b {
+		t.Errorf("the same commit archived to %s then %s: the key must be reproducible", a, b)
+	}
+	if err := git.Archive(t.Context(), "file://"+repo, strings.Repeat("0", 40), filepath.Join(t.TempDir(), "x.tar.gz")); err == nil {
+		t.Error("a commit the repository does not have was archived")
 	}
 }
 

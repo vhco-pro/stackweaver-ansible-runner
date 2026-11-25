@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/michielvha/stackweaver/core/runnercontract"
+	"github.com/michielvha/stackweaver/core/security/gitargs"
 )
 
 var gitCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -29,12 +30,33 @@ type GitRunner interface {
 	Archive(ctx context.Context, repo, commit, dst string) error
 }
 
-type execGit struct{}
+// execGit is the launcher's git. It runs outside any job's sandbox, so it fetches over https only
+// and consults no credential helper or configuration of the host, as the sync clone does.
+type execGit struct {
+	// protocols are the transports git may use; none means https only. Tests add file.
+	protocols []string
+}
 
-func runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: fixed git subcommands over validated arguments
+func (g execGit) config() []string {
+	protocols := g.protocols
+	if len(protocols) == 0 {
+		protocols = []string{"https"}
+	}
+	args := []string{"-c", "credential.helper=", "-c", "protocol.allow=never"}
+	for _, p := range protocols {
+		args = append(args, "-c", "protocol."+p+".allow=always")
+	}
+	return args
+}
+
+func gitEnv() []string {
+	return append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+}
+
+func (g execGit) run(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append(g.config(), args...)...) //nolint:gosec // G204: fixed git subcommands over validated arguments
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = gitEnv()
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
@@ -43,8 +65,8 @@ func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 	return out.String(), nil
 }
 
-func (execGit) TagCommit(ctx context.Context, repo, tag string) (string, error) {
-	out, err := runGit(ctx, "", "ls-remote", "--tags", "--", repo, "refs/tags/"+tag, "refs/tags/"+tag+"^{}")
+func (g execGit) TagCommit(ctx context.Context, repo, tag string) (string, error) {
+	out, err := g.run(ctx, "", "ls-remote", "--tags", "--", repo, "refs/tags/"+tag, "refs/tags/"+tag+"^{}")
 	if err != nil {
 		return "", err
 	}
@@ -65,26 +87,26 @@ func (execGit) TagCommit(ctx context.Context, repo, tag string) (string, error) 
 	return commit, nil
 }
 
-func (execGit) Archive(ctx context.Context, repo, commit, dst string) error {
+func (g execGit) Archive(ctx context.Context, repo, commit, dst string) error {
 	work, err := os.MkdirTemp(filepath.Dir(dst), "clone-*")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = os.RemoveAll(work) }()
-	if _, err := runGit(ctx, work, "init", "-q"); err != nil {
+	if _, err := g.run(ctx, work, "init", "-q"); err != nil {
 		return err
 	}
-	if _, err := runGit(ctx, work, "fetch", "-q", "--depth=1", "--", repo, commit); err != nil {
+	if _, err := g.run(ctx, work, "fetch", "-q", "--depth=1", "--", repo, commit); err != nil {
 		return err
 	}
-	got, err := runGit(ctx, work, "rev-parse", "FETCH_HEAD")
+	got, err := g.run(ctx, work, "rev-parse", "FETCH_HEAD")
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(got) != commit {
 		return fmt.Errorf("%w: the repository served %s for %s", ErrPoisoned, strings.TrimSpace(got), commit)
 	}
-	_, err = runGit(ctx, work, "archive", "--format=tar.gz", "--prefix=source/", "-o", dst, commit)
+	_, err = g.run(ctx, work, "archive", "--format=tar.gz", "--prefix=source/", "-o", dst, commit)
 	return err
 }
 
@@ -100,8 +122,10 @@ func (v *GitVerifier) Verify(ctx context.Context, e runnercontract.CacheEntry, d
 	if !gitCommit.MatchString(e.Version) {
 		return nil, fmt.Errorf("a git source is promoted only at an exact commit, not %q", e.Version)
 	}
-	if strings.HasPrefix(e.Name, "-") || e.Name == "" {
-		return nil, fmt.Errorf("%q is not a repository", e.Name)
+	// The job reports the repository, so only an https URL of the form the sync clone accepts is
+	// fetched. A source the populator does not fetch still installs; it is just not cached.
+	if !gitargs.HTTPSCloneURLRe.MatchString(e.Name) {
+		return nil, fmt.Errorf("a git source is promoted only from an https repository, not %q", e.Name)
 	}
 	git := v.Git
 	if git == nil {

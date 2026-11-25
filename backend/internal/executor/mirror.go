@@ -30,8 +30,9 @@ var systemCABundles = []string{
 var galaxyServerName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // MirrorEnv is the environment a job's tools run with for the deployment's mirror block (#933, D2):
-// the proxy variables, pip's index, the Galaxy servers' definitions and a CA bundle of the system
-// roots plus the deployment's extra roots, written into dir. A nil or empty block yields nothing.
+// the proxy variables, pip's index, the Galaxy servers' URLs and a CA bundle of the system roots
+// plus the deployment's extra roots, written into dir. A nil or empty block yields nothing. The
+// Galaxy tokens are not set here: GalaxyTokenEnv returns them for the ansible-galaxy commands.
 // The Galaxy server list itself is not set here, because a job's own ansible.cfg may name one;
 // GalaxyServerList returns it for the Ansible executor to apply.
 func MirrorEnv(m *runnercontract.Mirror, dir string) (map[string]string, error) {
@@ -58,9 +59,7 @@ func MirrorEnv(m *runnercontract.Mirror, dir string) (map[string]string, error) 
 			logger.Warnf("Skipping the Galaxy server %q: a name must be letters, digits and underscores, and a URL is required", s.Name)
 			continue
 		}
-		prefix := "ANSIBLE_GALAXY_SERVER_" + strings.ToUpper(s.Name)
-		env[prefix+"_URL"] = s.URL
-		set(s.Token, prefix+"_TOKEN")
+		env["ANSIBLE_GALAXY_SERVER_"+strings.ToUpper(s.Name)+"_URL"] = s.URL
 	}
 	if strings.TrimSpace(m.CACertificates) != "" {
 		bundle, err := writeCABundle(m.CACertificates, dir)
@@ -105,4 +104,20 @@ func writeCABundle(extra, dir string) (string, error) {
 		return "", fmt.Errorf("writing the job's CA bundle: %w", err)
 	}
 	return path, nil
+}
+
+// GalaxyTokenEnv is the deployment's Galaxy server tokens, for the ansible-galaxy commands alone.
+// MirrorEnv leaves them out, because its environment reaches the play, the run or the sync, where
+// the job's own code could read the deployment's credential.
+func GalaxyTokenEnv(m *runnercontract.Mirror) []string {
+	if m == nil {
+		return nil
+	}
+	var env []string
+	for _, s := range m.GalaxyServers {
+		if galaxyServerName.MatchString(s.Name) && s.URL != "" && s.Token != "" {
+			env = append(env, "ANSIBLE_GALAXY_SERVER_"+strings.ToUpper(s.Name)+"_TOKEN="+s.Token)
+		}
+	}
+	return env
 }

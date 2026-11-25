@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -120,6 +121,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	events := apiSink{client: c, jobID: job.ID}
 
 	// The deployment's mirrors, proxy and CA, for the clone, the Galaxy install and the play alike.
+	// Its Galaxy tokens are added to the Galaxy install alone.
 	mirrorEnv, err := executor.MirrorEnv(arts.Mirror, secrets.Dir())
 	if err != nil {
 		return failed("Failed to apply the deployment's mirror settings: " + err.Error())
@@ -198,7 +200,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	galaxyCollections, galaxyRoles, galaxyErr := InstallGalaxyRequirements(jobCtx, events, GalaxyInstall{
 		JobDir:      workDir,
 		PlaybookDir: repoDir,
-		Env:         toolEnv,
+		Env:         slices.Concat(toolEnv, executor.GalaxyTokenEnv(arts.Mirror)),
 		Cache:       galaxyCache,
 	})
 	if galaxyErr != nil {
