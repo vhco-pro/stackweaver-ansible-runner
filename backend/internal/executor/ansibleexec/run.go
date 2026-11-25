@@ -327,7 +327,6 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	defer cancelRun()
 
 	cmd := exec.CommandContext(runCtx, "ansible-playbook", args...) //nolint:gosec // G204: arguments are built from the job's artifacts, not a shell string
-	executor.BoundOrphanPipes(cmd)
 	cmd.Dir = ansibleWorkDir
 	cmd.Env = env
 	var stderr bytes.Buffer
@@ -336,7 +335,7 @@ func run(ctx context.Context, c *executor.Client, job Job, arts *runnercontract.
 	cmd.Stdout = stdoutW
 	cmd.Stderr = io.MultiWriter(&stderr, stderrW)
 
-	err = cmd.Run()
+	err = executor.Run(runCtx, cmd)
 	stdoutW.flush(jobCtx)
 	stderrW.flush(jobCtx)
 	if stopped() {
