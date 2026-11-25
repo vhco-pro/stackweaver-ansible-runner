@@ -129,9 +129,11 @@ jobs:
         run: |
           set -euo pipefail
           # Container packages owned by an org → /orgs/<org>/packages
+          # sed reads every page; head -1 would exit at the first match while gh is still
+          # paginating, and gh's SIGPIPE then fails the step under pipefail (exit 141).
           digest=$(gh api --paginate \
             "/orgs/vhco-pro/packages/container/${REPO_NAME}/versions" \
-            --jq ".[] | select(.metadata.container.tags[]? == \"${TAG}\") | .name" | head -1)
+            --jq ".[] | select(.metadata.container.tags[]? == \"${TAG}\") | .name" | sed -n 1p)
           if [ -z "${digest}" ]; then
             echo "::error::Could not resolve digest for ${REPO_NAME}:${TAG}"
             exit 1
