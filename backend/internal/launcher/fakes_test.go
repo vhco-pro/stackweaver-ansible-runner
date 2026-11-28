@@ -38,6 +38,7 @@ type fakeAPI struct {
 	pools            map[string]*runnercontract.PoolSettings
 	caches           map[string]*runnercontract.CacheDescriptor // a job's descriptor in its token
 	images           map[string]*runnercontract.JobImage        // a job's run image in its token
+	identities       map[string]*runnercontract.Identity        // a job's identity binding in its token
 	pullCreds        map[string]runnercontract.PullCredential   // GET /runner/images/:id/pull-credential
 	cacheObjects     map[string][]byte                          // GET /runner/cache: org/kind/sha -> body
 	cacheFetches     []string
@@ -48,6 +49,8 @@ type fakeAPI struct {
 	inventory        []runnercontract.InventoryEntry
 	tokens           []string
 	failed           map[string]string
+	failedBy         map[string]string // the credential each failure was reported with
+	tokenRefusals    map[string]string // POST /token answers 409 with this reason for the job
 	deregistered     bool
 	drain            bool     // the heartbeat answers Drain, as after POST /runners/:id/actions/drain
 	reapRunners      []string // the heartbeat names these lost runners of the pool for reaping
@@ -59,7 +62,7 @@ type fakeAPI struct {
 
 func newFakeAPI(t *testing.T, caps ...string) *fakeAPI {
 	t.Helper()
-	f := &fakeAPI{activeClaims: []runnercontract.ActiveClaim{}, capabilities: caps, statuses: map[string]string{}, failed: map[string]string{}}
+	f := &fakeAPI{activeClaims: []runnercontract.ActiveClaim{}, capabilities: caps, statuses: map[string]string{}, failed: map[string]string{}, failedBy: map[string]string{}, tokenRefusals: map[string]string{}}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -225,8 +228,14 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(map[string]any{"errors": []map[string]string{{"code": runnercontract.ErrorCodeJobTerminal}}})
 			return
 		}
+		if reason := f.tokenRefusals[jobOf(path)]; reason != "" {
+			w.Header().Set("Content-Type", "application/vnd.api+json")
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(map[string]any{"errors": []map[string]string{{"status": "409", "title": "Conflict", "detail": reason}}})
+			return
+		}
 		f.tokens = append(f.tokens, jobOf(path))
-		writeJSON(runnercontract.JobToken{Token: "swj-" + jobOf(path), JobID: jobOf(path), Attempt: claim.Attempt, Phase: claim.Phase, RunType: claim.RunType, ContractVersion: runnercontract.Version, TimeoutSeconds: f.timeouts[jobOf(path)], Pool: f.pools[jobOf(path)], Cache: f.caches[jobOf(path)], Image: f.images[jobOf(path)]})
+		writeJSON(runnercontract.JobToken{Token: "swj-" + jobOf(path), JobID: jobOf(path), Attempt: claim.Attempt, Phase: claim.Phase, RunType: claim.RunType, ContractVersion: runnercontract.Version, TimeoutSeconds: f.timeouts[jobOf(path)], Pool: f.pools[jobOf(path)], Cache: f.caches[jobOf(path)], Image: f.images[jobOf(path)], Identity: f.identities[jobOf(path)]})
 	case strings.HasSuffix(path, "/status"):
 		status := f.statuses[jobOf(path)]
 		if status == "" {
@@ -252,6 +261,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.failed[jobOf(path)] = req.ErrorMessage
+		f.failedBy[jobOf(path)] = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		writeJSON(map[string]string{"status": "ok"})
 	default:
 		http.NotFound(w, r)
